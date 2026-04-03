@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "canopen-core",
+    "canopen-derive",
+    "canopen-linux",
+    "hil-tests",
+]
+exclude = [
+    "examples/stm32-node",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"

@@ -1,0 +1,19 @@
+[package]
+name = "canopen-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "CANopen protocol stack for embedded systems"
+
+[features]
+default = []
+std = []
+defmt = ["dep:defmt"]
+
+[dependencies]
+embedded-can = "0.4"
+heapless = "0.9"
+defmt = { version = "1.0", optional = true }
+
+[dev-dependencies]
+canopen-derive = { path = "../canopen-derive" }
