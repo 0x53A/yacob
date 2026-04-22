@@ -1,12 +1,13 @@
 //! High-level SDO client helpers for Linux.
 //!
-//! These wrap the low-level `SdoClient` state machine into blocking
-//! read/write calls, suitable for test harnesses and CLI tools.
+//! These wrap the async `SdoDriver` into blocking read/write calls with timeouts,
+//! suitable for test harnesses and CLI tools.
 
+use canopen_core::can_router::SdoPort;
 use canopen_core::cobid::{CobId, NodeId};
-use canopen_core::sdo::client::{SdoClient, SdoClientResult};
+use canopen_core::sdo::driver::{SdoDriver, SdoError as AsyncSdoError};
 use canopen_core::sdo::AbortCode;
-use canopen_core::transport::{CanFrame, Transport};
+use canopen_core::transport::CanFrame;
 use std::time::{Duration, Instant};
 
 /// Error from a high-level SDO operation.
@@ -31,114 +32,189 @@ impl std::fmt::Display for SdoError {
 
 impl std::error::Error for SdoError {}
 
+impl<E: core::fmt::Debug> From<AsyncSdoError<E>> for SdoError {
+    fn from(e: AsyncSdoError<E>) -> Self {
+        match e {
+            AsyncSdoError::Aborted(code) => Self::Aborted(code),
+            AsyncSdoError::ProtocolError => Self::ProtocolError,
+            AsyncSdoError::Transport(_) => Self::TransportError,
+            AsyncSdoError::Timeout => Self::Timeout,
+        }
+    }
+}
+
+/// Minimal block_on executor with timeout for running async SDO operations.
+fn block_on_with_timeout<F: core::future::Future>(
+    f: F,
+    timeout: Duration,
+) -> Result<F::Output, SdoError> {
+    use core::pin::pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn raw_waker() -> RawWaker {
+        fn no_op(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut f = pin!(f);
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match f.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => return Ok(val),
+            Poll::Pending => {
+                if Instant::now() > deadline {
+                    return Err(SdoError::Timeout);
+                }
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        }
+    }
+}
+
 /// Perform a blocking SDO upload (read) from a remote node.
 ///
 /// Returns the data read from the object dictionary entry.
-pub fn sdo_upload(
-    transport: &mut impl Transport,
+pub fn sdo_upload<T>(
+    transport: &mut T,
     target: NodeId,
     index: u16,
     subindex: u8,
     timeout: Duration,
-) -> Result<Vec<u8>, SdoError> {
-    let mut client = SdoClient::new(target);
-    let req = client.start_upload(index, subindex);
-    transport
-        .send(&req)
-        .map_err(|_| SdoError::TransportError)?;
+) -> Result<Vec<u8>, SdoError>
+where
+    T: embedded_can::nb::Can<Frame = CanFrame>,
+    T::Error: core::fmt::Debug,
+{
+    let driver = SdoDriver::new(target);
+    let mut wrapper = NbCanWrapper(transport);
+    let mut port = SdoPort::new(&mut wrapper, target);
+    let mut buf = vec![0u8; 889]; // max SDO transfer
 
-    let response_cob = CobId::sdo_tx(target).raw();
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        if Instant::now() > deadline {
-            return Err(SdoError::Timeout);
-        }
-
-        if let Some(frame) = transport.recv() {
-            if frame.id() == response_cob && frame.dlc() == 8 {
-                let data: [u8; 8] = frame.data().try_into().unwrap();
-                match client.process_response(&data) {
-                    SdoClientResult::UploadComplete { data_len } => {
-                        return Ok(client.data()[..data_len].to_vec());
-                    }
-                    SdoClientResult::SendNext(next) => {
-                        transport
-                            .send(&next)
-                            .map_err(|_| SdoError::TransportError)?;
-                    }
-                    SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
-                    SdoClientResult::DownloadComplete | SdoClientResult::Error => {
-                        return Err(SdoError::ProtocolError)
-                    }
-                }
-            }
-        }
-
-        std::thread::sleep(Duration::from_micros(100));
-    }
+    let len = block_on_with_timeout(
+        driver.upload(index, subindex, &mut buf, &mut port),
+        timeout,
+    )??;
+    buf.truncate(len);
+    Ok(buf)
 }
 
 /// Perform a blocking SDO download (write) to a remote node.
-pub fn sdo_download(
-    transport: &mut impl Transport,
+pub fn sdo_download<T>(
+    transport: &mut T,
     target: NodeId,
     index: u16,
     subindex: u8,
     data: &[u8],
     timeout: Duration,
-) -> Result<(), SdoError> {
-    let mut client = SdoClient::new(target);
-    let req = client.start_download(index, subindex, data);
-    transport
-        .send(&req)
-        .map_err(|_| SdoError::TransportError)?;
+) -> Result<(), SdoError>
+where
+    T: embedded_can::nb::Can<Frame = CanFrame>,
+    T::Error: core::fmt::Debug,
+{
+    let driver = SdoDriver::new(target);
+    let mut wrapper = NbCanWrapper(transport);
+    let mut port = SdoPort::new(&mut wrapper, target);
 
-    let response_cob = CobId::sdo_tx(target).raw();
-    let deadline = Instant::now() + timeout;
+    block_on_with_timeout(
+        driver.download(index, subindex, data, &mut port),
+        timeout,
+    )??;
+    Ok(())
+}
 
-    loop {
-        if Instant::now() > deadline {
-            return Err(SdoError::Timeout);
-        }
+/// Wrapper that implements AsyncCan for &mut T where T: nb::Can.
+/// Similar to NbCanAsync but works with mutable references.
+struct NbCanWrapper<'a, T>(&'a mut T);
 
-        if let Some(frame) = transport.recv() {
-            if frame.id() == response_cob && frame.dlc() == 8 {
-                let resp: [u8; 8] = frame.data().try_into().unwrap();
-                match client.process_response(&resp) {
-                    SdoClientResult::DownloadComplete => return Ok(()),
-                    SdoClientResult::SendNext(next) => {
-                        transport
-                            .send(&next)
-                            .map_err(|_| SdoError::TransportError)?;
-                    }
-                    SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
-                    SdoClientResult::UploadComplete { .. } | SdoClientResult::Error => {
-                        return Err(SdoError::ProtocolError)
-                    }
+impl<T> canopen_core::sdo::AsyncCan for NbCanWrapper<'_, T>
+where
+    T: embedded_can::nb::Can<Frame = CanFrame>,
+    T::Error: core::fmt::Debug,
+{
+    type Error = T::Error;
+
+    async fn transmit(&mut self, frame: &CanFrame) -> Result<(), Self::Error> {
+        loop {
+            match self.0.transmit(frame) {
+                Ok(_) => return Ok(()),
+                Err(nb::Error::WouldBlock) => {
+                    // Yield then retry
+                    let mut yielded = false;
+                    core::future::poll_fn(|cx| {
+                        if yielded {
+                            core::task::Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            core::task::Poll::Pending
+                        }
+                    })
+                    .await;
                 }
+                Err(nb::Error::Other(e)) => return Err(e),
             }
         }
-
-        std::thread::sleep(Duration::from_micros(100));
     }
+
+    async fn receive(&mut self) -> Result<CanFrame, Self::Error> {
+        loop {
+            match self.0.receive() {
+                Ok(frame) => return Ok(frame),
+                Err(nb::Error::WouldBlock) => {
+                    let mut yielded = false;
+                    core::future::poll_fn(|cx| {
+                        if yielded {
+                            core::task::Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            core::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                Err(nb::Error::Other(e)) => return Err(e),
+            }
+        }
+    }
+}
+
+fn send(
+    transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
+    frame: &CanFrame,
+) -> Result<(), SdoError> {
+    transport
+        .transmit(frame)
+        .map_err(|_| SdoError::TransportError)?;
+    Ok(())
+}
+
+fn try_recv(
+    transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
+) -> Option<CanFrame> {
+    transport.receive().ok()
 }
 
 /// Send an NMT command to a node (or broadcast with node_id=0).
 pub fn nmt_command(
-    transport: &mut impl Transport,
+    transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
     command: u8,
     target_node: u8,
 ) -> Result<(), SdoError> {
     let frame = CanFrame::new(0x000, &[command, target_node]).unwrap();
-    transport
-        .send(&frame)
-        .map_err(|_| SdoError::TransportError)
+    send(transport, &frame)
 }
 
 /// Wait for a heartbeat from a specific node. Returns the NMT state byte.
 pub fn wait_heartbeat(
-    transport: &mut impl Transport,
+    transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
     target: NodeId,
     timeout: Duration,
 ) -> Result<u8, SdoError> {
@@ -149,8 +225,8 @@ pub fn wait_heartbeat(
         if Instant::now() > deadline {
             return Err(SdoError::Timeout);
         }
-        if let Some(frame) = transport.recv() {
-            if frame.id() == hb_cob && frame.dlc() >= 1 {
+        if let Some(frame) = try_recv(transport) {
+            if frame.raw_id() == hb_cob && frame.raw_dlc() >= 1 {
                 return Ok(frame.data()[0]);
             }
         }

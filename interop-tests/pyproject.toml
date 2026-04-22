@@ -1,0 +1,13 @@
+[project]
+name = "canopen-rs-interop-tests"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "canopen>=2.3",
+    "python-can>=4.4",
+    "msgpack>=1.0",
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]

@@ -2,7 +2,9 @@ extern crate proc_macro;
 
 mod codegen;
 mod dsl;
+mod eds_export;
 mod eds_parser;
+mod sdo_client_codegen;
 
 use proc_macro::TokenStream;
 
@@ -51,4 +53,25 @@ pub fn object_dictionary_from_eds(input: TokenStream) -> TokenStream {
         Ok(od_def) => codegen::generate(od_def).into(),
         Err(e) => e.to_compile_error().into(),
     }
+}
+
+/// Generate a typed async SDO client from an EDS file.
+///
+/// Creates a struct with typed `read_*` and `write_*` async methods for each
+/// OD entry, using `SdoDriver` under the hood.
+///
+/// # Example
+/// ```ignore
+/// sdo_client_from_eds! {
+///     pub struct MotorClient = "motor_controller.eds";
+/// }
+///
+/// let client = MotorClient::new(node_id);
+/// let status: u16 = client.read_statusword(&mut can).await?;
+/// client.write_controlword(0x0F, &mut can).await?;
+/// ```
+#[proc_macro]
+pub fn sdo_client_from_eds(input: TokenStream) -> TokenStream {
+    let eds_def = syn::parse_macro_input!(input as eds_parser::EdsDefinition);
+    sdo_client_codegen::generate(eds_def).into()
 }

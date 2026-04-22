@@ -26,6 +26,8 @@ pub struct OdEntryMeta {
     pub access: AccessType,
     pub pdo_mappable: bool,
     pub name: &'static str,
+    /// Maximum size in bytes for variable-length types. None for fixed-size types.
+    pub max_size: Option<u16>,
 }
 
 /// Errors from OD operations.
@@ -39,6 +41,34 @@ pub enum OdError {
     ValueRange,
     HardwareError,
 }
+
+/// Emitted when the protocol stack modifies an OD entry.
+#[derive(Clone, Copy, Debug)]
+pub struct OdEvent {
+    pub index: u16,
+    pub subindex: u8,
+    pub source: OdEventSource,
+}
+
+/// Source of an OD modification event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OdEventSource {
+    /// Remote SDO download wrote this entry.
+    Sdo,
+    /// Incoming RPDO mapped to this entry.
+    Rpdo,
+}
+
+/// Signal type for async notification of OD events.
+///
+/// Place in a `static` and pass to [`Node::set_event_signal`]. An async task
+/// can `signal.wait().await` to be woken when the protocol stack modifies an
+/// OD entry (SDO download or RPDO write).
+#[cfg(feature = "embassy")]
+pub type OdEventSignal = embassy_sync::signal::Signal<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    (),
+>;
 
 /// Trait for an object dictionary. Implemented by proc-macro-generated structs.
 ///
@@ -56,4 +86,20 @@ pub trait ObjectDictionary {
 
     /// Number of subindices for a given index (sub0 value for arrays/records).
     fn sub_count(&self, index: u16) -> Option<u8>;
+
+    /// Validate a write before it is committed to the OD.
+    ///
+    /// Called by the SDO server before `write()`. If this returns `Err`, the
+    /// SDO server sends an abort and the write is not applied. Override this
+    /// to implement application-level validation (e.g., range checks, state
+    /// guards, cross-field constraints).
+    ///
+    /// The default implementation accepts all writes.
+    ///
+    /// Common return errors:
+    /// - `OdError::ValueRange` — value out of application-defined range
+    /// - `OdError::HardwareError` — device not ready (e.g., flash in error state)
+    fn validate_write(&self, _index: u16, _subindex: u8, _data: &[u8]) -> Result<(), OdError> {
+        Ok(())
+    }
 }

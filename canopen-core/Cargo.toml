@@ -7,13 +7,20 @@ description = "CANopen protocol stack for embedded systems"
 
 [features]
 default = []
-std = []
+alloc = []
+std = ["critical-section/std", "alloc"]
 defmt = ["dep:defmt"]
+embassy = ["dep:embassy-sync"]
 
 [dependencies]
 embedded-can = "0.4"
 heapless = "0.9"
+critical-section = "1.2"
 defmt = { version = "1.0", optional = true }
+embassy-sync = { version = "0.8", default-features = false, optional = true }
+nb = "1.1.0"
 
 [dev-dependencies]
 canopen-derive = { path = "../canopen-derive" }
+critical-section = { version = "1.2", features = ["std"] }
+miniz_oxide = "0.9.1"

@@ -6,7 +6,7 @@
 //!
 //! Usage: cargo run --example slcan_setup -- /dev/ttyACM1
 
-use canopen_core::transport::Transport;
+use embedded_can::nb::Can;
 use canopen_linux::slcan::{SlcanBitrate, SlcanTransport};
 use std::time::{Duration, Instant};
 
@@ -41,12 +41,12 @@ fn main() {
     let start = Instant::now();
     let mut count = 0;
     while start.elapsed() < Duration::from_secs(3) {
-        if let Some(frame) = slcan.recv() {
+        if let Ok(frame) = slcan.receive() {
             if count == 0 {
                 println!(
                     "  First frame: ID=0x{:03X} DLC={} data={:02X?}",
-                    frame.id(),
-                    frame.dlc(),
+                    frame.raw_id(),
+                    frame.raw_dlc(),
                     frame.data()
                 );
             }

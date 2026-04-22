@@ -1,20 +1,32 @@
+//! Interrupt-driven CANopen node for Nucleo-G431KB.
+//!
+//! The CANopen protocol runs in a background task (heartbeat, SDO, PDO).
+//! Application logic stays in main: button reads via EXTI, LED writes via
+//! OD events. od_mut() auto-notifies changed TPDO-mapped fields.
+//!
+//! Between wakes the MCU is in WFI.
+
 #![no_std]
 #![no_main]
 
 use canopen_core::cobid::NodeId;
 use canopen_core::node::{Node, NodeConfig};
-use canopen_core::pdo::{RpdoConfig, TpdoConfig};
 use canopen_core::time::Clock;
-use canopen_core::transport::{CanFrame, Transport};
+use canopen_core::transport::{CanError, CanFrame};
+use canopen_core::OdEventSignal;
 use canopen_derive::object_dictionary;
 
+use core::cell::RefCell;
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_stm32::can::filter::{StandardFilter, StandardFilterSlot};
 use embassy_stm32::can::{CanConfigurator, CanRx, CanTx, Frame};
-use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::exti::ExtiInput;
+use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::{bind_interrupts, can, peripherals};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Ticker};
 
@@ -33,20 +45,48 @@ object_dictionary! {
             [4] serial_number: u32 = 0x0000_0001, ro;
         };
         [0x6000] inputs: record {
-            [1] input1: u8 = 0, ro, pdo;  // PB7 button (active low, pull-up)
-            [2] input2: u16 = 0, ro, pdo; // uptime in seconds
+            [1] button: u8 = 0, ro, pdo;      // PB7 (0=released, 1=pressed)
+            [2] echo_in: u16 = 0, rw, pdo;    // written by remote, echoed to echo_out
         };
         [0x6200] outputs: record {
-            [1] output1: u8 = 0, rw, pdo;  // PB8 LED (0=off, nonzero=on)
-            [2] output2: u16 = 0, rw, pdo; // unused, for testing
+            [1] led: u8 = 0, rw, pdo;         // PB8 (0=off, 1=on)
+            [2] echo_out: u16 = 0, ro, pdo;   // mirrors echo_in
+        };
+
+        // TPDO1: data this node sends (0x181 for node 1)
+        // - transmission_type: EVENT_DRIVEN (255) = send on change,
+        //   not tied to SYNC. Other options: SYNC_ACYCLIC (0), sync_cyclic(N).
+        // - inhibit_time: minimum 50ms between sends (in 100μs units)
+        // - event_timer: periodic fallback — send at least every 1000ms even
+        //   if nothing changed. Set to 0 to only send on explicit triggers.
+        // - Fields are packed into one CAN frame: [button (1 byte) | echo_out (2 bytes)]
+        tpdo[1](transmission_type = 255, inhibit_time = 500, event_timer = 1000) {
+            button,
+            echo_out,
+        };
+
+        // RPDO1: data this node receives (0x201 for node 1)
+        // - transmission_type: EVENT_DRIVEN (255) = apply values to OD immediately
+        //   when the frame arrives. With SYNC_ACYCLIC (0), values would be buffered
+        //   and only applied on the next SYNC pulse (useful for coordinated updates).
+        // - Fields are unpacked from the CAN frame: [led (1 byte) | echo_in (2 bytes)]
+        // - Writing to these triggers an OdEvent, which wakes main via EVENT_SIGNAL.
+        rpdo[1](transmission_type = 255) {
+            led,
+            echo_in,
         };
     }
 }
 
-// ---------- CAN channels ----------
+// ---------- Shared state ----------
 
 static TX_CHANNEL: Channel<CriticalSectionRawMutex, CanFrame, 16> = Channel::new();
 static RX_CHANNEL: Channel<CriticalSectionRawMutex, CanFrame, 16> = Channel::new();
+static EVENT_SIGNAL: OdEventSignal = OdEventSignal::new();
+
+/// The CANopen node, shared between the protocol task and main.
+static NODE: Mutex<CriticalSectionRawMutex, RefCell<Option<Node<NodeOd, 1, 1>>>> =
+    Mutex::new(RefCell::new(None));
 
 // ---------- Clock ----------
 
@@ -62,15 +102,19 @@ impl Clock for EmbassyClock {
 
 struct ChannelTransport;
 
-impl Transport for ChannelTransport {
-    fn send(&mut self, frame: &CanFrame) -> Result<(), canopen_core::transport::TransportError> {
+impl embedded_can::nb::Can for ChannelTransport {
+    type Frame = CanFrame;
+    type Error = CanError;
+
+    fn transmit(&mut self, frame: &Self::Frame) -> nb::Result<Option<Self::Frame>, Self::Error> {
         TX_CHANNEL
             .try_send(*frame)
-            .map_err(|_| canopen_core::transport::TransportError::TxBufferFull)
+            .map_err(|_| nb::Error::Other(CanError::TxBufferFull))?;
+        Ok(None)
     }
 
-    fn recv(&mut self) -> Option<CanFrame> {
-        RX_CHANNEL.try_receive().ok()
+    fn receive(&mut self) -> nb::Result<Self::Frame, Self::Error> {
+        RX_CHANNEL.try_receive().map_err(|_| nb::Error::WouldBlock)
     }
 }
 
@@ -87,7 +131,7 @@ bind_interrupts!(struct Irqs {
 async fn can_tx_task(mut tx: CanTx<'static>) {
     loop {
         let frame = TX_CHANNEL.receive().await;
-        let id = embedded_can::StandardId::new(frame.id()).unwrap();
+        let id = embedded_can::StandardId::new(frame.raw_id()).unwrap();
         match Frame::new_data(id, frame.data()) {
             Ok(f) => {
                 tx.write(&f).await;
@@ -106,7 +150,16 @@ async fn can_rx_task(mut rx: CanRx<'static>) {
     loop {
         match rx.read().await {
             Ok(envelope) => {
-                if let Some(can_frame) = CanFrame::from_frame(&envelope.frame) {
+                if let Some(can_frame) = {
+                    let id = embedded_can::Frame::id(&envelope.frame);
+                    CanFrame::new(
+                        match id {
+                            embedded_can::Id::Standard(sid) => sid.as_raw(),
+                            embedded_can::Id::Extended(_) => continue,
+                        },
+                        envelope.frame.data(),
+                    )
+                } {
                     let _ = RX_CHANNEL.try_send(can_frame);
                 }
             }
@@ -114,6 +167,28 @@ async fn can_rx_task(mut rx: CanRx<'static>) {
                 warn!("CAN RX bus error: {:?}", defmt::Debug2Format(&e));
             }
         }
+    }
+}
+
+// ---------- Protocol task (background) ----------
+//
+// The CANopen stack runs here: heartbeat, SDO server, PDO engines.
+// Application code doesn't touch this — it just calls od_mut() and
+// reads od() from main.
+
+#[embassy_executor::task]
+async fn protocol_task() {
+    let mut transport = ChannelTransport;
+    let clock = EmbassyClock;
+    let mut ticker = Ticker::every(Duration::from_millis(1));
+
+    loop {
+        ticker.next().await;
+        NODE.lock(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let node = borrow.as_mut().unwrap();
+            node.process(&mut transport, &clock);
+        });
     }
 }
 
@@ -146,59 +221,83 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(config);
 
     // GPIO setup
-    // PB8: onboard LED (active high on Nucleo-G431KB)
     let mut led = Output::new(p.PB8, Level::Low, Speed::Low);
-    // PB7: button input (active low, external or jumper to GND)
-    let button = Input::new(p.PB7, Pull::Up);
+    let mut button = ExtiInput::new(p.PB7, p.EXTI7, Pull::Up);
 
-    // FDCAN1: PA11 (RX) / PA12 (TX)
+    // FDCAN1: PA11 (RX) / PA12 (TX), 500 kbit/s
     let mut can = CanConfigurator::new(p.FDCAN1, p.PA11, p.PA12, Irqs);
-
-    // 500 kbit/s classic CAN
     can.set_bitrate(500_000);
-
-    // Accept all standard frames
     can.properties()
         .set_standard_filter(StandardFilterSlot::_0, StandardFilter::accept_all_into_fifo0());
-
     let can = can.into_normal_mode();
     let (tx, rx, _props) = can.split();
 
     spawner.must_spawn(can_tx_task(tx));
     spawner.must_spawn(can_rx_task(rx));
 
-    // Create CANopen node
+    // CANopen node — PDO config comes from the OD (declared in the macro above)
     let node_id = NodeId::new(1).unwrap();
-    let node_config = NodeConfig::<1, 1> {
-        node_id,
-        heartbeat_interval_ms: 500,
-        auto_start: true,
-        tpdo: [TpdoConfig::default()],
-        rpdo: [RpdoConfig::default()],
-    };
-
     let od = NodeOd::new();
-    let mut node = Node::new(node_config, od);
-    let mut transport = ChannelTransport;
-    let clock = EmbassyClock;
+    let mut node: Node<NodeOd, 1, 1> = Node::new(
+        NodeConfig::<1, 1> {
+            node_id,
+            heartbeat_interval_ms: 500,
+            auto_start: true,
+            tpdo: od.tpdo_configs(node_id),
+            rpdo: od.rpdo_configs(node_id),
+        },
+        od,
+    );
+    node.set_event_signal(&EVENT_SIGNAL);
+    NODE.lock(|cell| cell.borrow_mut().replace(node));
 
-    info!("CANopen node {} running, heartbeat 500ms", node_id.raw());
+    // Protocol runs in the background
+    spawner.must_spawn(protocol_task());
 
-    // Main loop: process protocol at ~1kHz
-    let mut ticker = Ticker::every(Duration::from_millis(1));
+    info!("node {} running — TPDO1 0x{:03X}, RPDO1 0x{:03X}",
+        node_id.raw(), 0x180u16 + node_id.raw() as u16, 0x200u16 + node_id.raw() as u16);
+
+    // ---------- Application logic ----------
+    //
+    // Main loop: wait for either an OD event (remote wrote something)
+    // or a button edge (local GPIO interrupt). No polling.
+
     loop {
-        // Read inputs → OD
-        node.od_mut().input1 = if button.is_low() { 1 } else { 0 };
-        node.od_mut().input2 = (Instant::now().as_secs() & 0xFFFF) as u16;
+        match select(EVENT_SIGNAL.wait(), button.wait_for_any_edge()).await {
+            // Protocol stack changed the OD (SDO download or RPDO write)
+            Either::First(_) => {
+                NODE.lock(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    let node = borrow.as_mut().unwrap();
 
-        // OD → outputs
-        if node.od().output1 != 0 {
-            led.set_high();
-        } else {
-            led.set_low();
+                    while let Some(evt) = node.next_event() {
+                        match (evt.index, evt.subindex) {
+                            (0x6200, 1) => {
+                                let on = node.od().led != 0;
+                                info!("LED {}", if on { "on" } else { "off" });
+                                if on { led.set_high() } else { led.set_low() }
+                            }
+                            (0x6000, 2) => {
+                                let val = node.od().echo_in;
+                                info!("echo {:#06X}", val);
+                                node.od_mut().echo_out = val;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+
+            // Button edge (EXTI interrupt)
+            Either::Second(_) => {
+                let pressed = button.is_low();
+                info!("button {}", if pressed { "dn" } else { "up" });
+                NODE.lock(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    let node = borrow.as_mut().unwrap();
+                    node.od_mut().button = pressed as u8;
+                });
+            }
         }
-
-        node.process(&mut transport, &clock);
-        ticker.next().await;
     }
 }

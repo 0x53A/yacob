@@ -32,29 +32,26 @@ enum State {
 /// 3. When a response arrives, call `process_response()`.
 /// 4. If it returns `SendNext(frame)`, send that frame and repeat from 3.
 /// 5. `UploadComplete` or `DownloadComplete` signals success.
-pub struct SdoClient {
+///
+/// The `BUF` const generic controls the maximum segmented transfer size.
+/// Default is 256 bytes. Use `SdoClient<889>` for max CiA 301 block size.
+pub struct SdoClient<const BUF: usize = 256> {
     target_node: NodeId,
     state: State,
-    buf: [u8; 256],
+    /// Shared buffer: holds received data during upload, or data to send during download.
+    buf: [u8; BUF],
     offset: usize,
     total_len: usize,
-    /// For segmented download: the data to send
-    download_buf: [u8; 256],
-    download_len: usize,
-    download_offset: usize,
 }
 
-impl SdoClient {
+impl<const BUF: usize> SdoClient<BUF> {
     pub fn new(target: NodeId) -> Self {
         Self {
             target_node: target,
             state: State::Idle,
-            buf: [0; 256],
+            buf: [0; BUF],
             offset: 0,
             total_len: 0,
-            download_buf: [0; 256],
-            download_len: 0,
-            download_offset: 0,
         }
     }
 
@@ -87,6 +84,7 @@ impl SdoClient {
         if value.len() <= 4 {
             // Expedited download
             self.state = State::WaitingDownloadInitResponse { index, subindex };
+            self.total_len = value.len();
             let n = 4 - value.len();
             let mut data = [0u8; 8];
             // CCS=1, n, e=1, s=1
@@ -98,11 +96,11 @@ impl SdoClient {
             data[4..4 + value.len()].copy_from_slice(value);
             CanFrame::new(self.tx_cobid(), &data).unwrap()
         } else {
-            // Segmented download
+            // Segmented download — store data in shared buffer
             self.state = State::WaitingDownloadInitResponse { index, subindex };
-            self.download_buf[..value.len()].copy_from_slice(value);
-            self.download_len = value.len();
-            self.download_offset = 0;
+            self.buf[..value.len()].copy_from_slice(value);
+            self.total_len = value.len();
+            self.offset = 0;
 
             let mut data = [0u8; 8];
             // CCS=1, e=0, s=1
@@ -133,10 +131,24 @@ impl SdoClient {
                 0x0503_0000 => AbortCode::ToggleBitNotAlternated,
                 0x0504_0000 => AbortCode::SdoProtocolTimeout,
                 0x0504_0001 => AbortCode::InvalidCommandSpecifier,
+                0x0504_0002 => AbortCode::InvalidBlockSize,
+                0x0504_0003 => AbortCode::InvalidSequenceNumber,
+                0x0504_0005 => AbortCode::OutOfMemory,
+                0x0601_0000 => AbortCode::UnsupportedAccess,
                 0x0601_0001 => AbortCode::WriteOnlyObject,
                 0x0601_0002 => AbortCode::ReadOnlyObject,
                 0x0602_0000 => AbortCode::ObjectNotFound,
+                0x0604_0041 => AbortCode::ObjectCannotBeMapped,
+                0x0604_0042 => AbortCode::PdoLengthExceeded,
+                0x0604_0043 => AbortCode::ParameterIncompatibility,
                 0x0609_0011 => AbortCode::SubindexNotFound,
+                0x0609_0030 => AbortCode::ValueRangeExceeded,
+                0x0609_0031 => AbortCode::ValueTooHigh,
+                0x0609_0032 => AbortCode::ValueTooLow,
+                0x0609_0043 => AbortCode::DataTypeMismatch,
+                0x0800_0020 => AbortCode::DataTransferError,
+                0x0800_0021 => AbortCode::DataTransferLocalControl,
+                0x0800_0022 => AbortCode::DataTransferDeviceState,
                 _ => AbortCode::GeneralError,
             });
         }
@@ -242,7 +254,7 @@ impl SdoClient {
         let last = (response[0] & 0x01) != 0;
         let seg_len = 7 - n;
 
-        if self.offset + seg_len > 256 {
+        if self.offset + seg_len > BUF {
             self.state = State::Idle;
             return SdoClientResult::Error;
         }
@@ -268,7 +280,7 @@ impl SdoClient {
     }
 
     fn handle_download_init_response(&mut self, _response: &[u8; 8]) -> SdoClientResult {
-        if self.download_len <= 4 {
+        if self.total_len <= 4 {
             // Was expedited, download is done
             self.state = State::Idle;
             SdoClientResult::DownloadComplete
@@ -304,7 +316,7 @@ impl SdoClient {
             return SdoClientResult::Error;
         }
 
-        if self.download_offset >= self.download_len {
+        if self.offset >= self.total_len {
             // All data sent and acknowledged
             self.state = State::Idle;
             SdoClientResult::DownloadComplete
@@ -327,7 +339,7 @@ impl SdoClient {
     }
 
     fn make_download_segment(&mut self, toggle: bool) -> CanFrame {
-        let remaining = self.download_len - self.download_offset;
+        let remaining = self.total_len - self.offset;
         let seg_len = remaining.min(7);
         let last = remaining <= 7;
         let n = 7 - seg_len;
@@ -338,9 +350,9 @@ impl SdoClient {
             | (n as u8) << 1
             | if last { 0x01 } else { 0 };
         data[1..1 + seg_len].copy_from_slice(
-            &self.download_buf[self.download_offset..self.download_offset + seg_len],
+            &self.buf[self.offset..self.offset + seg_len],
         );
-        self.download_offset += seg_len;
+        self.offset += seg_len;
 
         CanFrame::new(self.tx_cobid(), &data).unwrap()
     }
@@ -363,15 +375,15 @@ mod tests {
     static CLIENT_TEST_META: &[OdEntryMeta] = &[
         OdEntryMeta {
             index: 0x1000, subindex: 0, data_type: DataType::U32,
-            access: AccessType::Ro, pdo_mappable: false, name: "val_u32",
+            access: AccessType::Ro, pdo_mappable: false, name: "val_u32", max_size: None,
         },
         OdEntryMeta {
             index: 0x2000, subindex: 0, data_type: DataType::U16,
-            access: AccessType::Rw, pdo_mappable: false, name: "val_u16",
+            access: AccessType::Rw, pdo_mappable: false, name: "val_u16", max_size: None,
         },
         OdEntryMeta {
             index: 0x2001, subindex: 0, data_type: DataType::OctetString,
-            access: AccessType::Rw, pdo_mappable: false, name: "blob",
+            access: AccessType::Rw, pdo_mappable: false, name: "blob", max_size: None,
         },
     ];
 
@@ -408,13 +420,18 @@ mod tests {
     }
 
     /// Run a complete SDO transfer between client and server in-memory.
-    fn run_transfer(client: &mut SdoClient, server: &mut SdoServer, od: &mut TestOd, first_frame: CanFrame) -> SdoClientResult {
+    fn run_transfer(client: &mut SdoClient<256>, server: &mut SdoServer, od: &mut TestOd, first_frame: CanFrame) -> SdoClientResult {
+        use crate::nmt::NmtState;
+        use crate::od::OdEvent;
+        use heapless::Deque;
+
         // First frame goes from client to server
         let mut req_data = [0u8; 8];
         req_data.copy_from_slice(first_frame.data());
 
         let mut resp_data = [0u8; 8];
-        server.process(&req_data, od, &mut resp_data).unwrap();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+        server.process(&req_data, od, &mut resp_data, &mut events, NmtState::PreOperational, 0).unwrap();
 
         let mut result = client.process_response(&resp_data);
 
@@ -423,7 +440,7 @@ mod tests {
             match result {
                 SdoClientResult::SendNext(frame) => {
                     req_data.copy_from_slice(frame.data());
-                    server.process(&req_data, od, &mut resp_data).unwrap();
+                    server.process(&req_data, od, &mut resp_data, &mut events, NmtState::PreOperational, 0).unwrap();
                     result = client.process_response(&resp_data);
                 }
                 _ => return result,
@@ -434,7 +451,7 @@ mod tests {
     #[test]
     fn client_expedited_upload() {
         let target = NodeId::new(1).unwrap();
-        let mut client = SdoClient::new(target);
+        let mut client = SdoClient::<256>::new(target);
         let mut server = SdoServer::new();
         let mut od = TestOd { val_u32: 0xDEADBEEF, val_u16: 0, blob: [0; 20] };
 
@@ -451,7 +468,7 @@ mod tests {
     #[test]
     fn client_expedited_download() {
         let target = NodeId::new(1).unwrap();
-        let mut client = SdoClient::new(target);
+        let mut client = SdoClient::<256>::new(target);
         let mut server = SdoServer::new();
         let mut od = TestOd { val_u32: 0, val_u16: 0, blob: [0; 20] };
 
@@ -467,7 +484,7 @@ mod tests {
     #[test]
     fn client_segmented_upload() {
         let target = NodeId::new(1).unwrap();
-        let mut client = SdoClient::new(target);
+        let mut client = SdoClient::<256>::new(target);
         let mut server = SdoServer::new();
         let mut od = TestOd { val_u32: 0, val_u16: 0, blob: [0xBB; 20] };
 
@@ -484,7 +501,7 @@ mod tests {
     #[test]
     fn client_segmented_download() {
         let target = NodeId::new(1).unwrap();
-        let mut client = SdoClient::new(target);
+        let mut client = SdoClient::<256>::new(target);
         let mut server = SdoServer::new();
         let mut od = TestOd { val_u32: 0, val_u16: 0, blob: [0; 20] };
 
@@ -501,7 +518,7 @@ mod tests {
     #[test]
     fn client_abort_on_not_found() {
         let target = NodeId::new(1).unwrap();
-        let mut client = SdoClient::new(target);
+        let mut client = SdoClient::<256>::new(target);
         let mut server = SdoServer::new();
         let mut od = TestOd { val_u32: 0, val_u16: 0, blob: [0; 20] };
 

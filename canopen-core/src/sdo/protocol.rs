@@ -49,6 +49,10 @@ pub enum Ccs {
     UploadSegment = 3,
     /// Abort transfer
     AbortTransfer = 4,
+    /// Block upload (client initiates)
+    BlockUpload = 5,
+    /// Block download (client initiates)
+    BlockDownload = 6,
 }
 
 /// Server Command Specifier (SCS) - upper 3 bits of byte 0 in server→client SDO frames.

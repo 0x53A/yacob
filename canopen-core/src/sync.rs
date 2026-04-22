@@ -13,10 +13,10 @@ impl SyncConsumer {
     /// Process a SYNC frame. Returns the SYNC counter value if present.
     /// SYNC frames have COB-ID 0x080, 0 or 1 data byte.
     pub fn process(&mut self, frame: &CanFrame) -> Option<u8> {
-        if frame.id() != 0x080 {
+        if frame.raw_id() != 0x080 {
             return None;
         }
-        let counter = if frame.dlc() >= 1 {
+        let counter = if frame.raw_dlc() >= 1 {
             frame.data()[0]
         } else {
             self.counter = self.counter.wrapping_add(1);

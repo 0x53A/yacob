@@ -121,7 +121,7 @@ mod tests {
 
         // At t=100ms, first heartbeat
         let frame = hb.poll(100_000, NmtState::PreOperational).unwrap();
-        assert_eq!(frame.id(), 0x701);
+        assert_eq!(frame.raw_id(), 0x701);
         assert_eq!(frame.data(), &[0x7F]);
 
         // 50ms later - too early

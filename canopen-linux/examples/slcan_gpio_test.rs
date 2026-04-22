@@ -1,7 +1,6 @@
 //! Test GPIO integration: read button/uptime, toggle LED via SDO.
 
 use canopen_core::cobid::NodeId;
-use canopen_core::transport::Transport;
 use canopen_linux::sdo_helpers::*;
 use canopen_linux::slcan::{SlcanBitrate, SlcanTransport};
 use std::time::Duration;

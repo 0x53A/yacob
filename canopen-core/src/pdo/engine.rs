@@ -1,6 +1,6 @@
-use crate::od::ObjectDictionary;
+use crate::od::{ObjectDictionary, OdEvent, OdEventSource};
 use crate::transport::CanFrame;
-use heapless::Vec;
+use heapless::{Deque, Vec};
 
 /// One PDO mapping entry: which OD entry maps to which bits in the PDO frame.
 #[derive(Clone, Copy, Debug, Default)]
@@ -27,6 +27,23 @@ impl PdoMapping {
     pub const fn to_mapping_value(self) -> u32 {
         (self.index as u32) << 16 | (self.subindex as u32) << 8 | self.bit_length as u32
     }
+}
+
+// ---- Transmission type constants (CiA 301) ----
+
+/// Synchronous, acyclic — sent only when triggered, on the next SYNC.
+pub const SYNC_ACYCLIC: u8 = 0;
+/// Synchronous, cyclic — sent every N SYNC messages. Use [`sync_cyclic`] to construct.
+pub const SYNC_CYCLIC_1: u8 = 1;
+/// Event-driven, manufacturer-specific trigger.
+pub const EVENT_DRIVEN_MANUFACTURER: u8 = 254;
+/// Event-driven, device-profile-specific trigger.
+pub const EVENT_DRIVEN: u8 = 255;
+
+/// Synchronous, cyclic transmission type: send every `n` SYNCs (1..=240).
+pub const fn sync_cyclic(n: u8) -> u8 {
+    assert!(n >= 1 && n <= 240, "sync_cyclic: n must be 1..=240");
+    n
 }
 
 /// Configuration for one TPDO (transmit PDO).
@@ -136,11 +153,16 @@ impl<const N: usize> TpdoEngine<N> {
         }
     }
 
-    /// Called periodically. Checks event timers for event-driven PDOs.
-    pub fn poll<OD: ObjectDictionary>(
+    /// Called periodically. Checks event timers and dirty entries for event-driven PDOs.
+    ///
+    /// If any mapped entry is in the `dirty` set and the inhibit time has elapsed,
+    /// the PDO is sent immediately (event-driven). The dirty set should be cleared
+    /// by the caller after this returns.
+    pub fn poll<OD: ObjectDictionary, const DIRTY: usize>(
         &mut self,
         od: &OD,
         now_us: u64,
+        dirty: &Vec<(u16, u8), DIRTY>,
         out: &mut Vec<CanFrame, N>,
     ) {
         for i in 0..N {
@@ -148,13 +170,28 @@ impl<const N: usize> TpdoEngine<N> {
                 continue;
             }
             let tt = self.pdos[i].transmission_type;
-            if (tt == 254 || tt == 255) && self.pdos[i].event_timer_ms > 0 {
+            if tt != 254 && tt != 255 {
+                continue;
+            }
+
+            let inhibit_us = self.pdos[i].inhibit_time_100us as u64 * 100;
+            let elapsed = now_us.wrapping_sub(self.last_send_us[i]);
+
+            // Check if any mapped entry was marked dirty
+            let has_dirty = !dirty.is_empty() && self.pdos[i].mappings.iter().any(|m| {
+                dirty.iter().any(|&(idx, sub)| idx == m.index && sub == m.subindex)
+            });
+
+            // Send on dirty trigger (respecting inhibit time) or event timer
+            let timer_trigger = self.pdos[i].event_timer_ms > 0 && {
                 let interval_us = self.pdos[i].event_timer_ms as u64 * 1000;
-                if now_us.wrapping_sub(self.last_send_us[i]) >= interval_us {
-                    self.last_send_us[i] = now_us;
-                    if let Some(frame) = self.build_pdo_frame(i, od) {
-                        let _ = out.push(frame);
-                    }
+                elapsed >= interval_us
+            };
+
+            if (has_dirty && elapsed >= inhibit_us) || timer_trigger {
+                self.last_send_us[i] = now_us;
+                if let Some(frame) = self.build_pdo_frame(i, od) {
+                    let _ = out.push(frame);
                 }
             }
         }
@@ -209,13 +246,16 @@ impl<const N: usize> RpdoEngine<N> {
 
     /// Process an incoming CAN frame. If it matches an RPDO, write mapped values to OD.
     /// Returns true if the frame was consumed by an RPDO.
-    pub fn process<OD: ObjectDictionary>(
+    ///
+    /// Pushes one `OdEvent` per successfully written mapped entry.
+    pub fn process<OD: ObjectDictionary, const EVT_QUEUE: usize>(
         &self,
         frame: &CanFrame,
         od: &mut OD,
+        events: &mut Deque<OdEvent, EVT_QUEUE>,
     ) -> bool {
         for pdo in &self.pdos {
-            if !pdo.enabled || frame.id() != pdo.cob_id {
+            if !pdo.enabled || frame.raw_id() != pdo.cob_id {
                 continue;
             }
 
@@ -228,11 +268,20 @@ impl<const N: usize> RpdoEngine<N> {
                 if byte_offset + byte_len > data.len() {
                     break;
                 }
-                let _ = od.write(
+                if od.write(
                     mapping.index,
                     mapping.subindex,
                     &data[byte_offset..byte_offset + byte_len],
-                );
+                ).is_ok() {
+                    if events.is_full() {
+                        let _ = events.pop_front();
+                    }
+                    let _ = events.push_back(OdEvent {
+                        index: mapping.index,
+                        subindex: mapping.subindex,
+                        source: OdEventSource::Rpdo,
+                    });
+                }
                 bit_offset += mapping.bit_length as usize;
             }
             return true;
@@ -256,15 +305,15 @@ mod tests {
     static PDO_TEST_META: &[OdEntryMeta] = &[
         OdEntryMeta {
             index: 0x6000, subindex: 1, data_type: DataType::U8,
-            access: AccessType::Ro, pdo_mappable: true, name: "input1",
+            access: AccessType::Ro, pdo_mappable: true, name: "input1", max_size: None,
         },
         OdEntryMeta {
             index: 0x6000, subindex: 2, data_type: DataType::U16,
-            access: AccessType::Ro, pdo_mappable: true, name: "input2",
+            access: AccessType::Ro, pdo_mappable: true, name: "input2", max_size: None,
         },
         OdEntryMeta {
             index: 0x6200, subindex: 1, data_type: DataType::U8,
-            access: AccessType::Rw, pdo_mappable: true, name: "output1",
+            access: AccessType::Rw, pdo_mappable: true, name: "output1", max_size: None,
         },
     ];
 
@@ -312,7 +361,7 @@ mod tests {
         assert_eq!(out.len(), 1);
 
         let frame = &out[0];
-        assert_eq!(frame.id(), 0x181);
+        assert_eq!(frame.raw_id(), 0x181);
         assert_eq!(frame.data(), &[0x42, 0x34, 0x12]); // u8 + u16 LE
     }
 
@@ -330,14 +379,21 @@ mod tests {
 
         let engine = RpdoEngine::new([config]);
         let mut od = PdoTestOd { input1: 0, input2: 0, output1: 0 };
+        let mut events: Deque<OdEvent, 16> = Deque::new();
 
         let frame = CanFrame::new(0x201, &[0xFF]).unwrap();
-        assert!(engine.process(&frame, &mut od));
+        assert!(engine.process(&frame, &mut od, &mut events));
         assert_eq!(od.output1, 0xFF);
+
+        // Should have generated an RPDO event
+        let evt = events.pop_front().unwrap();
+        assert_eq!(evt.index, 0x6200);
+        assert_eq!(evt.subindex, 1);
+        assert_eq!(evt.source, OdEventSource::Rpdo);
 
         // Non-matching frame
         let frame2 = CanFrame::new(0x301, &[0x00]).unwrap();
-        assert!(!engine.process(&frame2, &mut od));
+        assert!(!engine.process(&frame2, &mut od, &mut events));
         assert_eq!(od.output1, 0xFF); // unchanged
     }
 
@@ -357,24 +413,25 @@ mod tests {
 
         let mut engine = TpdoEngine::new([config]);
         let od = PdoTestOd { input1: 0x99, input2: 0, output1: 0 };
+        let dirty = Vec::<(u16, u8), 8>::new();
 
         // At t=0, diff is 0 which is < 100ms
         let mut out = Vec::<CanFrame, 1>::new();
-        engine.poll(&od, 0, &mut out);
+        engine.poll(&od, 0, &dirty, &mut out);
         assert_eq!(out.len(), 0);
 
         // At t=100ms - first send
-        engine.poll(&od, 100_000, &mut out);
+        engine.poll(&od, 100_000, &dirty, &mut out);
         assert_eq!(out.len(), 1);
 
         // 150ms later - too early
         out.clear();
-        engine.poll(&od, 150_000, &mut out);
+        engine.poll(&od, 150_000, &dirty, &mut out);
         assert_eq!(out.len(), 0);
 
         // 200ms - due again
         out.clear();
-        engine.poll(&od, 200_000, &mut out);
+        engine.poll(&od, 200_000, &dirty, &mut out);
         assert_eq!(out.len(), 1);
     }
 }

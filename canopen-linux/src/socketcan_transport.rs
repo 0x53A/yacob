@@ -1,9 +1,9 @@
-use canopen_core::transport::{CanFrame, Transport, TransportError};
+use canopen_core::transport::{CanError, CanFrame};
 use socketcan::{CanDataFrame, CanSocket, EmbeddedFrame, Frame as ScFrame, Socket, StandardId};
 
-/// Transport implementation using Linux SocketCAN.
+/// CAN transport using Linux SocketCAN, implementing `embedded_can::nb::Can`.
 ///
-/// Uses non-blocking mode internally so `recv()` returns `None` immediately
+/// Uses non-blocking mode internally so `receive()` returns `WouldBlock`
 /// when no frame is available.
 pub struct SocketcanTransport {
     socket: CanSocket,
@@ -47,21 +47,25 @@ impl SocketcanTransport {
     }
 }
 
-impl Transport for SocketcanTransport {
-    fn send(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
-        let id = StandardId::new(frame.id()).ok_or(TransportError::BusError)?;
+impl embedded_can::nb::Can for SocketcanTransport {
+    type Frame = CanFrame;
+    type Error = CanError;
+
+    fn transmit(&mut self, frame: &Self::Frame) -> nb::Result<Option<Self::Frame>, Self::Error> {
+        let id = StandardId::new(frame.raw_id()).ok_or(nb::Error::Other(CanError::BusError))?;
         let sc_frame =
-            CanDataFrame::new(id, frame.data()).ok_or(TransportError::BusError)?;
+            CanDataFrame::new(id, frame.data()).ok_or(nb::Error::Other(CanError::BusError))?;
         self.socket
             .write_frame(&sc_frame)
-            .map_err(|_| TransportError::BusError)?;
-        Ok(())
+            .map_err(|_| nb::Error::Other(CanError::BusError))?;
+        Ok(None)
     }
 
-    fn recv(&mut self) -> Option<CanFrame> {
+    fn receive(&mut self) -> nb::Result<Self::Frame, Self::Error> {
         match self.socket.read_frame() {
-            Ok(frame) => sc_frame_to_canframe(&frame),
-            Err(_) => None,
+            Ok(frame) => sc_frame_to_canframe(&frame).ok_or(nb::Error::WouldBlock),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(nb::Error::WouldBlock),
+            Err(_) => Err(nb::Error::Other(CanError::BusError)),
         }
     }
 }

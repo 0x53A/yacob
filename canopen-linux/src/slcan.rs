@@ -17,7 +17,7 @@
 //! does NOT reset the device, allowing subsequent opens to find it already
 //! streaming and skip the slow init.
 
-use canopen_core::transport::{CanFrame, Transport, TransportError};
+use canopen_core::transport::{CanError, CanFrame};
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -161,6 +161,33 @@ impl SlcanTransport {
     pub fn close(&mut self) {
         let _ = self.port.write_all(b"C\r");
     }
+
+    fn try_recv(&mut self) -> Option<CanFrame> {
+        let space = self.rx_buf.len() - self.rx_pos;
+        if space > 0 {
+            match self.port.read(&mut self.rx_buf[self.rx_pos..]) {
+                Ok(n) => self.rx_pos += n,
+                Err(_) => {}
+            }
+        }
+
+        let buf = &self.rx_buf[..self.rx_pos];
+        if let Some(cr_pos) = buf.iter().position(|&b| b == b'\r') {
+            let line = &buf[..cr_pos];
+            let frame = parse_slcan_frame(line);
+
+            let remaining = self.rx_pos - cr_pos - 1;
+            self.rx_buf.copy_within(cr_pos + 1..self.rx_pos, 0);
+            self.rx_pos = remaining;
+
+            frame
+        } else {
+            if self.rx_pos > 200 {
+                self.rx_pos = 0;
+            }
+            None
+        }
+    }
 }
 
 impl Drop for SlcanTransport {
@@ -186,10 +213,13 @@ fn has_slcan_frame(buf: &[u8]) -> bool {
     false
 }
 
-impl Transport for SlcanTransport {
-    fn send(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+impl embedded_can::nb::Can for SlcanTransport {
+    type Frame = CanFrame;
+    type Error = CanError;
+
+    fn transmit(&mut self, frame: &Self::Frame) -> nb::Result<Option<Self::Frame>, Self::Error> {
         let mut cmd = [0u8; 32];
-        let id = frame.id();
+        let id = frame.raw_id();
         let data = frame.data();
 
         let mut pos = 0;
@@ -201,7 +231,7 @@ impl Transport for SlcanTransport {
         pos += 1;
         cmd[pos] = hex_digit(id as u8 & 0x0F);
         pos += 1;
-        cmd[pos] = b'0' + frame.dlc();
+        cmd[pos] = b'0' + frame.raw_dlc();
         pos += 1;
         for &b in data {
             cmd[pos] = hex_digit(b >> 4);
@@ -214,35 +244,12 @@ impl Transport for SlcanTransport {
 
         self.port
             .write_all(&cmd[..pos])
-            .map_err(|_| TransportError::BusError)?;
-        Ok(())
+            .map_err(|_| nb::Error::Other(CanError::BusError))?;
+        Ok(None)
     }
 
-    fn recv(&mut self) -> Option<CanFrame> {
-        let space = self.rx_buf.len() - self.rx_pos;
-        if space > 0 {
-            match self.port.read(&mut self.rx_buf[self.rx_pos..]) {
-                Ok(n) => self.rx_pos += n,
-                Err(_) => {}
-            }
-        }
-
-        let buf = &self.rx_buf[..self.rx_pos];
-        if let Some(cr_pos) = buf.iter().position(|&b| b == b'\r') {
-            let line = &buf[..cr_pos];
-            let frame = parse_slcan_frame(line);
-
-            let remaining = self.rx_pos - cr_pos - 1;
-            self.rx_buf.copy_within(cr_pos + 1..self.rx_pos, 0);
-            self.rx_pos = remaining;
-
-            frame
-        } else {
-            if self.rx_pos > 200 {
-                self.rx_pos = 0;
-            }
-            None
-        }
+    fn receive(&mut self) -> nb::Result<Self::Frame, Self::Error> {
+        self.try_recv().ok_or(nb::Error::WouldBlock)
     }
 }
 
@@ -297,8 +304,8 @@ mod tests {
     fn parse_standard_frame() {
         let line = b"t1FF8DEADBEEFCAFEBABE";
         let frame = parse_slcan_frame(line).unwrap();
-        assert_eq!(frame.id(), 0x1FF);
-        assert_eq!(frame.dlc(), 8);
+        assert_eq!(frame.raw_id(), 0x1FF);
+        assert_eq!(frame.raw_dlc(), 8);
         assert_eq!(
             frame.data(),
             &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]
@@ -309,8 +316,8 @@ mod tests {
     fn parse_heartbeat_frame() {
         let line = b"t701105";
         let frame = parse_slcan_frame(line).unwrap();
-        assert_eq!(frame.id(), 0x701);
-        assert_eq!(frame.dlc(), 1);
+        assert_eq!(frame.raw_id(), 0x701);
+        assert_eq!(frame.raw_dlc(), 1);
         assert_eq!(frame.data(), &[0x05]);
     }
 

@@ -3,7 +3,7 @@ name = "canopen-linux"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Linux socketcan transport and utilities for canopen-rs"
+description = "Linux transports (socketcan, SLCAN, UDP multicast) and utilities for canopen-rs"
 
 [dependencies]
 canopen-core = { path = "../canopen-core", features = ["std"] }
@@ -11,5 +11,9 @@ canopen-derive = { path = "../canopen-derive" }
 socketcan = "3.5"
 embedded-can = "0.4"
 libc = "0.2"
+nb = "1.1.0"
+rmp-serde = "1.3.1"
+serde = { version = "1.0.228", features = ["derive"] }
+socket2 = "0.6.3"
 
 [dev-dependencies]
