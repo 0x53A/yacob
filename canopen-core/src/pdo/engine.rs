@@ -125,11 +125,7 @@ impl<const N: usize> TpdoEngine<N> {
     }
 
     /// Called on SYNC reception. Returns frames to transmit for sync-triggered PDOs.
-    pub fn on_sync<OD: ObjectDictionary>(
-        &mut self,
-        od: &OD,
-        out: &mut Vec<CanFrame, N>,
-    ) {
+    pub fn on_sync<OD: ObjectDictionary>(&mut self, od: &OD, out: &mut Vec<CanFrame, N>) {
         for i in 0..N {
             if !self.pdos[i].enabled {
                 continue;
@@ -178,9 +174,12 @@ impl<const N: usize> TpdoEngine<N> {
             let elapsed = now_us.wrapping_sub(self.last_send_us[i]);
 
             // Check if any mapped entry was marked dirty
-            let has_dirty = !dirty.is_empty() && self.pdos[i].mappings.iter().any(|m| {
-                dirty.iter().any(|&(idx, sub)| idx == m.index && sub == m.subindex)
-            });
+            let has_dirty = !dirty.is_empty()
+                && self.pdos[i].mappings.iter().any(|m| {
+                    dirty
+                        .iter()
+                        .any(|&(idx, sub)| idx == m.index && sub == m.subindex)
+                });
 
             // Send on dirty trigger (respecting inhibit time) or event timer
             let timer_trigger = self.pdos[i].event_timer_ms > 0 && {
@@ -268,11 +267,14 @@ impl<const N: usize> RpdoEngine<N> {
                 if byte_offset + byte_len > data.len() {
                     break;
                 }
-                if od.write(
-                    mapping.index,
-                    mapping.subindex,
-                    &data[byte_offset..byte_offset + byte_len],
-                ).is_ok() {
+                if od
+                    .write(
+                        mapping.index,
+                        mapping.subindex,
+                        &data[byte_offset..byte_offset + byte_len],
+                    )
+                    .is_ok()
+                {
                     if events.is_full() {
                         let _ = events.pop_front();
                     }
@@ -293,8 +295,8 @@ impl<const N: usize> RpdoEngine<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::od::*;
     use crate::datatypes::DataType;
+    use crate::od::*;
 
     struct PdoTestOd {
         input1: u8,
@@ -304,45 +306,88 @@ mod tests {
 
     static PDO_TEST_META: &[OdEntryMeta] = &[
         OdEntryMeta {
-            index: 0x6000, subindex: 1, data_type: DataType::U8,
-            access: AccessType::Ro, pdo_mappable: true, name: "input1", max_size: None,
+            index: 0x6000,
+            subindex: 1,
+            data_type: DataType::U8,
+            access: AccessType::Ro,
+            pdo_mappable: true,
+            name: "input1",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x6000, subindex: 2, data_type: DataType::U16,
-            access: AccessType::Ro, pdo_mappable: true, name: "input2", max_size: None,
+            index: 0x6000,
+            subindex: 2,
+            data_type: DataType::U16,
+            access: AccessType::Ro,
+            pdo_mappable: true,
+            name: "input2",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x6200, subindex: 1, data_type: DataType::U8,
-            access: AccessType::Rw, pdo_mappable: true, name: "output1", max_size: None,
+            index: 0x6200,
+            subindex: 1,
+            data_type: DataType::U8,
+            access: AccessType::Rw,
+            pdo_mappable: true,
+            name: "output1",
+            max_size: None,
         },
     ];
 
     impl ObjectDictionary for PdoTestOd {
         fn lookup(&self, index: u16, subindex: u8) -> Option<&'static OdEntryMeta> {
-            PDO_TEST_META.iter().find(|e| e.index == index && e.subindex == subindex)
+            PDO_TEST_META
+                .iter()
+                .find(|e| e.index == index && e.subindex == subindex)
         }
         fn read(&self, index: u16, subindex: u8, buf: &mut [u8]) -> Result<usize, OdError> {
             match (index, subindex) {
-                (0x6000, 1) => { buf[0] = self.input1; Ok(1) }
-                (0x6000, 2) => { buf[..2].copy_from_slice(&self.input2.to_le_bytes()); Ok(2) }
-                (0x6200, 1) => { buf[0] = self.output1; Ok(1) }
+                (0x6000, 1) => {
+                    buf[0] = self.input1;
+                    Ok(1)
+                }
+                (0x6000, 2) => {
+                    buf[..2].copy_from_slice(&self.input2.to_le_bytes());
+                    Ok(2)
+                }
+                (0x6200, 1) => {
+                    buf[0] = self.output1;
+                    Ok(1)
+                }
                 _ => Err(OdError::NotFound),
             }
         }
         fn write(&mut self, index: u16, subindex: u8, data: &[u8]) -> Result<(), OdError> {
             match (index, subindex) {
-                (0x6200, 1) => { self.output1 = data[0]; Ok(()) }
+                (0x6200, 1) => {
+                    self.output1 = data[0];
+                    Ok(())
+                }
                 _ => Err(OdError::ReadOnly),
             }
         }
-        fn sub_count(&self, _index: u16) -> Option<u8> { None }
+        fn sub_count(&self, _index: u16) -> Option<u8> {
+            None
+        }
     }
 
     #[test]
     fn tpdo_sync_cyclic() {
         let mut mappings = Vec::<PdoMapping, 8>::new();
-        mappings.push(PdoMapping { index: 0x6000, subindex: 1, bit_length: 8 }).unwrap();
-        mappings.push(PdoMapping { index: 0x6000, subindex: 2, bit_length: 16 }).unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 2,
+                bit_length: 16,
+            })
+            .unwrap();
 
         let config = TpdoConfig {
             cob_id: 0x181,
@@ -354,7 +399,11 @@ mod tests {
         };
 
         let mut engine = TpdoEngine::new([config]);
-        let od = PdoTestOd { input1: 0x42, input2: 0x1234, output1: 0 };
+        let od = PdoTestOd {
+            input1: 0x42,
+            input2: 0x1234,
+            output1: 0,
+        };
         let mut out = Vec::<CanFrame, 1>::new();
 
         engine.on_sync(&od, &mut out);
@@ -368,7 +417,13 @@ mod tests {
     #[test]
     fn rpdo_process() {
         let mut mappings = Vec::<PdoMapping, 8>::new();
-        mappings.push(PdoMapping { index: 0x6200, subindex: 1, bit_length: 8 }).unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
 
         let config = RpdoConfig {
             cob_id: 0x201,
@@ -378,7 +433,11 @@ mod tests {
         };
 
         let engine = RpdoEngine::new([config]);
-        let mut od = PdoTestOd { input1: 0, input2: 0, output1: 0 };
+        let mut od = PdoTestOd {
+            input1: 0,
+            input2: 0,
+            output1: 0,
+        };
         let mut events: Deque<OdEvent, 16> = Deque::new();
 
         let frame = CanFrame::new(0x201, &[0xFF]).unwrap();
@@ -400,7 +459,13 @@ mod tests {
     #[test]
     fn tpdo_event_timer() {
         let mut mappings = Vec::<PdoMapping, 8>::new();
-        mappings.push(PdoMapping { index: 0x6000, subindex: 1, bit_length: 8 }).unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
 
         let config = TpdoConfig {
             cob_id: 0x181,
@@ -412,7 +477,11 @@ mod tests {
         };
 
         let mut engine = TpdoEngine::new([config]);
-        let od = PdoTestOd { input1: 0x99, input2: 0, output1: 0 };
+        let od = PdoTestOd {
+            input1: 0x99,
+            input2: 0,
+            output1: 0,
+        };
         let dirty = Vec::<(u16, u8), 8>::new();
 
         // At t=0, diff is 0 which is < 100ms

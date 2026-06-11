@@ -18,10 +18,24 @@ pub enum SdoClientResult {
 
 enum State {
     Idle,
-    WaitingUploadInitResponse { index: u16, subindex: u8 },
-    UploadSegmented { index: u16, subindex: u8, toggle: bool },
-    WaitingDownloadInitResponse { index: u16, subindex: u8 },
-    DownloadSegmented { index: u16, subindex: u8, toggle: bool },
+    WaitingUploadInitResponse {
+        index: u16,
+        subindex: u8,
+    },
+    UploadSegmented {
+        index: u16,
+        subindex: u8,
+        toggle: bool,
+    },
+    WaitingDownloadInitResponse {
+        index: u16,
+        subindex: u8,
+    },
+    DownloadSegmented {
+        index: u16,
+        subindex: u8,
+        toggle: bool,
+    },
 }
 
 /// SDO client for talking to a remote CANopen node.
@@ -88,8 +102,7 @@ impl<const BUF: usize> SdoClient<BUF> {
             let n = 4 - value.len();
             let mut data = [0u8; 8];
             // CCS=1, n, e=1, s=1
-            data[0] =
-                (Ccs::InitiateDownload as u8) << 5 | (n as u8) << 2 | 0x02 | 0x01;
+            data[0] = (Ccs::InitiateDownload as u8) << 5 | (n as u8) << 2 | 0x02 | 0x01;
             data[1] = (index & 0xFF) as u8;
             data[2] = (index >> 8) as u8;
             data[3] = subindex;
@@ -120,12 +133,7 @@ impl<const BUF: usize> SdoClient<BUF> {
         // Check for abort
         if cs == Scs::AbortTransfer as u8 {
             self.state = State::Idle;
-            let code = u32::from_le_bytes([
-                response[4],
-                response[5],
-                response[6],
-                response[7],
-            ]);
+            let code = u32::from_le_bytes([response[4], response[5], response[6], response[7]]);
             // Find matching abort code
             return SdoClientResult::Aborted(match code {
                 0x0503_0000 => AbortCode::ToggleBitNotAlternated,
@@ -208,12 +216,9 @@ impl<const BUF: usize> SdoClient<BUF> {
         } else {
             // Segmented transfer
             if size_indicated {
-                self.total_len = u32::from_le_bytes([
-                    response[4],
-                    response[5],
-                    response[6],
-                    response[7],
-                ]) as usize;
+                self.total_len =
+                    u32::from_le_bytes([response[4], response[5], response[6], response[7]])
+                        as usize;
             }
 
             let (index, subindex) = match &self.state {
@@ -259,8 +264,7 @@ impl<const BUF: usize> SdoClient<BUF> {
             return SdoClientResult::Error;
         }
 
-        self.buf[self.offset..self.offset + seg_len]
-            .copy_from_slice(&response[1..1 + seg_len]);
+        self.buf[self.offset..self.offset + seg_len].copy_from_slice(&response[1..1 + seg_len]);
         self.offset += seg_len;
 
         if last {
@@ -349,9 +353,7 @@ impl<const BUF: usize> SdoClient<BUF> {
             | if toggle { 0x10 } else { 0 }
             | (n as u8) << 1
             | if last { 0x01 } else { 0 };
-        data[1..1 + seg_len].copy_from_slice(
-            &self.buf[self.offset..self.offset + seg_len],
-        );
+        data[1..1 + seg_len].copy_from_slice(&self.buf[self.offset..self.offset + seg_len]);
         self.offset += seg_len;
 
         CanFrame::new(self.tx_cobid(), &data).unwrap()
@@ -361,9 +363,9 @@ impl<const BUF: usize> SdoClient<BUF> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sdo::server::SdoServer;
-    use crate::od::*;
     use crate::datatypes::DataType;
+    use crate::od::*;
+    use crate::sdo::server::SdoServer;
 
     /// Minimal test OD for client-server tests.
     struct TestOd {
@@ -374,28 +376,54 @@ mod tests {
 
     static CLIENT_TEST_META: &[OdEntryMeta] = &[
         OdEntryMeta {
-            index: 0x1000, subindex: 0, data_type: DataType::U32,
-            access: AccessType::Ro, pdo_mappable: false, name: "val_u32", max_size: None,
+            index: 0x1000,
+            subindex: 0,
+            data_type: DataType::U32,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "val_u32",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x2000, subindex: 0, data_type: DataType::U16,
-            access: AccessType::Rw, pdo_mappable: false, name: "val_u16", max_size: None,
+            index: 0x2000,
+            subindex: 0,
+            data_type: DataType::U16,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "val_u16",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x2001, subindex: 0, data_type: DataType::OctetString,
-            access: AccessType::Rw, pdo_mappable: false, name: "blob", max_size: None,
+            index: 0x2001,
+            subindex: 0,
+            data_type: DataType::OctetString,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "blob",
+            max_size: None,
         },
     ];
 
     impl ObjectDictionary for TestOd {
         fn lookup(&self, index: u16, subindex: u8) -> Option<&'static OdEntryMeta> {
-            CLIENT_TEST_META.iter().find(|e| e.index == index && e.subindex == subindex)
+            CLIENT_TEST_META
+                .iter()
+                .find(|e| e.index == index && e.subindex == subindex)
         }
         fn read(&self, index: u16, subindex: u8, buf: &mut [u8]) -> Result<usize, OdError> {
             match (index, subindex) {
-                (0x1000, 0) => { buf[..4].copy_from_slice(&self.val_u32.to_le_bytes()); Ok(4) }
-                (0x2000, 0) => { buf[..2].copy_from_slice(&self.val_u16.to_le_bytes()); Ok(2) }
-                (0x2001, 0) => { buf[..20].copy_from_slice(&self.blob); Ok(20) }
+                (0x1000, 0) => {
+                    buf[..4].copy_from_slice(&self.val_u32.to_le_bytes());
+                    Ok(4)
+                }
+                (0x2000, 0) => {
+                    buf[..2].copy_from_slice(&self.val_u16.to_le_bytes());
+                    Ok(2)
+                }
+                (0x2001, 0) => {
+                    buf[..20].copy_from_slice(&self.blob);
+                    Ok(20)
+                }
                 _ => Err(OdError::NotFound),
             }
         }
@@ -403,12 +431,16 @@ mod tests {
             match (index, subindex) {
                 (0x1000, 0) => Err(OdError::ReadOnly),
                 (0x2000, 0) => {
-                    if data.len() != 2 { return Err(OdError::DataTypeMismatch); }
+                    if data.len() != 2 {
+                        return Err(OdError::DataTypeMismatch);
+                    }
                     self.val_u16 = u16::from_le_bytes([data[0], data[1]]);
                     Ok(())
                 }
                 (0x2001, 0) => {
-                    if data.len() > 20 { return Err(OdError::ValueTooLong); }
+                    if data.len() > 20 {
+                        return Err(OdError::ValueTooLong);
+                    }
                     self.blob = [0; 20];
                     self.blob[..data.len()].copy_from_slice(data);
                     Ok(())
@@ -416,11 +448,18 @@ mod tests {
                 _ => Err(OdError::NotFound),
             }
         }
-        fn sub_count(&self, _index: u16) -> Option<u8> { Some(0) }
+        fn sub_count(&self, _index: u16) -> Option<u8> {
+            Some(0)
+        }
     }
 
     /// Run a complete SDO transfer between client and server in-memory.
-    fn run_transfer(client: &mut SdoClient<256>, server: &mut SdoServer, od: &mut TestOd, first_frame: CanFrame) -> SdoClientResult {
+    fn run_transfer(
+        client: &mut SdoClient<256>,
+        server: &mut SdoServer,
+        od: &mut TestOd,
+        first_frame: CanFrame,
+    ) -> SdoClientResult {
         use crate::nmt::NmtState;
         use crate::od::OdEvent;
         use heapless::Deque;
@@ -431,7 +470,16 @@ mod tests {
 
         let mut resp_data = [0u8; 8];
         let mut events: Deque<OdEvent, 16> = Deque::new();
-        server.process(&req_data, od, &mut resp_data, &mut events, NmtState::PreOperational, 0).unwrap();
+        server
+            .process(
+                &req_data,
+                od,
+                &mut resp_data,
+                &mut events,
+                NmtState::PreOperational,
+                0,
+            )
+            .unwrap();
 
         let mut result = client.process_response(&resp_data);
 
@@ -440,7 +488,16 @@ mod tests {
             match result {
                 SdoClientResult::SendNext(frame) => {
                     req_data.copy_from_slice(frame.data());
-                    server.process(&req_data, od, &mut resp_data, &mut events, NmtState::PreOperational, 0).unwrap();
+                    server
+                        .process(
+                            &req_data,
+                            od,
+                            &mut resp_data,
+                            &mut events,
+                            NmtState::PreOperational,
+                            0,
+                        )
+                        .unwrap();
                     result = client.process_response(&resp_data);
                 }
                 _ => return result,
@@ -453,7 +510,11 @@ mod tests {
         let target = NodeId::new(1).unwrap();
         let mut client = SdoClient::<256>::new(target);
         let mut server = SdoServer::new();
-        let mut od = TestOd { val_u32: 0xDEADBEEF, val_u16: 0, blob: [0; 20] };
+        let mut od = TestOd {
+            val_u32: 0xDEADBEEF,
+            val_u16: 0,
+            blob: [0; 20],
+        };
 
         let req = client.start_upload(0x1000, 0);
         match run_transfer(&mut client, &mut server, &mut od, req) {
@@ -470,7 +531,11 @@ mod tests {
         let target = NodeId::new(1).unwrap();
         let mut client = SdoClient::<256>::new(target);
         let mut server = SdoServer::new();
-        let mut od = TestOd { val_u32: 0, val_u16: 0, blob: [0; 20] };
+        let mut od = TestOd {
+            val_u32: 0,
+            val_u16: 0,
+            blob: [0; 20],
+        };
 
         let req = client.start_download(0x2000, 0, &0xCAFEu16.to_le_bytes());
         match run_transfer(&mut client, &mut server, &mut od, req) {
@@ -486,7 +551,11 @@ mod tests {
         let target = NodeId::new(1).unwrap();
         let mut client = SdoClient::<256>::new(target);
         let mut server = SdoServer::new();
-        let mut od = TestOd { val_u32: 0, val_u16: 0, blob: [0xBB; 20] };
+        let mut od = TestOd {
+            val_u32: 0,
+            val_u16: 0,
+            blob: [0xBB; 20],
+        };
 
         let req = client.start_upload(0x2001, 0);
         match run_transfer(&mut client, &mut server, &mut od, req) {
@@ -503,9 +572,15 @@ mod tests {
         let target = NodeId::new(1).unwrap();
         let mut client = SdoClient::<256>::new(target);
         let mut server = SdoServer::new();
-        let mut od = TestOd { val_u32: 0, val_u16: 0, blob: [0; 20] };
+        let mut od = TestOd {
+            val_u32: 0,
+            val_u16: 0,
+            blob: [0; 20],
+        };
 
-        let data: [u8; 20] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+        let data: [u8; 20] = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        ];
         let req = client.start_download(0x2001, 0, &data);
         match run_transfer(&mut client, &mut server, &mut od, req) {
             SdoClientResult::DownloadComplete => {
@@ -520,7 +595,11 @@ mod tests {
         let target = NodeId::new(1).unwrap();
         let mut client = SdoClient::<256>::new(target);
         let mut server = SdoServer::new();
-        let mut od = TestOd { val_u32: 0, val_u16: 0, blob: [0; 20] };
+        let mut od = TestOd {
+            val_u32: 0,
+            val_u16: 0,
+            blob: [0; 20],
+        };
 
         let req = client.start_upload(0xFFFF, 0);
         match run_transfer(&mut client, &mut server, &mut od, req) {

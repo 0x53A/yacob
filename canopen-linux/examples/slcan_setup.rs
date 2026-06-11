@@ -6,8 +6,8 @@
 //!
 //! Usage: cargo run --example slcan_setup -- /dev/ttyACM1
 
-use embedded_can::nb::Can;
 use canopen_linux::slcan::{SlcanBitrate, SlcanTransport};
+use embedded_can::nb::Can;
 use std::time::{Duration, Instant};
 
 fn main() {

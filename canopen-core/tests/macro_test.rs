@@ -103,7 +103,16 @@ fn macro_od_with_sdo_server() {
     // SDO upload request for 0x1000:0
     let req = [0x40, 0x00, 0x10, 0x00, 0, 0, 0, 0];
     let mut events: heapless::Deque<canopen_core::OdEvent, 16> = heapless::Deque::new();
-    server.process(&req, &mut od, &mut resp, &mut events, canopen_core::NmtState::Operational, 0).unwrap();
+    server
+        .process(
+            &req,
+            &mut od,
+            &mut resp,
+            &mut events,
+            canopen_core::NmtState::Operational,
+            0,
+        )
+        .unwrap();
 
     // Check expedited response
     assert_eq!(resp[4..8], 0x191u32.to_le_bytes());
@@ -177,7 +186,10 @@ fn variable_length_capacity_overflow() {
 fn visible_string_metadata() {
     let od = TestOd::new();
     let meta = od.lookup(0x1008, 0).unwrap();
-    assert_eq!(meta.data_type, canopen_core::datatypes::DataType::VisibleString);
+    assert_eq!(
+        meta.data_type,
+        canopen_core::datatypes::DataType::VisibleString
+    );
     assert_eq!(meta.max_size, Some(32));
 }
 
@@ -223,7 +235,10 @@ fn array_out_of_range() {
     let mut buf = [0u8; 4];
 
     // sub9 is out of range for 8-element array
-    assert_eq!(od.read(0x1003, 9, &mut buf), Err(canopen_core::od::OdError::NotFound));
+    assert_eq!(
+        od.read(0x1003, 9, &mut buf),
+        Err(canopen_core::od::OdError::NotFound)
+    );
 }
 
 #[test]
@@ -231,10 +246,16 @@ fn array_readonly_rejects_write() {
     let mut od = TestOd::new();
 
     // error_field is ro
-    assert_eq!(od.write(0x1003, 1, &0u32.to_le_bytes()), Err(canopen_core::od::OdError::ReadOnly));
+    assert_eq!(
+        od.write(0x1003, 1, &0u32.to_le_bytes()),
+        Err(canopen_core::od::OdError::ReadOnly)
+    );
 
     // sub0 is always ro
-    assert_eq!(od.write(0x2030, 0, &[1]), Err(canopen_core::od::OdError::ReadOnly));
+    assert_eq!(
+        od.write(0x2030, 0, &[1]),
+        Err(canopen_core::od::OdError::ReadOnly)
+    );
 }
 
 #[test]
@@ -449,7 +470,12 @@ fn store_eds_compressed() {
 fn store_eds_smaller_than_original() {
     let original = TestOd::EDS.as_bytes().len();
     let compressed = TestOd::EDS_COMPRESSED.len();
-    assert!(compressed < original, "compressed {} >= original {}", compressed, original);
+    assert!(
+        compressed < original,
+        "compressed {} >= original {}",
+        compressed,
+        original
+    );
 }
 
 #[test]
@@ -464,8 +490,14 @@ fn store_format_is_compressed() {
 #[test]
 fn store_eds_is_readonly() {
     let mut od = TestOd::new();
-    assert_eq!(od.write(0x1021, 0, &[0]), Err(canopen_core::od::OdError::ReadOnly));
-    assert_eq!(od.write(0x1022, 0, &[1]), Err(canopen_core::od::OdError::ReadOnly));
+    assert_eq!(
+        od.write(0x1021, 0, &[0]),
+        Err(canopen_core::od::OdError::ReadOnly)
+    );
+    assert_eq!(
+        od.write(0x1022, 0, &[1]),
+        Err(canopen_core::od::OdError::ReadOnly)
+    );
 }
 
 #[test]
@@ -565,7 +597,10 @@ fn alloc_od_no_capacity_needed() {
     let od = AllocOd::new();
     // Metadata reports no max_size for alloc types
     let meta = od.lookup(0x1008, 0).unwrap();
-    assert_eq!(meta.data_type, canopen_core::datatypes::DataType::VisibleString);
+    assert_eq!(
+        meta.data_type,
+        canopen_core::datatypes::DataType::VisibleString
+    );
     assert_eq!(meta.max_size, None);
 }
 
@@ -581,7 +616,12 @@ object_dictionary! {
 
 impl ValidatedOd {
     /// Application validation: level must be <= 1000.
-    fn check_value(&self, index: u16, subindex: u8, data: &[u8]) -> Result<(), canopen_core::od::OdError> {
+    fn check_value(
+        &self,
+        index: u16,
+        subindex: u8,
+        data: &[u8],
+    ) -> Result<(), canopen_core::od::OdError> {
         if index == 0x2000 && subindex == 0 && data.len() >= 2 {
             let val = u16::from_le_bytes([data[0], data[1]]);
             if val > 1000 {
@@ -613,9 +653,9 @@ fn validate_write_macro_rejects_invalid() {
 
 #[test]
 fn validate_write_macro_sdo_server_rejects() {
-    use canopen_core::sdo::SdoServer;
-    use canopen_core::od::OdEvent;
     use canopen_core::nmt::NmtState;
+    use canopen_core::od::OdEvent;
+    use canopen_core::sdo::SdoServer;
 
     let mut od = ValidatedOd::new();
     od.level = 42;
@@ -631,13 +671,30 @@ fn validate_write_macro_sdo_server_rejects() {
         0xD0, 0x07, // value 2000 in LE
         0x00, 0x00,
     ];
-    server.process(&req, &mut od, &mut resp, &mut events, NmtState::Operational, 0).unwrap();
+    server
+        .process(
+            &req,
+            &mut od,
+            &mut resp,
+            &mut events,
+            NmtState::Operational,
+            0,
+        )
+        .unwrap();
 
     // Should have gotten an abort response (SCS=4 = 0x80)
-    assert_eq!(resp[0] & 0xE0, 0x80, "expected abort response, got 0x{:02X}", resp[0]);
+    assert_eq!(
+        resp[0] & 0xE0,
+        0x80,
+        "expected abort response, got 0x{:02X}",
+        resp[0]
+    );
     // Abort code should be ValueRangeExceeded = 0x0609_0030
     let abort_code = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
-    assert_eq!(abort_code, 0x0609_0030, "expected ValueRangeExceeded abort code");
+    assert_eq!(
+        abort_code, 0x0609_0030,
+        "expected ValueRangeExceeded abort code"
+    );
     // Value should NOT have been written
     assert_eq!(od.level, 42);
     // No event should have been pushed

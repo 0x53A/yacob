@@ -120,7 +120,12 @@ object_dictionary! {
 
 impl SensorHubOd {
     /// Validate threshold writes: reject temp_high < temp_low and adc_high < adc_low.
-    fn check_thresholds(&self, index: u16, subindex: u8, data: &[u8]) -> Result<(), canopen_core::od::OdError> {
+    fn check_thresholds(
+        &self,
+        index: u16,
+        subindex: u8,
+        data: &[u8],
+    ) -> Result<(), canopen_core::od::OdError> {
         match (index, subindex) {
             // temp_high being written — check it's >= current temp_low
             (0x6100, 1) if data.len() >= 2 => {
@@ -162,7 +167,9 @@ struct StdClock {
 
 impl StdClock {
     fn new() -> Self {
-        Self { start: Instant::now() }
+        Self {
+            start: Instant::now(),
+        }
     }
 }
 
@@ -242,8 +249,14 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
     let mut temp_alarm_active = [false; 4];
 
     eprintln!("Sensor hub node {} running", node_id.raw());
-    eprintln!("TPDO1 (temps):  0x{:03X}, 100ms event timer", 0x180 + node_id.raw() as u16);
-    eprintln!("TPDO2 (analog): 0x{:03X}, 250ms event timer", 0x280 + node_id.raw() as u16);
+    eprintln!(
+        "TPDO1 (temps):  0x{:03X}, 100ms event timer",
+        0x180 + node_id.raw() as u16
+    );
+    eprintln!(
+        "TPDO2 (analog): 0x{:03X}, 250ms event timer",
+        0x280 + node_id.raw() as u16
+    );
     eprintln!("RPDO1 (thresh): 0x{:03X}", 0x200 + node_id.raw() as u16);
 
     let mut last_print = Instant::now();
@@ -265,7 +278,12 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
         }
 
         // Check alarm thresholds
-        let temps = [readings.temp1, readings.temp2, readings.temp3, readings.temp4];
+        let temps = [
+            readings.temp1,
+            readings.temp2,
+            readings.temp3,
+            readings.temp4,
+        ];
         let high_thresh = node.od().temp_high;
         let low_thresh = node.od().temp_low;
 
@@ -283,11 +301,15 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
                 let vendor_data = [(i + 1) as u8, 0, 0, 0, 0]; // sensor index in vendor bytes
                 node.set_error(
                     0x4200, // Temperature error (CiA 404)
-                    canopen_core::error_register::GENERIC | canopen_core::error_register::TEMPERATURE,
+                    canopen_core::error_register::GENERIC
+                        | canopen_core::error_register::TEMPERATURE,
                     &vendor_data,
                 );
-                eprintln!("ALARM: Sensor {} temp={:.1}C exceeds threshold",
-                         i + 1, temp as f64 / 10.0);
+                eprintln!(
+                    "ALARM: Sensor {} temp={:.1}C exceeds threshold",
+                    i + 1,
+                    temp as f64 / 10.0
+                );
                 temp_alarm_active[i] = true;
             } else if !over && temp_alarm_active[i] {
                 // Alarm cleared
@@ -303,12 +325,16 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
         while let Some(evt) = node.next_event() {
             match (evt.index, evt.subindex) {
                 (0x6100, 1) => {
-                    eprintln!("Threshold updated: temp_high = {:.1}C",
-                             node.od().temp_high as f64 / 10.0);
+                    eprintln!(
+                        "Threshold updated: temp_high = {:.1}C",
+                        node.od().temp_high as f64 / 10.0
+                    );
                 }
                 (0x6100, 2) => {
-                    eprintln!("Threshold updated: temp_low = {:.1}C",
-                             node.od().temp_low as f64 / 10.0);
+                    eprintln!(
+                        "Threshold updated: temp_low = {:.1}C",
+                        node.od().temp_low as f64 / 10.0
+                    );
                 }
                 (0x6100, 3) => eprintln!("Threshold updated: adc_high = {}", node.od().adc_high),
                 (0x6100, 4) => eprintln!("Threshold updated: adc_low = {}", node.od().adc_low),
@@ -319,16 +345,22 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
         // Periodic status print
         if last_print.elapsed() >= std::time::Duration::from_secs(5) {
             let dropped = node.events_dropped();
-            eprintln!("temps=[{:.1} {:.1} {:.1} {:.1}]C  adc=[{} {}]  state={:?}  alarms={:?}{}",
-                     readings.temp1 as f64 / 10.0,
-                     readings.temp2 as f64 / 10.0,
-                     readings.temp3 as f64 / 10.0,
-                     readings.temp4 as f64 / 10.0,
-                     readings.adc1,
-                     readings.adc2,
-                     node.state(),
-                     temp_alarm_active,
-                     if dropped > 0 { format!("  WARN: {} events dropped", dropped) } else { String::new() });
+            eprintln!(
+                "temps=[{:.1} {:.1} {:.1} {:.1}]C  adc=[{} {}]  state={:?}  alarms={:?}{}",
+                readings.temp1 as f64 / 10.0,
+                readings.temp2 as f64 / 10.0,
+                readings.temp3 as f64 / 10.0,
+                readings.temp4 as f64 / 10.0,
+                readings.adc1,
+                readings.adc2,
+                node.state(),
+                temp_alarm_active,
+                if dropped > 0 {
+                    format!("  WARN: {} events dropped", dropped)
+                } else {
+                    String::new()
+                }
+            );
             last_print = Instant::now();
         }
 
@@ -349,8 +381,8 @@ fn main() {
         _ => {
             let iface = std::env::var("CAN_IFACE").unwrap_or("vcan0".into());
             eprintln!("Sensor hub on {}", iface);
-            let mut transport = SocketcanTransport::open(&iface)
-                .expect("Failed to open CAN interface");
+            let mut transport =
+                SocketcanTransport::open(&iface).expect("Failed to open CAN interface");
             run_node(&mut transport);
         }
     }

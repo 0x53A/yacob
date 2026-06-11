@@ -216,7 +216,8 @@ impl SdoDriver {
         val: u16,
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<(), SdoError<E>> {
-        self.download(index, subindex, &val.to_le_bytes(), can).await
+        self.download(index, subindex, &val.to_le_bytes(), can)
+            .await
     }
 
     pub async fn write_u32<E: core::fmt::Debug>(
@@ -226,7 +227,8 @@ impl SdoDriver {
         val: u32,
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<(), SdoError<E>> {
-        self.download(index, subindex, &val.to_le_bytes(), can).await
+        self.download(index, subindex, &val.to_le_bytes(), can)
+            .await
     }
 
     pub async fn write_f32<E: core::fmt::Debug>(
@@ -236,7 +238,8 @@ impl SdoDriver {
         val: f32,
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<(), SdoError<E>> {
-        self.download(index, subindex, &val.to_le_bytes(), can).await
+        self.download(index, subindex, &val.to_le_bytes(), can)
+            .await
     }
 
     /// Read a value with a timeout.
@@ -448,7 +451,14 @@ mod tests {
             let mut events: heapless::Deque<OdEvent, 16> = heapless::Deque::new();
             if self
                 .server
-                .process(&req, self.od, &mut resp, &mut events, NmtState::Operational, 0)
+                .process(
+                    &req,
+                    self.od,
+                    &mut resp,
+                    &mut events,
+                    NmtState::Operational,
+                    0,
+                )
                 .is_ok()
             {
                 let resp_cob = 0x580 + 1; // node 1
@@ -555,8 +565,7 @@ mod tests {
             fn clone(p: *const ()) -> RawWaker {
                 RawWaker::new(p, &VTABLE)
             }
-            const VTABLE: RawWakerVTable =
-                RawWakerVTable::new(clone, no_op, no_op, no_op);
+            const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTABLE)
         }
 
@@ -668,31 +677,43 @@ mod tests {
         value: u16,
     }
 
-    static VALIDATING_META: &[OdEntryMeta] = &[
-        OdEntryMeta {
-            index: 0x2000, subindex: 0, data_type: DataType::U16,
-            access: AccessType::Rw, pdo_mappable: false, name: "value",
-            max_size: None,
-        },
-    ];
+    static VALIDATING_META: &[OdEntryMeta] = &[OdEntryMeta {
+        index: 0x2000,
+        subindex: 0,
+        data_type: DataType::U16,
+        access: AccessType::Rw,
+        pdo_mappable: false,
+        name: "value",
+        max_size: None,
+    }];
 
     impl ObjectDictionary for ValidatingOd {
         fn lookup(&self, index: u16, subindex: u8) -> Option<&'static OdEntryMeta> {
-            VALIDATING_META.iter().find(|e| e.index == index && e.subindex == subindex)
+            VALIDATING_META
+                .iter()
+                .find(|e| e.index == index && e.subindex == subindex)
         }
         fn read(&self, index: u16, subindex: u8, buf: &mut [u8]) -> Result<usize, OdError> {
             match (index, subindex) {
-                (0x2000, 0) => { buf[..2].copy_from_slice(&self.value.to_le_bytes()); Ok(2) }
+                (0x2000, 0) => {
+                    buf[..2].copy_from_slice(&self.value.to_le_bytes());
+                    Ok(2)
+                }
                 _ => Err(OdError::NotFound),
             }
         }
         fn write(&mut self, index: u16, subindex: u8, data: &[u8]) -> Result<(), OdError> {
             match (index, subindex) {
-                (0x2000, 0) => { self.value = u16::from_le_bytes([data[0], data[1]]); Ok(()) }
+                (0x2000, 0) => {
+                    self.value = u16::from_le_bytes([data[0], data[1]]);
+                    Ok(())
+                }
                 _ => Err(OdError::NotFound),
             }
         }
-        fn sub_count(&self, _: u16) -> Option<u8> { Some(0) }
+        fn sub_count(&self, _: u16) -> Option<u8> {
+            Some(0)
+        }
 
         fn validate_write(&self, index: u16, subindex: u8, data: &[u8]) -> Result<(), OdError> {
             if index == 0x2000 && subindex == 0 {
@@ -740,7 +761,9 @@ mod tests {
     use core::cell::Cell;
     struct TickingClock(Cell<u64>);
     impl TickingClock {
-        fn new() -> Self { Self(Cell::new(0)) }
+        fn new() -> Self {
+            Self(Cell::new(0))
+        }
     }
     impl crate::time::Clock for TickingClock {
         fn now_us(&self) -> u64 {
@@ -776,7 +799,9 @@ mod tests {
     struct DeadNodeCan;
     impl AsyncCan for DeadNodeCan {
         type Error = MockError;
-        async fn transmit(&mut self, _frame: &CanFrame) -> Result<(), MockError> { Ok(()) }
+        async fn transmit(&mut self, _frame: &CanFrame) -> Result<(), MockError> {
+            Ok(())
+        }
         async fn receive(&mut self) -> Result<CanFrame, MockError> {
             // Return a non-matching frame (heartbeat) so the driver loops
             // and re-checks the deadline

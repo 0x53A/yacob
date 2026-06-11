@@ -48,17 +48,20 @@ struct ArrayEntry {
 }
 
 fn collect_arrays(entries: &[OdEntry]) -> Vec<ArrayEntry> {
-    entries.iter().filter_map(|e| {
-        if let EntryKind::Array(def) = &e.kind {
-            Some(ArrayEntry {
-                index: e.index,
-                field_name: e.name.clone(),
-                def: def.clone(),
-            })
-        } else {
-            None
-        }
-    }).collect()
+    entries
+        .iter()
+        .filter_map(|e| {
+            if let EntryKind::Array(def) = &e.kind {
+                Some(ArrayEntry {
+                    index: e.index,
+                    field_name: e.name.clone(),
+                    def: def.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Resolved PDO mapping: field name → (index, subindex, bit_length).
@@ -69,13 +72,13 @@ struct ResolvedMapping {
 }
 
 /// Resolve PDO field names to (index, subindex, bit_length) using the flat entry list.
-fn resolve_pdo_mappings(
-    pdo: &PdoDef,
-    flat: &[FlatEntry],
-) -> Vec<ResolvedMapping> {
+fn resolve_pdo_mappings(pdo: &PdoDef, flat: &[FlatEntry]) -> Vec<ResolvedMapping> {
     let pdo_label = format!(
         "{}[{}]",
-        match pdo.direction { PdoDirection::Tpdo => "tpdo", PdoDirection::Rpdo => "rpdo" },
+        match pdo.direction {
+            PdoDirection::Tpdo => "tpdo",
+            PdoDirection::Rpdo => "rpdo",
+        },
         pdo.number,
     );
     let mut resolved = Vec::new();
@@ -112,9 +115,7 @@ fn resolve_pdo_mappings(
                  Only fixed-size types (u8, u16, u32, i8, i16, i32, f32, f64) can be PDO-mapped.",
             );
         }
-        let bit_length = type_size(&ty_str)
-            .expect("unsupported type") as u8
-            * 8;
+        let bit_length = type_size(&ty_str).expect("unsupported type") as u8 * 8;
         resolved.push(ResolvedMapping {
             index: entry.index,
             subindex: entry.subindex,
@@ -137,15 +138,29 @@ pub fn generate(od: OdDefinition) -> TokenStream {
     let arrays = collect_arrays(&od.entries);
 
     // Count TPDOs and RPDOs
-    let tpdo_defs: Vec<&PdoDef> = od.pdos.iter().filter(|p| p.direction == PdoDirection::Tpdo).collect();
-    let rpdo_defs: Vec<&PdoDef> = od.pdos.iter().filter(|p| p.direction == PdoDirection::Rpdo).collect();
+    let tpdo_defs: Vec<&PdoDef> = od
+        .pdos
+        .iter()
+        .filter(|p| p.direction == PdoDirection::Tpdo)
+        .collect();
+    let rpdo_defs: Vec<&PdoDef> = od
+        .pdos
+        .iter()
+        .filter(|p| p.direction == PdoDirection::Rpdo)
+        .collect();
     let tpdo_count = tpdo_defs.len();
     let rpdo_count = rpdo_defs.len();
     let has_pdos = tpdo_count > 0 || rpdo_count > 0;
 
     // Resolve PDO mappings (field names → index/subindex/bit_length)
-    let tpdo_resolved: Vec<Vec<ResolvedMapping>> = tpdo_defs.iter().map(|p| resolve_pdo_mappings(p, &flat)).collect();
-    let rpdo_resolved: Vec<Vec<ResolvedMapping>> = rpdo_defs.iter().map(|p| resolve_pdo_mappings(p, &flat)).collect();
+    let tpdo_resolved: Vec<Vec<ResolvedMapping>> = tpdo_defs
+        .iter()
+        .map(|p| resolve_pdo_mappings(p, &flat))
+        .collect();
+    let rpdo_resolved: Vec<Vec<ResolvedMapping>> = rpdo_defs
+        .iter()
+        .map(|p| resolve_pdo_mappings(p, &flat))
+        .collect();
 
     // ---- Generate user-defined struct fields ----
     let struct_fields: Vec<TokenStream> = flat
@@ -237,28 +252,34 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         .collect();
 
     // ---- Generate array struct fields and defaults ----
-    let array_struct_fields: Vec<TokenStream> = arrays.iter().map(|a| {
-        let fname = &a.field_name;
-        let ty = &a.def.element_type;
-        let count = a.def.count;
-        quote! { pub #fname: [#ty; #count] }
-    }).collect();
+    let array_struct_fields: Vec<TokenStream> = arrays
+        .iter()
+        .map(|a| {
+            let fname = &a.field_name;
+            let ty = &a.def.element_type;
+            let count = a.def.count;
+            quote! { pub #fname: [#ty; #count] }
+        })
+        .collect();
 
-    let array_field_defaults: Vec<TokenStream> = arrays.iter().map(|a| {
-        let fname = &a.field_name;
-        let ty = &a.def.element_type;
-        let ty_str = ty.to_string();
-        let count = a.def.count;
-        if ty_str == "bool" {
-            quote! { #fname: [false; #count] }
-        } else if ty_str == "f32" {
-            quote! { #fname: [0.0f32; #count] }
-        } else if ty_str == "f64" {
-            quote! { #fname: [0.0f64; #count] }
-        } else {
-            quote! { #fname: [0 as #ty; #count] }
-        }
-    }).collect();
+    let array_field_defaults: Vec<TokenStream> = arrays
+        .iter()
+        .map(|a| {
+            let fname = &a.field_name;
+            let ty = &a.def.element_type;
+            let ty_str = ty.to_string();
+            let count = a.def.count;
+            if ty_str == "bool" {
+                quote! { #fname: [false; #count] }
+            } else if ty_str == "f32" {
+                quote! { #fname: [0.0f32; #count] }
+            } else if ty_str == "f64" {
+                quote! { #fname: [0.0f64; #count] }
+            } else {
+                quote! { #fname: [0 as #ty; #count] }
+            }
+        })
+        .collect();
 
     // ---- Generate array read/write/meta ----
     let mut array_read_arms: Vec<TokenStream> = Vec::new();
@@ -411,25 +432,32 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         let mut defaults = Vec::new();
         if tpdo_count > 0 {
             // Build arrays of default values from the PdoDef list
-            let cob_ids: Vec<TokenStream> = tpdo_defs.iter().map(|p| {
-                match p.cob_id {
-                    Some(id) => quote! { #id },
-                    // 0 = use predefined default, resolved at runtime with node_id
-                    None => quote! { 0 },
-                }
-            }).collect();
+            let cob_ids: Vec<TokenStream> = tpdo_defs
+                .iter()
+                .map(|p| {
+                    match p.cob_id {
+                        Some(id) => quote! { #id },
+                        // 0 = use predefined default, resolved at runtime with node_id
+                        None => quote! { 0 },
+                    }
+                })
+                .collect();
             let tt: Vec<u8> = tpdo_defs.iter().map(|p| p.transmission_type).collect();
             let inh: Vec<u16> = tpdo_defs.iter().map(|p| p.inhibit_time).collect();
             let evt: Vec<u16> = tpdo_defs.iter().map(|p| p.event_timer).collect();
             let map_counts: Vec<u8> = tpdo_resolved.iter().map(|m| m.len() as u8).collect();
-            let map_arrays: Vec<TokenStream> = tpdo_resolved.iter().map(|mappings| {
-                let mut vals = [0u32; 8];
-                for (i, m) in mappings.iter().enumerate() {
-                    vals[i] = (m.index as u32) << 16 | (m.subindex as u32) << 8 | m.bit_length as u32;
-                }
-                let v = vals;
-                quote! { [#(#v),*] }
-            }).collect();
+            let map_arrays: Vec<TokenStream> = tpdo_resolved
+                .iter()
+                .map(|mappings| {
+                    let mut vals = [0u32; 8];
+                    for (i, m) in mappings.iter().enumerate() {
+                        vals[i] =
+                            (m.index as u32) << 16 | (m.subindex as u32) << 8 | m.bit_length as u32;
+                    }
+                    let v = vals;
+                    quote! { [#(#v),*] }
+                })
+                .collect();
 
             defaults.push(quote! { tpdo_cob_id: [#(#cob_ids),*] });
             defaults.push(quote! { tpdo_transmission_type: [#(#tt),*] });
@@ -439,22 +467,27 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             defaults.push(quote! { tpdo_mappings: [#(#map_arrays),*] });
         }
         if rpdo_count > 0 {
-            let cob_ids: Vec<TokenStream> = rpdo_defs.iter().map(|p| {
-                match p.cob_id {
+            let cob_ids: Vec<TokenStream> = rpdo_defs
+                .iter()
+                .map(|p| match p.cob_id {
                     Some(id) => quote! { #id },
                     None => quote! { 0 },
-                }
-            }).collect();
+                })
+                .collect();
             let tt: Vec<u8> = rpdo_defs.iter().map(|p| p.transmission_type).collect();
             let map_counts: Vec<u8> = rpdo_resolved.iter().map(|m| m.len() as u8).collect();
-            let map_arrays: Vec<TokenStream> = rpdo_resolved.iter().map(|mappings| {
-                let mut vals = [0u32; 8];
-                for (i, m) in mappings.iter().enumerate() {
-                    vals[i] = (m.index as u32) << 16 | (m.subindex as u32) << 8 | m.bit_length as u32;
-                }
-                let v = vals;
-                quote! { [#(#v),*] }
-            }).collect();
+            let map_arrays: Vec<TokenStream> = rpdo_resolved
+                .iter()
+                .map(|mappings| {
+                    let mut vals = [0u32; 8];
+                    for (i, m) in mappings.iter().enumerate() {
+                        vals[i] =
+                            (m.index as u32) << 16 | (m.subindex as u32) << 8 | m.bit_length as u32;
+                    }
+                    let v = vals;
+                    quote! { [#(#v),*] }
+                })
+                .collect();
 
             defaults.push(quote! { rpdo_cob_id: [#(#cob_ids),*] });
             defaults.push(quote! { rpdo_transmission_type: [#(#tt),*] });
@@ -474,8 +507,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         .map(|e| {
             let index = e.index;
             let subindex = e.subindex;
-            let dt = type_to_datatype(&e.var.type_name.to_string())
-                .expect("unsupported type");
+            let dt = type_to_datatype(&e.var.type_name.to_string()).expect("unsupported type");
             let dt_ident = format_ident!("{}", dt);
             let access_ident = match e.var.access {
                 AccessKind::Ro => format_ident!("Ro"),
@@ -545,7 +577,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
 
         // sub 2: transmission_type (u8)
         all_meta_entries.push(gen_pdo_meta(comm_idx, 2, "U8", "Rw", "transmission_type"));
-        pdo_read_arms.push(quote! { (#comm_idx, 2) => { buf[0] = self.tpdo_transmission_type[#n]; Ok(1) } });
+        pdo_read_arms
+            .push(quote! { (#comm_idx, 2) => { buf[0] = self.tpdo_transmission_type[#n]; Ok(1) } });
         pdo_write_arms.push(quote! {
             (#comm_idx, 2) => {
                 if data.is_empty() { return Err(canopen_core::od::OdError::DataTypeMismatch); }
@@ -599,7 +632,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
 
         // sub 0: mapping count
         all_meta_entries.push(gen_pdo_meta(map_idx, 0, "U8", "Rw", "mapping_count"));
-        pdo_read_arms.push(quote! { (#map_idx, 0) => { buf[0] = self.tpdo_mapping_count[#n]; Ok(1) } });
+        pdo_read_arms
+            .push(quote! { (#map_idx, 0) => { buf[0] = self.tpdo_mapping_count[#n]; Ok(1) } });
         pdo_write_arms.push(quote! {
             (#map_idx, 0) => {
                 if data.is_empty() { return Err(canopen_core::od::OdError::DataTypeMismatch); }
@@ -668,7 +702,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
 
         // sub 2: transmission_type (u8)
         all_meta_entries.push(gen_pdo_meta(comm_idx, 2, "U8", "Rw", "transmission_type"));
-        pdo_read_arms.push(quote! { (#comm_idx, 2) => { buf[0] = self.rpdo_transmission_type[#n]; Ok(1) } });
+        pdo_read_arms
+            .push(quote! { (#comm_idx, 2) => { buf[0] = self.rpdo_transmission_type[#n]; Ok(1) } });
         pdo_write_arms.push(quote! {
             (#comm_idx, 2) => {
                 if data.is_empty() { return Err(canopen_core::od::OdError::DataTypeMismatch); }
@@ -683,7 +718,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         pdo_sub_counts.insert(map_idx, max_map_sub);
 
         all_meta_entries.push(gen_pdo_meta(map_idx, 0, "U8", "Rw", "mapping_count"));
-        pdo_read_arms.push(quote! { (#map_idx, 0) => { buf[0] = self.rpdo_mapping_count[#n]; Ok(1) } });
+        pdo_read_arms
+            .push(quote! { (#map_idx, 0) => { buf[0] = self.rpdo_mapping_count[#n]; Ok(1) } });
         pdo_write_arms.push(quote! {
             (#map_idx, 0) => {
                 if data.is_empty() { return Err(canopen_core::od::OdError::DataTypeMismatch); }

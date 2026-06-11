@@ -44,15 +44,27 @@ pub enum DcfError {
     /// Failed to parse a value in the DCF.
     ParseError(String),
     /// OD write failed for an entry.
-    OdError { index: u16, subindex: u8, error: OdError },
+    OdError {
+        index: u16,
+        subindex: u8,
+        error: OdError,
+    },
 }
 
 impl core::fmt::Display for DcfError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::ParseError(msg) => write!(f, "DCF parse error: {}", msg),
-            Self::OdError { index, subindex, error } => {
-                write!(f, "OD write failed at 0x{:04X}:{}: {:?}", index, subindex, error)
+            Self::OdError {
+                index,
+                subindex,
+                error,
+            } => {
+                write!(
+                    f,
+                    "OD write failed at 0x{:04X}:{}: {:?}",
+                    index, subindex, error
+                )
             }
         }
     }
@@ -95,15 +107,14 @@ impl Dcf {
             let sub = subindex.unwrap_or(0);
 
             // Get the data type
-            let Some(data_type) = get_prop(props, "DataType")
-                .and_then(|v| parse_int_val(&v))
+            let Some(data_type) = get_prop(props, "DataType").and_then(|v| parse_int_val(&v))
             else {
                 continue;
             };
 
             // Get the value: prefer ParameterValue (DCF), fall back to DefaultValue (EDS)
-            let value_str = get_prop(props, "ParameterValue")
-                .or_else(|| get_prop(props, "DefaultValue"));
+            let value_str =
+                get_prop(props, "ParameterValue").or_else(|| get_prop(props, "DefaultValue"));
 
             let Some(value_str) = value_str else {
                 continue;
@@ -240,7 +251,9 @@ fn parse_section_index(section: &str) -> Option<(u16, Option<u8>)> {
     let lower = section.to_lowercase();
     if let Some((idx_str, sub_str)) = lower.split_once("sub") {
         let index = u16::from_str_radix(idx_str, 16).ok()?;
-        let subindex = u8::from_str_radix(sub_str, 16).ok().or_else(|| sub_str.parse().ok())?;
+        let subindex = u8::from_str_radix(sub_str, 16)
+            .ok()
+            .or_else(|| sub_str.parse().ok())?;
         Some((index, Some(subindex)))
     } else {
         let index = u16::from_str_radix(&lower, 16).ok()?;
@@ -269,33 +282,25 @@ fn serialize_value(value: &str, data_type: u16) -> Option<Vec<u8>> {
             Some(alloc::vec![b])
         }
         // Integer8 / Unsigned8
-        0x0002 | 0x0005 => {
-            parse_int_val(v).map(|n| alloc::vec![n as u8])
-        }
+        0x0002 | 0x0005 => parse_int_val(v).map(|n| alloc::vec![n as u8]),
         // Integer16 / Unsigned16
-        0x0003 | 0x0006 => {
-            parse_int_val(v).map(|n| (n as u16).to_le_bytes().to_vec())
-        }
+        0x0003 | 0x0006 => parse_int_val(v).map(|n| (n as u16).to_le_bytes().to_vec()),
         // Integer32 / Unsigned32
-        0x0004 | 0x0007 => {
-            parse_int_val(v).map(|n| (n as u32).to_le_bytes().to_vec())
-        }
+        0x0004 | 0x0007 => parse_int_val(v).map(|n| (n as u32).to_le_bytes().to_vec()),
         // Real32
         0x0008 => {
             if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
                 // Hex = IEEE 754 bit pattern
-                u32::from_str_radix(hex, 16).ok()
+                u32::from_str_radix(hex, 16)
+                    .ok()
                     .map(|bits| bits.to_le_bytes().to_vec())
             } else {
                 // Decimal float
-                v.parse::<f32>().ok()
-                    .map(|f| f.to_le_bytes().to_vec())
+                v.parse::<f32>().ok().map(|f| f.to_le_bytes().to_vec())
             }
         }
         // Visible String
-        0x0009 => {
-            Some(v.as_bytes().to_vec())
-        }
+        0x0009 => Some(v.as_bytes().to_vec()),
         // Octet String / Domain
         0x000A | 0x000F => {
             // Try hex, otherwise raw bytes
@@ -312,17 +317,15 @@ fn serialize_value(value: &str, data_type: u16) -> Option<Vec<u8>> {
         // Real64
         0x0011 => {
             if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
-                u64::from_str_radix(hex, 16).ok()
+                u64::from_str_radix(hex, 16)
+                    .ok()
                     .map(|bits| bits.to_le_bytes().to_vec())
             } else {
-                v.parse::<f64>().ok()
-                    .map(|f| f.to_le_bytes().to_vec())
+                v.parse::<f64>().ok().map(|f| f.to_le_bytes().to_vec())
             }
         }
         // Integer64 / Unsigned64
-        0x0015 | 0x001B => {
-            parse_int_val(v).map(|n| n.to_le_bytes().to_vec())
-        }
+        0x0015 | 0x001B => parse_int_val(v).map(|n| n.to_le_bytes().to_vec()),
         _ => None,
     }
 }
@@ -330,8 +333,8 @@ fn serialize_value(value: &str, data_type: u16) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::od::*;
     use crate::datatypes::DataType;
+    use crate::od::*;
 
     struct DcfTestOd {
         device_type: u32,
@@ -354,36 +357,101 @@ mod tests {
     }
 
     static DCF_TEST_META: &[OdEntryMeta] = &[
-        OdEntryMeta { index: 0x1000, subindex: 0, data_type: DataType::U32, access: AccessType::Ro, pdo_mappable: false, name: "device_type", max_size: None },
-        OdEntryMeta { index: 0x1001, subindex: 0, data_type: DataType::U8, access: AccessType::Ro, pdo_mappable: false, name: "error_register", max_size: None },
-        OdEntryMeta { index: 0x1017, subindex: 0, data_type: DataType::U16, access: AccessType::Rw, pdo_mappable: false, name: "heartbeat_time", max_size: None },
-        OdEntryMeta { index: 0x6040, subindex: 0, data_type: DataType::U16, access: AccessType::Rw, pdo_mappable: false, name: "controlword", max_size: None },
-        OdEntryMeta { index: 0x6041, subindex: 0, data_type: DataType::U16, access: AccessType::Ro, pdo_mappable: false, name: "statusword", max_size: None },
+        OdEntryMeta {
+            index: 0x1000,
+            subindex: 0,
+            data_type: DataType::U32,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "device_type",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x1001,
+            subindex: 0,
+            data_type: DataType::U8,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "error_register",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x1017,
+            subindex: 0,
+            data_type: DataType::U16,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "heartbeat_time",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x6040,
+            subindex: 0,
+            data_type: DataType::U16,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "controlword",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x6041,
+            subindex: 0,
+            data_type: DataType::U16,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "statusword",
+            max_size: None,
+        },
     ];
 
     impl ObjectDictionary for DcfTestOd {
         fn lookup(&self, index: u16, subindex: u8) -> Option<&'static OdEntryMeta> {
-            DCF_TEST_META.iter().find(|e| e.index == index && e.subindex == subindex)
+            DCF_TEST_META
+                .iter()
+                .find(|e| e.index == index && e.subindex == subindex)
         }
         fn read(&self, index: u16, _sub: u8, buf: &mut [u8]) -> Result<usize, OdError> {
             match index {
-                0x1000 => { buf[..4].copy_from_slice(&self.device_type.to_le_bytes()); Ok(4) }
-                0x1001 => { buf[0] = self.error_register; Ok(1) }
-                0x1017 => { buf[..2].copy_from_slice(&self.heartbeat_time.to_le_bytes()); Ok(2) }
-                0x6040 => { buf[..2].copy_from_slice(&self.controlword.to_le_bytes()); Ok(2) }
-                0x6041 => { buf[..2].copy_from_slice(&self.statusword.to_le_bytes()); Ok(2) }
+                0x1000 => {
+                    buf[..4].copy_from_slice(&self.device_type.to_le_bytes());
+                    Ok(4)
+                }
+                0x1001 => {
+                    buf[0] = self.error_register;
+                    Ok(1)
+                }
+                0x1017 => {
+                    buf[..2].copy_from_slice(&self.heartbeat_time.to_le_bytes());
+                    Ok(2)
+                }
+                0x6040 => {
+                    buf[..2].copy_from_slice(&self.controlword.to_le_bytes());
+                    Ok(2)
+                }
+                0x6041 => {
+                    buf[..2].copy_from_slice(&self.statusword.to_le_bytes());
+                    Ok(2)
+                }
                 _ => Err(OdError::NotFound),
             }
         }
         fn write(&mut self, index: u16, _sub: u8, data: &[u8]) -> Result<(), OdError> {
             match index {
                 0x1000 | 0x1001 | 0x6041 => Err(OdError::ReadOnly),
-                0x1017 => { self.heartbeat_time = u16::from_le_bytes([data[0], data[1]]); Ok(()) }
-                0x6040 => { self.controlword = u16::from_le_bytes([data[0], data[1]]); Ok(()) }
+                0x1017 => {
+                    self.heartbeat_time = u16::from_le_bytes([data[0], data[1]]);
+                    Ok(())
+                }
+                0x6040 => {
+                    self.controlword = u16::from_le_bytes([data[0], data[1]]);
+                    Ok(())
+                }
                 _ => Err(OdError::NotFound),
             }
         }
-        fn sub_count(&self, _: u16) -> Option<u8> { Some(0) }
+        fn sub_count(&self, _: u16) -> Option<u8> {
+            Some(0)
+        }
     }
 
     const TEST_DCF: &str = "\

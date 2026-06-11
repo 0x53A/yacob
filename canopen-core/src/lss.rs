@@ -254,21 +254,33 @@ mod tests {
 
         // Send matching identity fields
         let vendor = CanFrame::new(LSS_REQUEST_COB, &{
-            let mut d = [0u8; 8]; d[0] = 0x40;
-            d[1..5].copy_from_slice(&0xCAFEu32.to_le_bytes()); d
-        }).unwrap();
+            let mut d = [0u8; 8];
+            d[0] = 0x40;
+            d[1..5].copy_from_slice(&0xCAFEu32.to_le_bytes());
+            d
+        })
+        .unwrap();
         let product = CanFrame::new(LSS_REQUEST_COB, &{
-            let mut d = [0u8; 8]; d[0] = 0x41;
-            d[1..5].copy_from_slice(&0x0001u32.to_le_bytes()); d
-        }).unwrap();
+            let mut d = [0u8; 8];
+            d[0] = 0x41;
+            d[1..5].copy_from_slice(&0x0001u32.to_le_bytes());
+            d
+        })
+        .unwrap();
         let revision = CanFrame::new(LSS_REQUEST_COB, &{
-            let mut d = [0u8; 8]; d[0] = 0x42;
-            d[1..5].copy_from_slice(&0x00010000u32.to_le_bytes()); d
-        }).unwrap();
+            let mut d = [0u8; 8];
+            d[0] = 0x42;
+            d[1..5].copy_from_slice(&0x00010000u32.to_le_bytes());
+            d
+        })
+        .unwrap();
         let serial = CanFrame::new(LSS_REQUEST_COB, &{
-            let mut d = [0u8; 8]; d[0] = 0x43;
-            d[1..5].copy_from_slice(&0x00000001u32.to_le_bytes()); d
-        }).unwrap();
+            let mut d = [0u8; 8];
+            d[0] = 0x43;
+            d[1..5].copy_from_slice(&0x00000001u32.to_le_bytes());
+            d
+        })
+        .unwrap();
 
         assert!(lss.process(&vendor).is_none());
         assert!(lss.process(&product).is_none());
@@ -283,22 +295,34 @@ mod tests {
         let mut lss = LssSlave::new(test_identity(), 1);
 
         let vendor = CanFrame::new(LSS_REQUEST_COB, &{
-            let mut d = [0u8; 8]; d[0] = 0x40;
-            d[1..5].copy_from_slice(&0xCAFEu32.to_le_bytes()); d
-        }).unwrap();
+            let mut d = [0u8; 8];
+            d[0] = 0x40;
+            d[1..5].copy_from_slice(&0xCAFEu32.to_le_bytes());
+            d
+        })
+        .unwrap();
         let product = CanFrame::new(LSS_REQUEST_COB, &{
-            let mut d = [0u8; 8]; d[0] = 0x41;
-            d[1..5].copy_from_slice(&0x0001u32.to_le_bytes()); d
-        }).unwrap();
+            let mut d = [0u8; 8];
+            d[0] = 0x41;
+            d[1..5].copy_from_slice(&0x0001u32.to_le_bytes());
+            d
+        })
+        .unwrap();
         let revision = CanFrame::new(LSS_REQUEST_COB, &{
-            let mut d = [0u8; 8]; d[0] = 0x42;
-            d[1..5].copy_from_slice(&0x00010000u32.to_le_bytes()); d
-        }).unwrap();
+            let mut d = [0u8; 8];
+            d[0] = 0x42;
+            d[1..5].copy_from_slice(&0x00010000u32.to_le_bytes());
+            d
+        })
+        .unwrap();
         // Wrong serial
         let serial = CanFrame::new(LSS_REQUEST_COB, &{
-            let mut d = [0u8; 8]; d[0] = 0x43;
-            d[1..5].copy_from_slice(&0x99999999u32.to_le_bytes()); d
-        }).unwrap();
+            let mut d = [0u8; 8];
+            d[0] = 0x43;
+            d[1..5].copy_from_slice(&0x99999999u32.to_le_bytes());
+            d
+        })
+        .unwrap();
 
         lss.process(&vendor);
         lss.process(&product);
@@ -347,7 +371,10 @@ mod tests {
         let req = CanFrame::new(LSS_REQUEST_COB, &[0x5A, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         let resp = lss.process(&req).unwrap();
         assert_eq!(resp.data()[0], 0x5A);
-        assert_eq!(u32::from_le_bytes(resp.data()[1..5].try_into().unwrap()), 0xCAFE);
+        assert_eq!(
+            u32::from_le_bytes(resp.data()[1..5].try_into().unwrap()),
+            0xCAFE
+        );
 
         let req = CanFrame::new(LSS_REQUEST_COB, &[0x5E, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         let resp = lss.process(&req).unwrap();

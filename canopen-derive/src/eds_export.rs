@@ -45,7 +45,9 @@ fn flatten_for_eds(entries: &[OdEntry]) -> Vec<FlatEdsEntry> {
     for entry in entries {
         match &entry.kind {
             EntryKind::Var(var) => {
-                let default_value = var.default_value.as_ref()
+                let default_value = var
+                    .default_value
+                    .as_ref()
                     .map(|expr| quote::ToTokens::to_token_stream(expr).to_string())
                     .unwrap_or_default();
                 flat.push(FlatEdsEntry {
@@ -60,7 +62,10 @@ fn flatten_for_eds(entries: &[OdEntry]) -> Vec<FlatEdsEntry> {
             }
             EntryKind::Record(subs) => {
                 for sub in subs {
-                    let default_value = sub.var.default_value.as_ref()
+                    let default_value = sub
+                        .var
+                        .default_value
+                        .as_ref()
                         .map(|expr| quote::ToTokens::to_token_stream(expr).to_string())
                         .unwrap_or_default();
                     flat.push(FlatEdsEntry {
@@ -115,7 +120,11 @@ pub fn generate_eds(od: &OdDefinition) -> String {
     all_indices.sort();
     all_indices.dedup();
 
-    let mandatory: Vec<u16> = all_indices.iter().copied().filter(|i| *i < 0x2000).collect();
+    let mandatory: Vec<u16> = all_indices
+        .iter()
+        .copied()
+        .filter(|i| *i < 0x2000)
+        .collect();
     let optional: Vec<u16> = Vec::new(); // CiA optional range not distinguished in DSL
     let manufacturer: Vec<u16> = all_indices
         .iter()
@@ -233,7 +242,12 @@ fn write_var_props(out: &mut String, fe: &FlatEdsEntry, obj_type: u8) {
     writeln!(out, "ObjectType=0x{:X}", obj_type).unwrap();
     writeln!(out, "DataType=0x{:04X}", type_to_eds_code(&fe.type_name)).unwrap();
     writeln!(out, "AccessType={}", access_to_eds(fe.access)).unwrap();
-    writeln!(out, "DefaultValue={}", normalize_eds_value(&fe.default_value)).unwrap();
+    writeln!(
+        out,
+        "DefaultValue={}",
+        normalize_eds_value(&fe.default_value)
+    )
+    .unwrap();
     writeln!(out, "PDOMapping={}", if fe.pdo_mappable { 1 } else { 0 }).unwrap();
 }
 

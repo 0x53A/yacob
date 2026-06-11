@@ -25,10 +25,10 @@
 //! embedded, or tokio/async-std on Linux. The CanDemux still helps by routing
 //! frames to the right consumer.
 
+use canopen_core::can_router::CanDemux;
 use canopen_core::cobid::{CobId, NodeId, ParsedCobId};
 use canopen_core::nmt::{NmtCommand, NmtState};
 use canopen_core::sdo::driver::{AsyncCan, NbCanAsync, SdoDriver, SdoError};
-use canopen_core::can_router::CanDemux;
 use canopen_core::time::Clock;
 use canopen_core::transport::CanFrame;
 use canopen_linux::{SocketcanTransport, UdpMulticastTransport};
@@ -37,7 +37,9 @@ use std::time::{Duration, Instant};
 struct StdClock(Instant);
 
 impl StdClock {
-    fn new() -> Self { Self(Instant::now()) }
+    fn new() -> Self {
+        Self(Instant::now())
+    }
 }
 
 impl Clock for StdClock {
@@ -53,7 +55,9 @@ fn block_on<F: core::future::Future>(f: F) -> F::Output {
 
     fn raw_waker() -> RawWaker {
         fn no_op(_: *const ()) {}
-        fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
         const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTABLE)
     }
@@ -86,7 +90,9 @@ fn run_master(transport: impl embedded_can::nb::Can<Frame = CanFrame, Error: cor
     // Step 1: Wait for heartbeat (proves the node is alive)
     println!("[1] Waiting for heartbeat from node {}...", target.raw());
     let hb_result = block_on(async {
-        demux.recv_heartbeat_timed(Some(target), 5_000_000, &clock).await
+        demux
+            .recv_heartbeat_timed(Some(target), 5_000_000, &clock)
+            .await
     });
     match hb_result {
         Ok(Some(frame)) => {
@@ -123,7 +129,10 @@ fn run_master(transport: impl embedded_can::nb::Can<Frame = CanFrame, Error: cor
 
             // Read device type (0x1000:0) with timeout
             let mut buf = [0u8; 4];
-            match sdo.upload_timed(0x1000, 0, &mut buf, &mut port, timeout_us, &clock).await {
+            match sdo
+                .upload_timed(0x1000, 0, &mut buf, &mut port, timeout_us, &clock)
+                .await
+            {
                 Ok(_) => println!("    Device Type: 0x{:08X}", u32::from_le_bytes(buf)),
                 Err(SdoError::Timeout) => println!("    Device Type: TIMEOUT"),
                 Err(e) => println!("    Device Type: error {:?}", e),
@@ -131,19 +140,28 @@ fn run_master(transport: impl embedded_can::nb::Can<Frame = CanFrame, Error: cor
 
             // Read vendor ID (0x1018:1)
             let mut buf = [0u8; 4];
-            match sdo.upload_timed(0x1018, 1, &mut buf, &mut port, timeout_us, &clock).await {
+            match sdo
+                .upload_timed(0x1018, 1, &mut buf, &mut port, timeout_us, &clock)
+                .await
+            {
                 Ok(_) => println!("    Vendor ID:   0x{:08X}", u32::from_le_bytes(buf)),
                 Err(e) => println!("    Vendor ID:   error {:?}", e),
             }
 
             // Read product code (0x1018:2)
-            match sdo.upload_timed(0x1018, 2, &mut buf, &mut port, timeout_us, &clock).await {
+            match sdo
+                .upload_timed(0x1018, 2, &mut buf, &mut port, timeout_us, &clock)
+                .await
+            {
                 Ok(_) => println!("    Product:     0x{:08X}", u32::from_le_bytes(buf)),
                 Err(e) => println!("    Product:     error {:?}", e),
             }
 
             // Read revision (0x1018:3)
-            match sdo.upload_timed(0x1018, 3, &mut buf, &mut port, timeout_us, &clock).await {
+            match sdo
+                .upload_timed(0x1018, 3, &mut buf, &mut port, timeout_us, &clock)
+                .await
+            {
                 Ok(_) => println!("    Revision:    0x{:08X}", u32::from_le_bytes(buf)),
                 Err(e) => println!("    Revision:    error {:?}", e),
             }
@@ -161,7 +179,10 @@ fn run_master(transport: impl embedded_can::nb::Can<Frame = CanFrame, Error: cor
             let _ = frame;
         }
         if hb_count > 0 || pdo_count > 0 {
-            println!("    (buffered during SDO: {} heartbeats, {} PDOs)", hb_count, pdo_count);
+            println!(
+                "    (buffered during SDO: {} heartbeats, {} PDOs)",
+                hb_count, pdo_count
+            );
         }
     });
 
@@ -172,14 +193,20 @@ fn run_master(transport: impl embedded_can::nb::Can<Frame = CanFrame, Error: cor
         let mut port = demux.sdo_port(target);
 
         // Write output1 = 0x42
-        match sdo.download_timed(0x6200, 1, &[0x42], &mut port, timeout_us, &clock).await {
+        match sdo
+            .download_timed(0x6200, 1, &[0x42], &mut port, timeout_us, &clock)
+            .await
+        {
             Ok(()) => println!("    Write 0x6200:1 = 0x42: OK"),
             Err(e) => println!("    Write 0x6200:1: error {:?}", e),
         }
 
         // Read back
         let mut buf = [0u8; 1];
-        match sdo.upload_timed(0x6200, 1, &mut buf, &mut port, timeout_us, &clock).await {
+        match sdo
+            .upload_timed(0x6200, 1, &mut buf, &mut port, timeout_us, &clock)
+            .await
+        {
             Ok(_) => println!("    Read  0x6200:1 = 0x{:02X}", buf[0]),
             Err(e) => println!("    Read  0x6200:1: error {:?}", e),
         }
@@ -192,9 +219,15 @@ fn run_master(transport: impl embedded_can::nb::Can<Frame = CanFrame, Error: cor
     block_on(async {
         let mut port = demux.sdo_port(fake_target);
         let start = Instant::now();
-        match fake_sdo.upload_timed(0x1000, 0, &mut [0u8; 4], &mut port, 500_000, &clock).await {
+        match fake_sdo
+            .upload_timed(0x1000, 0, &mut [0u8; 4], &mut port, 500_000, &clock)
+            .await
+        {
             Err(SdoError::Timeout) => {
-                println!("    Timed out after {}ms (expected)", start.elapsed().as_millis());
+                println!(
+                    "    Timed out after {}ms (expected)",
+                    start.elapsed().as_millis()
+                );
             }
             other => println!("    Unexpected result: {:?}", other),
         }
@@ -219,8 +252,12 @@ fn run_master(transport: impl embedded_can::nb::Can<Frame = CanFrame, Error: cor
                                 }
                             }
                             ParsedCobId::Tpdo { pdo_num, node } => {
-                                println!("    TPDO{} from node {}: {:02X?}",
-                                    pdo_num, node.raw(), frame.data());
+                                println!(
+                                    "    TPDO{} from node {}: {:02X?}",
+                                    pdo_num,
+                                    node.raw(),
+                                    frame.data()
+                                );
                             }
                             _ => {}
                         }
@@ -248,8 +285,7 @@ fn main() {
         _ => {
             let iface = std::env::var("CAN_IFACE").unwrap_or("vcan0".into());
             eprintln!("Async master on {}", iface);
-            let transport = SocketcanTransport::open(&iface)
-                .expect("Failed to open CAN interface");
+            let transport = SocketcanTransport::open(&iface).expect("Failed to open CAN interface");
             run_master(transport);
         }
     }

@@ -24,8 +24,7 @@ static TRANSPORT: Mutex<Option<SlcanTransport>> = Mutex::new(None);
 fn with_transport<R>(f: impl FnOnce(&mut SlcanTransport) -> R) -> R {
     let mut guard = TRANSPORT.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
-        let port =
-            std::env::var("SLCAN_PORT").unwrap_or_else(|_| "/dev/ttyACM1".to_string());
+        let port = std::env::var("SLCAN_PORT").unwrap_or_else(|_| "/dev/ttyACM1".to_string());
         *guard = Some(
             SlcanTransport::open(&port, SlcanBitrate::S6)
                 .unwrap_or_else(|e| panic!("Failed to open SLCAN on {}: {}", port, e)),
@@ -38,8 +37,8 @@ fn with_transport<R>(f: impl FnOnce(&mut SlcanTransport) -> R) -> R {
 #[ignore]
 fn t01_heartbeat() {
     with_transport(|transport| {
-        let state = wait_heartbeat(transport, target_node(), TIMEOUT)
-            .expect("No heartbeat received");
+        let state =
+            wait_heartbeat(transport, target_node(), TIMEOUT).expect("No heartbeat received");
         assert!(
             state == 0x7F || state == 0x05 || state == 0x00,
             "Unexpected heartbeat state: 0x{:02X}",
@@ -64,8 +63,8 @@ fn t02_nmt_start() {
 #[ignore]
 fn t03_sdo_read_device_type() {
     with_transport(|transport| {
-        let data = sdo_upload(transport, target_node(), 0x1000, 0, TIMEOUT)
-            .expect("SDO upload failed");
+        let data =
+            sdo_upload(transport, target_node(), 0x1000, 0, TIMEOUT).expect("SDO upload failed");
         assert_eq!(data.len(), 4);
         let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         assert_eq!(val, 0x0000_0191);

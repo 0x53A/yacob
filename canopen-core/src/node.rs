@@ -4,9 +4,9 @@ use crate::heartbeat::HeartbeatProducer;
 use crate::lss::{LssIdentity, LssSlave};
 use crate::nmt::{NmtCommand, NmtHandler, NmtState, NmtTransition};
 use crate::od::ObjectDictionary;
+use crate::od::OdEvent;
 #[cfg(feature = "embassy")]
 use crate::od::OdEventSignal;
-use crate::od::OdEvent;
 use crate::pdo::{PdoMapping, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine};
 use crate::sdo::SdoServer;
 use crate::time::Clock;
@@ -64,8 +64,13 @@ pub struct Node<
     event_signal: Option<&'static OdEventSignal>,
 }
 
-impl<OD: ObjectDictionary, const TPDO: usize, const RPDO: usize, const EVT_QUEUE: usize, const DIRTY_SET: usize>
-    Node<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+impl<
+        OD: ObjectDictionary,
+        const TPDO: usize,
+        const RPDO: usize,
+        const EVT_QUEUE: usize,
+        const DIRTY_SET: usize,
+    > Node<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
 {
     pub fn new(config: NodeConfig<TPDO, RPDO>, od: OD) -> Self {
         Self {
@@ -120,9 +125,11 @@ impl<OD: ObjectDictionary, const TPDO: usize, const RPDO: usize, const EVT_QUEUE
         OD: Clone,
     {
         let snapshot = self.od.clone();
-        OdGuard { node: self, snapshot }
+        OdGuard {
+            node: self,
+            snapshot,
+        }
     }
-
 
     pub fn tpdo_engine(&self) -> &TpdoEngine<TPDO> {
         &self.tpdo
@@ -211,7 +218,11 @@ impl<OD: ObjectDictionary, const TPDO: usize, const RPDO: usize, const EVT_QUEUE
     /// On the next `process()` call, if an event-driven TPDO (type 254/255)
     /// maps this entry and the inhibit time has elapsed, the TPDO is sent.
     pub fn notify_changed(&mut self, index: u16, subindex: u8) {
-        if !self.dirty_set.iter().any(|&(i, s)| i == index && s == subindex) {
+        if !self
+            .dirty_set
+            .iter()
+            .any(|&(i, s)| i == index && s == subindex)
+        {
             let _ = self.dirty_set.push((index, subindex));
         }
     }
@@ -243,7 +254,11 @@ impl<OD: ObjectDictionary, const TPDO: usize, const RPDO: usize, const EVT_QUEUE
     ///
     /// Drains received frames from the transport, handles protocol logic,
     /// and queues outgoing frames (heartbeat, PDO, SDO responses).
-    pub fn process(&mut self, transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>, clock: &impl Clock) {
+    pub fn process(
+        &mut self,
+        transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
+        clock: &impl Clock,
+    ) {
         let now = clock.now_us();
 
         // Boot sequence
@@ -365,9 +380,9 @@ impl<OD: ObjectDictionary, const TPDO: usize, const RPDO: usize, const EVT_QUEUE
                     let count = buf4[0].min(8);
                     for sub in 1..=count {
                         if self.od.read(map_idx, sub, &mut buf4).is_ok() {
-                            let _ = config.mappings.push(
-                                PdoMapping::from_mapping_value(u32::from_le_bytes(buf4)),
-                            );
+                            let _ = config
+                                .mappings
+                                .push(PdoMapping::from_mapping_value(u32::from_le_bytes(buf4)));
                         }
                     }
                 }
@@ -393,9 +408,9 @@ impl<OD: ObjectDictionary, const TPDO: usize, const RPDO: usize, const EVT_QUEUE
                     let count = buf4[0].min(8);
                     for sub in 1..=count {
                         if self.od.read(map_idx, sub, &mut buf4).is_ok() {
-                            let _ = config.mappings.push(
-                                PdoMapping::from_mapping_value(u32::from_le_bytes(buf4)),
-                            );
+                            let _ = config
+                                .mappings
+                                .push(PdoMapping::from_mapping_value(u32::from_le_bytes(buf4)));
                         }
                     }
                 }
@@ -403,7 +418,12 @@ impl<OD: ObjectDictionary, const TPDO: usize, const RPDO: usize, const EVT_QUEUE
         }
     }
 
-    fn dispatch_frame(&mut self, frame: &CanFrame, transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>, now: u64) {
+    fn dispatch_frame(
+        &mut self,
+        frame: &CanFrame,
+        transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
+        now: u64,
+    ) {
         let Some(cob) = CobId::new(frame.raw_id()) else {
             return;
         };
@@ -441,7 +461,18 @@ impl<OD: ObjectDictionary, const TPDO: usize, const RPDO: usize, const EVT_QUEUE
                     let req: [u8; 8] = frame.data().try_into().unwrap();
                     let mut resp = [0u8; 8];
                     let was_full = self.event_queue.is_full();
-                    if self.sdo_server.process(&req, &mut self.od, &mut resp, &mut self.event_queue, self.nmt.state(), now).is_ok() {
+                    if self
+                        .sdo_server
+                        .process(
+                            &req,
+                            &mut self.od,
+                            &mut resp,
+                            &mut self.event_queue,
+                            self.nmt.state(),
+                            now,
+                        )
+                        .is_ok()
+                    {
                         let resp_cob = CobId::sdo_tx(self.node_id);
                         if let Some(resp_frame) = CanFrame::new(resp_cob.raw(), &resp) {
                             let _ = transport.transmit(&resp_frame);
@@ -469,7 +500,8 @@ impl<OD: ObjectDictionary, const TPDO: usize, const RPDO: usize, const EVT_QUEUE
                 // The RPDO engine matches on COB-ID, so just feed it the frame
                 if self.nmt.state() == NmtState::Operational {
                     let was_full = self.event_queue.is_full();
-                    self.rpdo.process(frame, &mut self.od, &mut self.event_queue);
+                    self.rpdo
+                        .process(frame, &mut self.od, &mut self.event_queue);
                     if was_full && self.event_queue.is_full() {
                         self.event_overflow_count = self.event_overflow_count.saturating_add(1);
                     }
@@ -506,8 +538,13 @@ pub struct OdGuard<
     snapshot: OD,
 }
 
-impl<OD: ObjectDictionary + Clone, const TPDO: usize, const RPDO: usize, const EVT_QUEUE: usize, const DIRTY_SET: usize>
-    core::ops::Deref for OdGuard<'_, OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+impl<
+        OD: ObjectDictionary + Clone,
+        const TPDO: usize,
+        const RPDO: usize,
+        const EVT_QUEUE: usize,
+        const DIRTY_SET: usize,
+    > core::ops::Deref for OdGuard<'_, OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
 {
     type Target = OD;
     fn deref(&self) -> &OD {
@@ -515,16 +552,26 @@ impl<OD: ObjectDictionary + Clone, const TPDO: usize, const RPDO: usize, const E
     }
 }
 
-impl<OD: ObjectDictionary + Clone, const TPDO: usize, const RPDO: usize, const EVT_QUEUE: usize, const DIRTY_SET: usize>
-    core::ops::DerefMut for OdGuard<'_, OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+impl<
+        OD: ObjectDictionary + Clone,
+        const TPDO: usize,
+        const RPDO: usize,
+        const EVT_QUEUE: usize,
+        const DIRTY_SET: usize,
+    > core::ops::DerefMut for OdGuard<'_, OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
 {
     fn deref_mut(&mut self) -> &mut OD {
         &mut self.node.od
     }
 }
 
-impl<OD: ObjectDictionary + Clone, const TPDO: usize, const RPDO: usize, const EVT_QUEUE: usize, const DIRTY_SET: usize>
-    Drop for OdGuard<'_, OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+impl<
+        OD: ObjectDictionary + Clone,
+        const TPDO: usize,
+        const RPDO: usize,
+        const EVT_QUEUE: usize,
+        const DIRTY_SET: usize,
+    > Drop for OdGuard<'_, OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
 {
     fn drop(&mut self) {
         // Collect changed (index, subindex) pairs first to avoid borrow conflict
@@ -536,8 +583,15 @@ impl<OD: ObjectDictionary + Clone, const TPDO: usize, const RPDO: usize, const E
                 for mapping in config.mappings.iter() {
                     let mut old = [0u8; 8];
                     let mut new = [0u8; 8];
-                    let old_len = self.snapshot.read(mapping.index, mapping.subindex, &mut old).unwrap_or(0);
-                    let new_len = self.node.od.read(mapping.index, mapping.subindex, &mut new).unwrap_or(0);
+                    let old_len = self
+                        .snapshot
+                        .read(mapping.index, mapping.subindex, &mut old)
+                        .unwrap_or(0);
+                    let new_len = self
+                        .node
+                        .od
+                        .read(mapping.index, mapping.subindex, &mut new)
+                        .unwrap_or(0);
                     if old_len != new_len || old[..old_len] != new[..new_len] {
                         if count < changed.len() {
                             changed[count] = (mapping.index, mapping.subindex);
@@ -567,10 +621,10 @@ impl<OD: ObjectDictionary + Clone, const TPDO: usize, const RPDO: usize, const E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::od::*;
-    use crate::pdo::PdoMapping;
     use crate::datatypes::DataType;
     use crate::lss::LssIdentity;
+    use crate::od::*;
+    use crate::pdo::PdoMapping;
     use crate::transport::MailboxTransport;
 
     struct MinimalOd {
@@ -580,35 +634,57 @@ mod tests {
 
     static MINIMAL_META: &[OdEntryMeta] = &[
         OdEntryMeta {
-            index: 0x1000, subindex: 0, data_type: DataType::U32,
-            access: AccessType::Ro, pdo_mappable: false, name: "device_type", max_size: None,
+            index: 0x1000,
+            subindex: 0,
+            data_type: DataType::U32,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "device_type",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x1001, subindex: 0, data_type: DataType::U8,
-            access: AccessType::Ro, pdo_mappable: false, name: "error_register", max_size: None,
+            index: 0x1001,
+            subindex: 0,
+            data_type: DataType::U8,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "error_register",
+            max_size: None,
         },
     ];
 
     impl ObjectDictionary for MinimalOd {
         fn lookup(&self, index: u16, subindex: u8) -> Option<&'static OdEntryMeta> {
-            MINIMAL_META.iter().find(|e| e.index == index && e.subindex == subindex)
+            MINIMAL_META
+                .iter()
+                .find(|e| e.index == index && e.subindex == subindex)
         }
         fn read(&self, index: u16, subindex: u8, buf: &mut [u8]) -> Result<usize, OdError> {
             match (index, subindex) {
-                (0x1000, 0) => { buf[..4].copy_from_slice(&self.device_type.to_le_bytes()); Ok(4) }
-                (0x1001, 0) => { buf[0] = self.error_reg; Ok(1) }
+                (0x1000, 0) => {
+                    buf[..4].copy_from_slice(&self.device_type.to_le_bytes());
+                    Ok(4)
+                }
+                (0x1001, 0) => {
+                    buf[0] = self.error_reg;
+                    Ok(1)
+                }
                 _ => Err(OdError::NotFound),
             }
         }
         fn write(&mut self, _: u16, _: u8, _: &[u8]) -> Result<(), OdError> {
             Err(OdError::ReadOnly)
         }
-        fn sub_count(&self, _: u16) -> Option<u8> { Some(0) }
+        fn sub_count(&self, _: u16) -> Option<u8> {
+            Some(0)
+        }
     }
 
     struct TestClock(u64);
     impl Clock for TestClock {
-        fn now_us(&self) -> u64 { self.0 }
+        fn now_us(&self) -> u64 {
+            self.0
+        }
     }
 
     #[test]
@@ -621,7 +697,10 @@ mod tests {
             rpdo: [RpdoConfig::default()],
             identity: LssIdentity::default(),
         };
-        let od = MinimalOd { device_type: 0x191, error_reg: 0 };
+        let od = MinimalOd {
+            device_type: 0x191,
+            error_reg: 0,
+        };
         let mut node: Node<MinimalOd, 1, 1> = Node::new(config, od);
         let mut transport = MailboxTransport::<16, 16>::new();
 
@@ -645,7 +724,10 @@ mod tests {
             rpdo: [RpdoConfig::default()],
             identity: LssIdentity::default(),
         };
-        let od = MinimalOd { device_type: 0x191, error_reg: 0 };
+        let od = MinimalOd {
+            device_type: 0x191,
+            error_reg: 0,
+        };
         let mut node: Node<MinimalOd, 1, 1> = Node::new(config, od);
         let mut transport = MailboxTransport::<16, 16>::new();
 
@@ -666,11 +748,8 @@ mod tests {
 
         let resp = transport.next_to_transmit().unwrap();
         assert_eq!(resp.raw_id(), 0x581); // SDO response from node 1
-        // Check expedited upload response contains device_type
-        assert_eq!(
-            &resp.data()[4..8],
-            &0x191u32.to_le_bytes()
-        );
+                                          // Check expedited upload response contains device_type
+        assert_eq!(&resp.data()[4..8], &0x191u32.to_le_bytes());
     }
 
     // --- OD with writable + PDO-mappable entries for event tests ---
@@ -685,53 +764,113 @@ mod tests {
 
     static EVENT_TEST_META: &[OdEntryMeta] = &[
         OdEntryMeta {
-            index: 0x1000, subindex: 0, data_type: DataType::U32,
-            access: AccessType::Ro, pdo_mappable: false, name: "device_type", max_size: None,
+            index: 0x1000,
+            subindex: 0,
+            data_type: DataType::U32,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "device_type",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x6200, subindex: 1, data_type: DataType::U8,
-            access: AccessType::Rw, pdo_mappable: true, name: "output1", max_size: None,
+            index: 0x6200,
+            subindex: 1,
+            data_type: DataType::U8,
+            access: AccessType::Rw,
+            pdo_mappable: true,
+            name: "output1",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x6200, subindex: 2, data_type: DataType::U8,
-            access: AccessType::Rw, pdo_mappable: true, name: "output2", max_size: None,
+            index: 0x6200,
+            subindex: 2,
+            data_type: DataType::U8,
+            access: AccessType::Rw,
+            pdo_mappable: true,
+            name: "output2",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x6000, subindex: 1, data_type: DataType::U8,
-            access: AccessType::Ro, pdo_mappable: true, name: "input1", max_size: None,
+            index: 0x6000,
+            subindex: 1,
+            data_type: DataType::U8,
+            access: AccessType::Ro,
+            pdo_mappable: true,
+            name: "input1",
+            max_size: None,
         },
     ];
 
     impl ObjectDictionary for EventTestOd {
         fn lookup(&self, index: u16, subindex: u8) -> Option<&'static OdEntryMeta> {
-            EVENT_TEST_META.iter().find(|e| e.index == index && e.subindex == subindex)
+            EVENT_TEST_META
+                .iter()
+                .find(|e| e.index == index && e.subindex == subindex)
         }
         fn read(&self, index: u16, subindex: u8, buf: &mut [u8]) -> Result<usize, OdError> {
             match (index, subindex) {
-                (0x1000, 0) => { buf[..4].copy_from_slice(&self.device_type.to_le_bytes()); Ok(4) }
-                (0x6200, 1) => { buf[0] = self.output1; Ok(1) }
-                (0x6200, 2) => { buf[0] = self.output2; Ok(1) }
-                (0x6000, 1) => { buf[0] = self.input1; Ok(1) }
+                (0x1000, 0) => {
+                    buf[..4].copy_from_slice(&self.device_type.to_le_bytes());
+                    Ok(4)
+                }
+                (0x6200, 1) => {
+                    buf[0] = self.output1;
+                    Ok(1)
+                }
+                (0x6200, 2) => {
+                    buf[0] = self.output2;
+                    Ok(1)
+                }
+                (0x6000, 1) => {
+                    buf[0] = self.input1;
+                    Ok(1)
+                }
                 _ => Err(OdError::NotFound),
             }
         }
         fn write(&mut self, index: u16, subindex: u8, data: &[u8]) -> Result<(), OdError> {
             match (index, subindex) {
-                (0x6200, 1) => { self.output1 = data[0]; Ok(()) }
-                (0x6200, 2) => { self.output2 = data[0]; Ok(()) }
+                (0x6200, 1) => {
+                    self.output1 = data[0];
+                    Ok(())
+                }
+                (0x6200, 2) => {
+                    self.output2 = data[0];
+                    Ok(())
+                }
                 _ => Err(OdError::ReadOnly),
             }
         }
-        fn sub_count(&self, _: u16) -> Option<u8> { Some(0) }
+        fn sub_count(&self, _: u16) -> Option<u8> {
+            Some(0)
+        }
     }
 
     fn make_event_node() -> (Node<EventTestOd, 1, 1>, MailboxTransport<32, 32>) {
         let mut rpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
-        rpdo_mappings.push(PdoMapping { index: 0x6200, subindex: 1, bit_length: 8 }).unwrap();
-        rpdo_mappings.push(PdoMapping { index: 0x6200, subindex: 2, bit_length: 8 }).unwrap();
+        rpdo_mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        rpdo_mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 2,
+                bit_length: 8,
+            })
+            .unwrap();
 
         let mut tpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
-        tpdo_mappings.push(PdoMapping { index: 0x6000, subindex: 1, bit_length: 8 }).unwrap();
+        tpdo_mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
 
         let config = NodeConfig::<1, 1> {
             node_id: NodeId::new(1).unwrap(),
@@ -753,7 +892,12 @@ mod tests {
             }],
             identity: LssIdentity::default(),
         };
-        let od = EventTestOd { device_type: 0x191, output1: 0, output2: 0, input1: 0 };
+        let od = EventTestOd {
+            device_type: 0x191,
+            output1: 0,
+            output2: 0,
+            input1: 0,
+        };
         let mut node: Node<EventTestOd, 1, 1> = Node::new(config, od);
         let mut transport = MailboxTransport::<32, 32>::new();
 
@@ -771,7 +915,8 @@ mod tests {
         let (mut node, mut transport) = make_event_node();
 
         // SDO expedited download: write 0x42 to 0x6200:1
-        let sdo_req = CanFrame::new(0x601, &[0x2F, 0x00, 0x62, 0x01, 0x42, 0x00, 0x00, 0x00]).unwrap();
+        let sdo_req =
+            CanFrame::new(0x601, &[0x2F, 0x00, 0x62, 0x01, 0x42, 0x00, 0x00, 0x00]).unwrap();
         transport.store_received(sdo_req).unwrap();
         node.process(&mut transport, &TestClock(1000));
 
@@ -810,8 +955,20 @@ mod tests {
     fn event_queue_overflow_drops_oldest() {
         // Use a tiny queue of size 2
         let mut rpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
-        rpdo_mappings.push(PdoMapping { index: 0x6200, subindex: 1, bit_length: 8 }).unwrap();
-        rpdo_mappings.push(PdoMapping { index: 0x6200, subindex: 2, bit_length: 8 }).unwrap();
+        rpdo_mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        rpdo_mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 2,
+                bit_length: 8,
+            })
+            .unwrap();
 
         let config = NodeConfig::<1, 1> {
             node_id: NodeId::new(1).unwrap(),
@@ -826,7 +983,12 @@ mod tests {
             }],
             identity: LssIdentity::default(),
         };
-        let od = EventTestOd { device_type: 0x191, output1: 0, output2: 0, input1: 0 };
+        let od = EventTestOd {
+            device_type: 0x191,
+            output1: 0,
+            output2: 0,
+            input1: 0,
+        };
         // EVT_QUEUE = 2, so two RPDO events will fill it, then SDO will overflow
         let mut node: Node<EventTestOd, 1, 1, 2, 8> = Node::new(config, od);
         let mut transport = MailboxTransport::<32, 32>::new();
@@ -838,7 +1000,8 @@ mod tests {
         let rpdo_frame = CanFrame::new(0x201, &[0x11, 0x22]).unwrap();
         transport.store_received(rpdo_frame).unwrap();
         // SDO write will try to push a 3rd event, dropping the oldest
-        let sdo_req = CanFrame::new(0x601, &[0x2F, 0x00, 0x62, 0x01, 0x33, 0x00, 0x00, 0x00]).unwrap();
+        let sdo_req =
+            CanFrame::new(0x601, &[0x2F, 0x00, 0x62, 0x01, 0x33, 0x00, 0x00, 0x00]).unwrap();
         transport.store_received(sdo_req).unwrap();
         node.process(&mut transport, &TestClock(1000));
 
@@ -877,7 +1040,13 @@ mod tests {
     #[test]
     fn notify_changed_respects_inhibit_time() {
         let mut tpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
-        tpdo_mappings.push(PdoMapping { index: 0x6000, subindex: 1, bit_length: 8 }).unwrap();
+        tpdo_mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
 
         let config = NodeConfig::<1, 1> {
             node_id: NodeId::new(1).unwrap(),
@@ -894,7 +1063,12 @@ mod tests {
             rpdo: [RpdoConfig::default()],
             identity: LssIdentity::default(),
         };
-        let od = EventTestOd { device_type: 0x191, output1: 0, output2: 0, input1: 0x10 };
+        let od = EventTestOd {
+            device_type: 0x191,
+            output1: 0,
+            output2: 0,
+            input1: 0x10,
+        };
         let mut node: Node<EventTestOd, 1, 1> = Node::new(config, od);
         let mut transport = MailboxTransport::<32, 32>::new();
 
@@ -905,7 +1079,7 @@ mod tests {
         node.od_mut().input1 = 0x11;
         node.notify_changed(0x6000, 1);
         node.process(&mut transport, &TestClock(50_000)); // 50ms - less than 100ms inhibit
-        // last_send_us[0] is 0, elapsed = 50ms < 100ms inhibit, should NOT send
+                                                          // last_send_us[0] is 0, elapsed = 50ms < 100ms inhibit, should NOT send
         assert!(transport.next_to_transmit().is_none());
 
         // At 100ms, should send
@@ -924,7 +1098,13 @@ mod tests {
     #[test]
     fn notify_changed_does_not_trigger_sync_tpdo() {
         let mut tpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
-        tpdo_mappings.push(PdoMapping { index: 0x6000, subindex: 1, bit_length: 8 }).unwrap();
+        tpdo_mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
 
         let config = NodeConfig::<1, 1> {
             node_id: NodeId::new(1).unwrap(),
@@ -941,7 +1121,12 @@ mod tests {
             rpdo: [RpdoConfig::default()],
             identity: LssIdentity::default(),
         };
-        let od = EventTestOd { device_type: 0x191, output1: 0, output2: 0, input1: 0x42 };
+        let od = EventTestOd {
+            device_type: 0x191,
+            output1: 0,
+            output2: 0,
+            input1: 0x42,
+        };
         let mut node: Node<EventTestOd, 1, 1> = Node::new(config, od);
         let mut transport = MailboxTransport::<32, 32>::new();
 
@@ -996,7 +1181,10 @@ mod tests {
             rpdo: [RpdoConfig::default()],
             identity: LssIdentity::default(),
         };
-        let od = MinimalOd { device_type: 0x191, error_reg: 0 };
+        let od = MinimalOd {
+            device_type: 0x191,
+            error_reg: 0,
+        };
         let mut node: Node<MinimalOd, 1, 1> = Node::new(config, od);
         let mut transport = MailboxTransport::<16, 16>::new();
 

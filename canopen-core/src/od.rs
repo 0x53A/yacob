@@ -65,10 +65,8 @@ pub enum OdEventSource {
 /// can `signal.wait().await` to be woken when the protocol stack modifies an
 /// OD entry (SDO download or RPDO write).
 #[cfg(feature = "embassy")]
-pub type OdEventSignal = embassy_sync::signal::Signal<
-    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    (),
->;
+pub type OdEventSignal =
+    embassy_sync::signal::Signal<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, ()>;
 
 /// Trait for an object dictionary. Implemented by proc-macro-generated structs.
 ///

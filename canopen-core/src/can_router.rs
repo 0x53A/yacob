@@ -200,9 +200,7 @@ impl<T: AsyncCan> CanDemux<T> {
             let frame = self.transport.receive().await?;
             let parsed = CobId::new(frame.raw_id()).map(|c| c.parse());
             match parsed {
-                Some(ParsedCobId::Heartbeat(n))
-                    if node.is_none() || node == Some(n) =>
-                {
+                Some(ParsedCobId::Heartbeat(n)) if node.is_none() || node == Some(n) => {
                     return Ok(frame);
                 }
                 _ => {
@@ -238,9 +236,7 @@ impl<T: AsyncCan> CanDemux<T> {
             let frame = self.transport.receive().await?;
             let parsed = CobId::new(frame.raw_id()).map(|c| c.parse());
             match parsed {
-                Some(ParsedCobId::Heartbeat(n))
-                    if node.is_none() || node == Some(n) =>
-                {
+                Some(ParsedCobId::Heartbeat(n)) if node.is_none() || node == Some(n) => {
                     return Ok(Some(frame));
                 }
                 _ => {
@@ -256,11 +252,12 @@ impl<T: AsyncCan> CanDemux<T> {
         let mut found = None;
         for _ in 0..len {
             if let Some(f) = self.heartbeat_buf.pop_front() {
-                if found.is_none() && (node.is_none() || CobId::new(f.raw_id())
-                    .and_then(|c| match c.parse() {
-                        ParsedCobId::Heartbeat(n) => Some(n),
-                        _ => None,
-                    }) == node)
+                if found.is_none()
+                    && (node.is_none()
+                        || CobId::new(f.raw_id()).and_then(|c| match c.parse() {
+                            ParsedCobId::Heartbeat(n) => Some(n),
+                            _ => None,
+                        }) == node)
                 {
                     found = Some(f);
                 } else {
@@ -418,9 +415,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 server: SdoServer::new(),
-                od: NoisyOd {
-                    device_type: 0x42,
-                },
+                od: NoisyOd { device_type: 0x42 },
                 pending: heapless::Vec::new(),
             }
         }

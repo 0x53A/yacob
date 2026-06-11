@@ -48,35 +48,59 @@ impl CobId {
                 None => ParsedCobId::Unknown(raw),
             },
             0x181..=0x1FF => match NodeId::new((raw - 0x180) as u8) {
-                Some(n) => ParsedCobId::Tpdo { pdo_num: 0, node: n },
+                Some(n) => ParsedCobId::Tpdo {
+                    pdo_num: 0,
+                    node: n,
+                },
                 None => ParsedCobId::Unknown(raw),
             },
             0x201..=0x27F => match NodeId::new((raw - 0x200) as u8) {
-                Some(n) => ParsedCobId::Rpdo { pdo_num: 0, node: n },
+                Some(n) => ParsedCobId::Rpdo {
+                    pdo_num: 0,
+                    node: n,
+                },
                 None => ParsedCobId::Unknown(raw),
             },
             0x281..=0x2FF => match NodeId::new((raw - 0x280) as u8) {
-                Some(n) => ParsedCobId::Tpdo { pdo_num: 1, node: n },
+                Some(n) => ParsedCobId::Tpdo {
+                    pdo_num: 1,
+                    node: n,
+                },
                 None => ParsedCobId::Unknown(raw),
             },
             0x301..=0x37F => match NodeId::new((raw - 0x300) as u8) {
-                Some(n) => ParsedCobId::Rpdo { pdo_num: 1, node: n },
+                Some(n) => ParsedCobId::Rpdo {
+                    pdo_num: 1,
+                    node: n,
+                },
                 None => ParsedCobId::Unknown(raw),
             },
             0x381..=0x3FF => match NodeId::new((raw - 0x380) as u8) {
-                Some(n) => ParsedCobId::Tpdo { pdo_num: 2, node: n },
+                Some(n) => ParsedCobId::Tpdo {
+                    pdo_num: 2,
+                    node: n,
+                },
                 None => ParsedCobId::Unknown(raw),
             },
             0x401..=0x47F => match NodeId::new((raw - 0x400) as u8) {
-                Some(n) => ParsedCobId::Rpdo { pdo_num: 2, node: n },
+                Some(n) => ParsedCobId::Rpdo {
+                    pdo_num: 2,
+                    node: n,
+                },
                 None => ParsedCobId::Unknown(raw),
             },
             0x481..=0x4FF => match NodeId::new((raw - 0x480) as u8) {
-                Some(n) => ParsedCobId::Tpdo { pdo_num: 3, node: n },
+                Some(n) => ParsedCobId::Tpdo {
+                    pdo_num: 3,
+                    node: n,
+                },
                 None => ParsedCobId::Unknown(raw),
             },
             0x501..=0x57F => match NodeId::new((raw - 0x500) as u8) {
-                Some(n) => ParsedCobId::Rpdo { pdo_num: 3, node: n },
+                Some(n) => ParsedCobId::Rpdo {
+                    pdo_num: 3,
+                    node: n,
+                },
                 None => ParsedCobId::Unknown(raw),
             },
             0x581..=0x5FF => match NodeId::new((raw - 0x580) as u8) {

@@ -1,5 +1,5 @@
-use critical_section::Mutex;
 use core::cell::RefCell;
+use critical_section::Mutex;
 use heapless::Deque;
 
 /// CAN error type for canopen-rs transports.

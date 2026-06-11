@@ -48,9 +48,7 @@ pub fn reset_target() -> Result<(), String> {
 
 /// Check if the CAN interface exists and is up.
 pub fn check_can_interface(ifname: &str) -> bool {
-    let output = Command::new("ip")
-        .args(["link", "show", ifname])
-        .output();
+    let output = Command::new("ip").args(["link", "show", ifname]).output();
 
     match output {
         Ok(out) => {

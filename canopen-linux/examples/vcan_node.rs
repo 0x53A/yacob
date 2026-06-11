@@ -138,15 +138,13 @@ fn main() {
             let iface = std::env::var("CAN_IFACE").unwrap_or("vcan0".into());
             eprintln!("CANopen node 1 running on {}", iface);
             eprintln!("Heartbeat every 500ms, auto_start=false (waiting for NMT Start)");
-            let mut transport = SocketcanTransport::open(&iface).expect(
-                &format!(
-                    "Failed to open {}. Set up with:\n  \
+            let mut transport = SocketcanTransport::open(&iface).expect(&format!(
+                "Failed to open {}. Set up with:\n  \
                      sudo modprobe vcan\n  \
                      sudo ip link add dev {} type vcan\n  \
                      sudo ip link set up {}",
-                    iface, iface, iface
-                ),
-            );
+                iface, iface, iface
+            ));
             run_node(&mut transport);
         }
     }

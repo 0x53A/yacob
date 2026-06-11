@@ -59,7 +59,14 @@ impl AsyncCan for MockCan {
         let mut events: heapless::Deque<OdEvent, 16> = heapless::Deque::new();
         if self
             .server
-            .process(&req, &mut self.od, &mut resp, &mut events, NmtState::Operational, 0)
+            .process(
+                &req,
+                &mut self.od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                0,
+            )
             .is_ok()
         {
             self.pending = CanFrame::new(0x580 + 1, &resp);
@@ -154,10 +161,7 @@ fn typed_client_read_write_roundtrip() {
             .unwrap();
 
         // Read it back
-        let val = client
-            .read_producer_heartbeat_time(&mut can)
-            .await
-            .unwrap();
+        let val = client.read_producer_heartbeat_time(&mut can).await.unwrap();
         assert_eq!(val, 1000);
     });
 }

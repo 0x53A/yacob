@@ -82,13 +82,16 @@ fn upload_firmware(
     match sdo_upload(transport, target, 0x1F57, 1, timeout) {
         Ok(data) if data.len() >= 4 => {
             let status = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            println!("       Flash status: {}", match status {
-                0 => "idle",
-                1 => "programming",
-                2 => "valid",
-                0xFF => "error",
-                _ => "unknown",
-            });
+            println!(
+                "       Flash status: {}",
+                match status {
+                    0 => "idle",
+                    1 => "programming",
+                    2 => "valid",
+                    0xFF => "error",
+                    _ => "unknown",
+                }
+            );
         }
         _ => {}
     }
@@ -96,7 +99,9 @@ fn upload_firmware(
     // Step 3: Send NMT Pre-Operational (stop PDOs during update)
     println!("[3/7] Sending NMT Pre-Operational...");
     let frame = NmtCommand::EnterPreOperational.to_frame(target.raw());
-    transport.transmit(&frame).map_err(|_| SdoError::TransportError)?;
+    transport
+        .transmit(&frame)
+        .map_err(|_| SdoError::TransportError)?;
     std::thread::sleep(Duration::from_millis(100));
 
     // Step 4: Clear flash (write 3 to Program Control)
@@ -106,7 +111,12 @@ fn upload_firmware(
 
     // Verify status is idle after clear
     let status_data = sdo_upload(transport, target, 0x1F57, 1, timeout)?;
-    let status = u32::from_le_bytes([status_data[0], status_data[1], status_data[2], status_data[3]]);
+    let status = u32::from_le_bytes([
+        status_data[0],
+        status_data[1],
+        status_data[2],
+        status_data[3],
+    ]);
     if status != 0 {
         return Err(format!("Flash not idle after clear (status={})", status).into());
     }
@@ -114,8 +124,12 @@ fn upload_firmware(
 
     // Step 5: Upload firmware in chunks
     let total_chunks = (firmware.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    println!("[5/7] Uploading {} bytes in {} chunks of {} bytes...",
-             firmware.len(), total_chunks, CHUNK_SIZE);
+    println!(
+        "[5/7] Uploading {} bytes in {} chunks of {} bytes...",
+        firmware.len(),
+        total_chunks,
+        CHUNK_SIZE
+    );
 
     // Compute CRC32 of firmware
     let crc = crc32(firmware);
@@ -129,7 +143,12 @@ fn upload_firmware(
 
         let pct = (i + 1) * 100 / total_chunks;
         let bytes_sent = (i + 1) * CHUNK_SIZE;
-        print!("\r       [{:3}%] {}/{} bytes", pct, bytes_sent.min(firmware.len()), firmware.len());
+        print!(
+            "\r       [{:3}%] {}/{} bytes",
+            pct,
+            bytes_sent.min(firmware.len()),
+            firmware.len()
+        );
     }
     println!();
 
@@ -141,7 +160,12 @@ fn upload_firmware(
     // Read status
     std::thread::sleep(Duration::from_millis(100));
     let status_data = sdo_upload(transport, target, 0x1F57, 1, timeout)?;
-    let status = u32::from_le_bytes([status_data[0], status_data[1], status_data[2], status_data[3]]);
+    let status = u32::from_le_bytes([
+        status_data[0],
+        status_data[1],
+        status_data[2],
+        status_data[3],
+    ]);
 
     match status {
         2 => println!("       Firmware validated successfully!"),
@@ -217,11 +241,10 @@ fn main() {
         }
         _ => {
             let iface = std::env::var("CAN_IFACE").unwrap_or("vcan0".into());
-            let mut transport = SocketcanTransport::open(&iface)
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to open {}: {}", iface, e);
-                    std::process::exit(1);
-                });
+            let mut transport = SocketcanTransport::open(&iface).unwrap_or_else(|e| {
+                eprintln!("Failed to open {}: {}", iface, e);
+                std::process::exit(1);
+            });
             upload_firmware(&mut transport, target, &firmware)
         }
     };

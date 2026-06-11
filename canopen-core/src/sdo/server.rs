@@ -33,10 +33,10 @@ struct BlockUploadState {
     subindex: u8,
     buf: [u8; 889],
     total_len: usize,
-    offset: usize,       // how far we've sent
-    blksize: u8,         // segments per sub-block
-    seqno: u8,           // current segment number within sub-block (1-based)
-    crc: u16,            // running CRC-16/CCITT
+    offset: usize, // how far we've sent
+    blksize: u8,   // segments per sub-block
+    seqno: u8,     // current segment number within sub-block (1-based)
+    crc: u16,      // running CRC-16/CCITT
     last_activity_us: u64,
 }
 
@@ -47,9 +47,9 @@ struct BlockDownloadState {
     buf: [u8; 889],
     offset: usize,
     #[allow(dead_code)] // retained for future size validation
-    total_len: usize,    // expected size (0 if unknown)
+    total_len: usize, // expected size (0 if unknown)
     blksize: u8,
-    seqno: u8,           // last received sequence number
+    seqno: u8, // last received sequence number
     crc: u16,
     last_activity_us: u64,
 }
@@ -137,7 +137,10 @@ impl SdoServer {
             .copy_from_slice(&state.buf[state.offset..state.offset + seg_data_len]);
 
         // Update CRC
-        state.crc = crc16_ccitt_update(state.crc, &state.buf[state.offset..state.offset + seg_data_len]);
+        state.crc = crc16_ccitt_update(
+            state.crc,
+            &state.buf[state.offset..state.offset + seg_data_len],
+        );
 
         state.offset += seg_data_len;
         state.last_activity_us = now_us;
@@ -227,8 +230,7 @@ impl SdoServer {
         };
 
         if len <= 4 {
-            *response =
-                encode_upload_response_expedited(index, subindex, &buf[..len]).unwrap();
+            *response = encode_upload_response_expedited(index, subindex, &buf[..len]).unwrap();
             self.transfer = None;
         } else {
             *response = encode_upload_response_segmented(index, subindex, len as u32);
@@ -325,7 +327,14 @@ impl SdoServer {
             match od.write(index, subindex, data) {
                 Ok(()) => {
                     *response = encode_download_response(index, subindex);
-                    push_event(events, OdEvent { index, subindex, source: OdEventSource::Sdo });
+                    push_event(
+                        events,
+                        OdEvent {
+                            index,
+                            subindex,
+                            source: OdEventSource::Sdo,
+                        },
+                    );
                 }
                 Err(e) => {
                     *response = encode_abort(index, subindex, od_error_to_abort(e));
@@ -419,7 +428,14 @@ impl SdoServer {
 
             match od.write(index, subindex, &write_buf[..data_len]) {
                 Ok(()) => {
-                    push_event(events, OdEvent { index, subindex, source: OdEventSource::Sdo });
+                    push_event(
+                        events,
+                        OdEvent {
+                            index,
+                            subindex,
+                            source: OdEventSource::Sdo,
+                        },
+                    );
                 }
                 Err(e) => {
                     *response = encode_abort(index, subindex, od_error_to_abort(e));
@@ -626,7 +642,14 @@ impl SdoServer {
 
                         match od.write(index, subindex, &write_buf[..data_len]) {
                             Ok(()) => {
-                                push_event(events, OdEvent { index, subindex, source: OdEventSource::Sdo });
+                                push_event(
+                                    events,
+                                    OdEvent {
+                                        index,
+                                        subindex,
+                                        source: OdEventSource::Sdo,
+                                    },
+                                );
                             }
                             Err(e) => {
                                 *response = encode_abort(index, subindex, od_error_to_abort(e));
@@ -671,8 +694,7 @@ impl SdoServer {
         // Copy 7 data bytes
         let space = 889 - state.offset;
         let copy_len = space.min(7);
-        state.buf[state.offset..state.offset + copy_len]
-            .copy_from_slice(&request[1..1 + copy_len]);
+        state.buf[state.offset..state.offset + copy_len].copy_from_slice(&request[1..1 + copy_len]);
         state.crc = crc16_ccitt_update(state.crc, &request[1..1 + copy_len]);
         state.offset += copy_len;
         state.seqno = seqno;
@@ -740,8 +762,8 @@ fn od_error_to_abort(e: OdError) -> AbortCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::od::*;
     use crate::datatypes::DataType;
+    use crate::od::*;
 
     /// Simple test OD with a few entries.
     struct TestOd {
@@ -764,26 +786,48 @@ mod tests {
 
     static TEST_META: &[OdEntryMeta] = &[
         OdEntryMeta {
-            index: 0x1000, subindex: 0, data_type: DataType::U32,
-            access: AccessType::Ro, pdo_mappable: false, name: "device_type", max_size: None,
+            index: 0x1000,
+            subindex: 0,
+            data_type: DataType::U32,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "device_type",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x1001, subindex: 0, data_type: DataType::U8,
-            access: AccessType::Ro, pdo_mappable: false, name: "error_register", max_size: None,
+            index: 0x1001,
+            subindex: 0,
+            data_type: DataType::U8,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "error_register",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x2000, subindex: 0, data_type: DataType::U16,
-            access: AccessType::Rw, pdo_mappable: false, name: "writable_u16", max_size: None,
+            index: 0x2000,
+            subindex: 0,
+            data_type: DataType::U16,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "writable_u16",
+            max_size: None,
         },
         OdEntryMeta {
-            index: 0x2001, subindex: 0, data_type: DataType::OctetString,
-            access: AccessType::Rw, pdo_mappable: false, name: "long_data", max_size: None,
+            index: 0x2001,
+            subindex: 0,
+            data_type: DataType::OctetString,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "long_data",
+            max_size: None,
         },
     ];
 
     impl ObjectDictionary for TestOd {
         fn lookup(&self, index: u16, subindex: u8) -> Option<&'static OdEntryMeta> {
-            TEST_META.iter().find(|e| e.index == index && e.subindex == subindex)
+            TEST_META
+                .iter()
+                .find(|e| e.index == index && e.subindex == subindex)
         }
 
         fn read(&self, index: u16, subindex: u8, buf: &mut [u8]) -> Result<usize, OdError> {
@@ -843,10 +887,22 @@ mod tests {
         // Initiate upload for 0x1000:0 (device_type, u32)
         let req = [0x40, 0x00, 0x10, 0x00, 0, 0, 0, 0]; // CCS=2
         let mut events: Deque<OdEvent, 16> = Deque::new();
-        server.process(&req, &mut od, &mut resp, &mut events, NmtState::Operational, 0).unwrap();
+        server
+            .process(
+                &req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                0,
+            )
+            .unwrap();
 
         // Should be expedited response with 4 bytes
-        assert_eq!(command_specifier(resp[0]), Scs::InitiateUploadResponse as u8);
+        assert_eq!(
+            command_specifier(resp[0]),
+            Scs::InitiateUploadResponse as u8
+        );
         assert!(resp[0] & 0x02 != 0); // expedited
         assert_eq!(resp[4..8], 0x0000_0191u32.to_le_bytes());
     }
@@ -861,9 +917,21 @@ mod tests {
         // CCS=1, n=2 (2 unused bytes), e=1, s=1
         let req = [0x2B, 0x00, 0x20, 0x00, 0xCD, 0xAB, 0x00, 0x00];
         let mut events: Deque<OdEvent, 16> = Deque::new();
-        server.process(&req, &mut od, &mut resp, &mut events, NmtState::Operational, 0).unwrap();
+        server
+            .process(
+                &req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                0,
+            )
+            .unwrap();
 
-        assert_eq!(command_specifier(resp[0]), Scs::InitiateDownloadResponse as u8);
+        assert_eq!(
+            command_specifier(resp[0]),
+            Scs::InitiateDownloadResponse as u8
+        );
         assert_eq!(od.writable_u16, 0xABCD);
 
         // Should have generated an event
@@ -882,7 +950,16 @@ mod tests {
         // Try to write to 0x1000:0 (read-only)
         let req = [0x23, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut events: Deque<OdEvent, 16> = Deque::new();
-        server.process(&req, &mut od, &mut resp, &mut events, NmtState::Operational, 0).unwrap();
+        server
+            .process(
+                &req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                0,
+            )
+            .unwrap();
 
         assert_eq!(command_specifier(resp[0]), Scs::AbortTransfer as u8);
         let code = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
@@ -897,7 +974,16 @@ mod tests {
 
         let req = [0x40, 0xFF, 0xFF, 0x00, 0, 0, 0, 0];
         let mut events: Deque<OdEvent, 16> = Deque::new();
-        server.process(&req, &mut od, &mut resp, &mut events, NmtState::Operational, 0).unwrap();
+        server
+            .process(
+                &req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                0,
+            )
+            .unwrap();
 
         assert_eq!(command_specifier(resp[0]), Scs::AbortTransfer as u8);
         let code = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
@@ -913,10 +999,22 @@ mod tests {
         // Initiate upload for 0x2001:0 (20-byte octet string)
         let req = [0x40, 0x01, 0x20, 0x00, 0, 0, 0, 0];
         let mut events: Deque<OdEvent, 16> = Deque::new();
-        server.process(&req, &mut od, &mut resp, &mut events, NmtState::Operational, 0).unwrap();
+        server
+            .process(
+                &req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                0,
+            )
+            .unwrap();
 
         // Should be segmented initiate response
-        assert_eq!(command_specifier(resp[0]), Scs::InitiateUploadResponse as u8);
+        assert_eq!(
+            command_specifier(resp[0]),
+            Scs::InitiateUploadResponse as u8
+        );
         assert_eq!(resp[0] & 0x02, 0); // not expedited
         let size = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
         assert_eq!(size, 20);
@@ -929,9 +1027,24 @@ mod tests {
         loop {
             let seg_req = [
                 (Ccs::UploadSegment as u8) << 5 | if toggle { 0x10 } else { 0 },
-                0, 0, 0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             ];
-            server.process(&seg_req, &mut od, &mut resp, &mut events, NmtState::Operational, 0).unwrap();
+            server
+                .process(
+                    &seg_req,
+                    &mut od,
+                    &mut resp,
+                    &mut events,
+                    NmtState::Operational,
+                    0,
+                )
+                .unwrap();
 
             let scs = command_specifier(resp[0]);
             assert_eq!(scs, Scs::UploadSegmentResponse as u8);
@@ -962,7 +1075,16 @@ mod tests {
         // Try to write to 0x1800:01 (TPDO comm param) while Operational
         let req = [0x23, 0x00, 0x18, 0x01, 0x81, 0x01, 0x00, 0x00];
         let mut events: Deque<OdEvent, 16> = Deque::new();
-        server.process(&req, &mut od, &mut resp, &mut events, NmtState::Operational, 0).unwrap();
+        server
+            .process(
+                &req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                0,
+            )
+            .unwrap();
 
         assert_eq!(command_specifier(resp[0]), Scs::AbortTransfer as u8);
         let code = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
@@ -980,7 +1102,16 @@ mod tests {
         // the point is it's not rejected by the PDO config guard)
         let req = [0x23, 0x00, 0x18, 0x01, 0x81, 0x01, 0x00, 0x00];
         let mut events: Deque<OdEvent, 16> = Deque::new();
-        server.process(&req, &mut od, &mut resp, &mut events, NmtState::PreOperational, 0).unwrap();
+        server
+            .process(
+                &req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                0,
+            )
+            .unwrap();
 
         let code = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
         // Should be ObjectNotFound (OD doesn't have 0x1800), NOT DataTransferDeviceState
@@ -996,7 +1127,16 @@ mod tests {
         // Initiate segmented upload for 20-byte entry
         let req = [0x40, 0x01, 0x20, 0x00, 0, 0, 0, 0];
         let mut events: Deque<OdEvent, 16> = Deque::new();
-        server.process(&req, &mut od, &mut resp, &mut events, NmtState::Operational, 1_000_000).unwrap();
+        server
+            .process(
+                &req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                1_000_000,
+            )
+            .unwrap();
 
         // Transfer is now in progress. Check timeout before 5s — should be None
         assert!(server.check_timeout(3_000_000).is_none());

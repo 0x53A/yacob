@@ -112,8 +112,8 @@ impl embedded_can::nb::Can for UdpMulticastTransport {
             channel: None,
         };
 
-        let encoded = rmp_serde::to_vec_named(&msg)
-            .map_err(|_| nb::Error::Other(CanError::BusError))?;
+        let encoded =
+            rmp_serde::to_vec_named(&msg).map_err(|_| nb::Error::Other(CanError::BusError))?;
 
         self.socket
             .send_to(&encoded, self.dest)
@@ -133,8 +133,7 @@ impl embedded_can::nb::Can for UdpMulticastTransport {
                 }
 
                 let id = (msg.arbitration_id & 0x7FF) as u16;
-                CanFrame::new(id, &msg.data)
-                    .ok_or(nb::Error::Other(CanError::BusError))
+                CanFrame::new(id, &msg.data).ok_or(nb::Error::Other(CanError::BusError))
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Err(nb::Error::WouldBlock),
             Err(_) => Err(nb::Error::Other(CanError::BusError)),

@@ -79,12 +79,7 @@ impl EmcyProducer {
 
     /// Report an error. Sets the corresponding error register bits and
     /// queues an EMCY frame with the given error code and optional vendor data.
-    pub fn set_error(
-        &mut self,
-        error_code: u16,
-        register_bits: u8,
-        vendor_data: &[u8],
-    ) {
+    pub fn set_error(&mut self, error_code: u16, register_bits: u8, vendor_data: &[u8]) {
         self.error_register |= register_bits | error_register::GENERIC;
         self.pending = Some(build_emcy_frame(
             self.node_id,
@@ -149,7 +144,10 @@ mod tests {
 
         // Set error
         emcy.set_error(0x3000, error_register::VOLTAGE, &[]);
-        assert_eq!(emcy.error_register(), error_register::VOLTAGE | error_register::GENERIC);
+        assert_eq!(
+            emcy.error_register(),
+            error_register::VOLTAGE | error_register::GENERIC
+        );
         let frame = emcy.take_pending().unwrap();
         assert_eq!(frame.raw_id(), 0x081);
         assert_eq!(frame.data()[0..2], [0x00, 0x30]); // 0x3000 LE

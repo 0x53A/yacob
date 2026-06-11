@@ -1,4 +1,6 @@
-use crate::dsl::{AccessKind, EntryKind, OdDefinition, OdEntry, PdoDef, PdoDirection, SubEntry, VarDef};
+use crate::dsl::{
+    AccessKind, EntryKind, OdDefinition, OdEntry, PdoDef, PdoDirection, SubEntry, VarDef,
+};
 use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
 use syn::{braced, bracketed, Ident, LitInt, LitStr, Result, Token, Visibility};
@@ -33,18 +35,18 @@ impl Parse for EdsDefinition {
                 let idx_content;
                 bracketed!(idx_content in content);
                 let idx_lit: LitInt = idx_content.parse()?;
-                let index: u16 = idx_lit.base10_parse().map_err(|_| {
-                    syn::Error::new(idx_lit.span(), "expected u16 index")
-                })?;
+                let index: u16 = idx_lit
+                    .base10_parse()
+                    .map_err(|_| syn::Error::new(idx_lit.span(), "expected u16 index"))?;
                 let kw: Ident = content.parse()?;
                 if kw != "capacity" {
                     return Err(syn::Error::new(kw.span(), "expected `capacity`"));
                 }
                 content.parse::<Token![=]>()?;
                 let cap_lit: LitInt = content.parse()?;
-                let cap: usize = cap_lit.base10_parse().map_err(|_| {
-                    syn::Error::new(cap_lit.span(), "expected usize capacity")
-                })?;
+                let cap: usize = cap_lit
+                    .base10_parse()
+                    .map_err(|_| syn::Error::new(cap_lit.span(), "expected usize capacity"))?;
                 capacity_overrides.insert(index, cap);
                 let _ = content.parse::<Token![,]>(); // optional trailing comma
             }
@@ -63,9 +65,8 @@ impl Parse for EdsDefinition {
 /// Parse an EDS file and convert it to an OdDefinition for codegen.
 pub fn parse_eds_to_od(def: EdsDefinition) -> std::result::Result<OdDefinition, syn::Error> {
     // Resolve path relative to CARGO_MANIFEST_DIR
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
-        syn::Error::new(Span::call_site(), "CARGO_MANIFEST_DIR not set")
-    })?;
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .map_err(|_| syn::Error::new(Span::call_site(), "CARGO_MANIFEST_DIR not set"))?;
     let full_path = std::path::Path::new(&manifest_dir).join(&def.file_path);
 
     let content = std::fs::read_to_string(&full_path).map_err(|e| {
@@ -75,9 +76,8 @@ pub fn parse_eds_to_od(def: EdsDefinition) -> std::result::Result<OdDefinition, 
         )
     })?;
 
-    let (entries, pdos) = parse_eds_content_with_overrides(&content, &def.capacity_overrides).map_err(|e| {
-        syn::Error::new(Span::call_site(), format!("EDS parse error: {e}"))
-    })?;
+    let (entries, pdos) = parse_eds_content_with_overrides(&content, &def.capacity_overrides)
+        .map_err(|e| syn::Error::new(Span::call_site(), format!("EDS parse error: {e}")))?;
 
     Ok(OdDefinition {
         vis: def.vis,
@@ -206,15 +206,21 @@ fn parse_eds_content_with_overrides(
                 // Only use EntryKind::Array for larger homogeneous arrays (4+ elements)
                 // where per-element defaults don't matter. Smaller arrays or arrays
                 // with non-zero defaults are kept as records to preserve defaults.
-                let elements: Vec<&SubEntry> = sub_entries.iter()
-                    .filter(|s| s.subindex > 0)
-                    .collect();
+                let elements: Vec<&SubEntry> =
+                    sub_entries.iter().filter(|s| s.subindex > 0).collect();
                 let all_zero_defaults = elements.iter().all(|e| {
-                    e.var.default_value.as_ref()
+                    e.var
+                        .default_value
+                        .as_ref()
                         .map(|expr| {
                             let s = quote::ToTokens::to_token_stream(expr).to_string();
-                            s == "0" || s == "0x00" || s == "0i32" || s == "0u32"
-                                || s == "0.0f32" || s == "0.0f64" || s == "false"
+                            s == "0"
+                                || s == "0x00"
+                                || s == "0i32"
+                                || s == "0u32"
+                                || s == "0.0f32"
+                                || s == "0.0f64"
+                                || s == "false"
                         })
                         .unwrap_or(true) // None = no default = zero
                 });
@@ -281,7 +287,8 @@ fn extract_pdos(
 
     // Helper: look up props for a given section like "1800sub2"
     let get_section_props = |section_key: &str| -> Option<&Vec<(String, String)>> {
-        sections.iter()
+        sections
+            .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(section_key))
             .map(|(_, props)| props)
     };
@@ -453,7 +460,9 @@ fn parse_section_index(section: &str) -> Option<(u16, Option<u8>)> {
     let lower = section.to_lowercase();
     if let Some((idx_str, sub_str)) = lower.split_once("sub") {
         let index = u16::from_str_radix(idx_str, 16).ok()?;
-        let subindex = u8::from_str_radix(sub_str, 16).ok().or_else(|| sub_str.parse().ok())?;
+        let subindex = u8::from_str_radix(sub_str, 16)
+            .ok()
+            .or_else(|| sub_str.parse().ok())?;
         Some((index, Some(subindex)))
     } else {
         let index = u16::from_str_radix(&lower, 16).ok()?;
@@ -466,7 +475,12 @@ fn parse_section_index(section: &str) -> Option<(u16, Option<u8>)> {
     }
 }
 
-fn parse_var_entry(_index: u16, subindex: u8, props: &[(String, String)], capacity_overrides: &std::collections::HashMap<u16, usize>) -> Option<SubEntry> {
+fn parse_var_entry(
+    _index: u16,
+    subindex: u8,
+    props: &[(String, String)],
+    capacity_overrides: &std::collections::HashMap<u16, usize>,
+) -> Option<SubEntry> {
     let name_str = get_prop(props, "ParameterName")?;
     let data_type_code = get_prop(props, "DataType").and_then(|v| parse_int(&v))? as u16;
     let access_str = get_prop(props, "AccessType").unwrap_or_else(|| "ro".to_string());
@@ -492,7 +506,12 @@ fn parse_var_entry(_index: u16, subindex: u8, props: &[(String, String)], capaci
             "domain" => 512,
             _ => 256,
         };
-        Some(capacity_overrides.get(&_index).copied().unwrap_or(default_cap))
+        Some(
+            capacity_overrides
+                .get(&_index)
+                .copied()
+                .unwrap_or(default_cap),
+        )
     } else {
         None
     };
@@ -569,7 +588,13 @@ fn datatype_to_rust(code: u16) -> Option<(&'static str, usize)> {
 fn sanitize_name(name: &str) -> String {
     let s: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     // Ensure it starts with a letter or underscore
     if s.starts_with(|c: char| c.is_ascii_digit()) {

@@ -97,10 +97,7 @@ where
     let mut port = SdoPort::new(&mut wrapper, target);
     let mut buf = vec![0u8; 889]; // max SDO transfer
 
-    let len = block_on_with_timeout(
-        driver.upload(index, subindex, &mut buf, &mut port),
-        timeout,
-    )??;
+    let len = block_on_with_timeout(driver.upload(index, subindex, &mut buf, &mut port), timeout)??;
     buf.truncate(len);
     Ok(buf)
 }
@@ -122,10 +119,7 @@ where
     let mut wrapper = NbCanWrapper(transport);
     let mut port = SdoPort::new(&mut wrapper, target);
 
-    block_on_with_timeout(
-        driver.download(index, subindex, data, &mut port),
-        timeout,
-    )??;
+    block_on_with_timeout(driver.download(index, subindex, data, &mut port), timeout)??;
     Ok(())
 }
 
@@ -196,9 +190,7 @@ fn send(
     Ok(())
 }
 
-fn try_recv(
-    transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
-) -> Option<CanFrame> {
+fn try_recv(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) -> Option<CanFrame> {
     transport.receive().ok()
 }
 

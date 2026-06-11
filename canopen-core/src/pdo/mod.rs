@@ -8,9 +8,6 @@ pub fn heapless_vec_new<T, const N: usize>() -> heapless::Vec<T, N> {
 }
 
 /// Helper for generated code: push to a Vec.
-pub fn heapless_vec_push<T, const N: usize>(
-    v: &mut heapless::Vec<T, N>,
-    val: T,
-) -> Result<(), T> {
+pub fn heapless_vec_push<T, const N: usize>(v: &mut heapless::Vec<T, N>, val: T) -> Result<(), T> {
     v.push(val)
 }

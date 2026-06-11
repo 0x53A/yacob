@@ -88,11 +88,7 @@ pub fn encode_abort(index: u16, subindex: u8, code: AbortCode) -> [u8; 8] {
 }
 
 /// Encode an initiate upload response (expedited, ≤4 bytes).
-pub fn encode_upload_response_expedited(
-    index: u16,
-    subindex: u8,
-    value: &[u8],
-) -> Option<[u8; 8]> {
+pub fn encode_upload_response_expedited(index: u16, subindex: u8, value: &[u8]) -> Option<[u8; 8]> {
     if value.len() > 4 {
         return None;
     }
@@ -108,11 +104,7 @@ pub fn encode_upload_response_expedited(
 }
 
 /// Encode an initiate upload response for segmented transfer (size indicated).
-pub fn encode_upload_response_segmented(
-    index: u16,
-    subindex: u8,
-    total_size: u32,
-) -> [u8; 8] {
+pub fn encode_upload_response_segmented(index: u16, subindex: u8, total_size: u32) -> [u8; 8] {
     let mut data = [0u8; 8];
     // SCS=2, e=0, s=1 (size indicated)
     data[0] = (Scs::InitiateUploadResponse as u8) << 5 | 0x01;
@@ -124,11 +116,7 @@ pub fn encode_upload_response_segmented(
 }
 
 /// Encode an upload segment response.
-pub fn encode_upload_segment_response(
-    toggle: bool,
-    segment_data: &[u8],
-    last: bool,
-) -> [u8; 8] {
+pub fn encode_upload_segment_response(toggle: bool, segment_data: &[u8], last: bool) -> [u8; 8] {
     let n = 7 - segment_data.len();
     let mut data = [0u8; 8];
     data[0] = (Scs::UploadSegmentResponse as u8) << 5
@@ -180,8 +168,7 @@ mod tests {
 
     #[test]
     fn expedited_upload_response() {
-        let data =
-            encode_upload_response_expedited(0x1000, 0, &[0x91, 0x01, 0x00, 0x00]).unwrap();
+        let data = encode_upload_response_expedited(0x1000, 0, &[0x91, 0x01, 0x00, 0x00]).unwrap();
         let cs = command_specifier(data[0]);
         assert_eq!(cs, Scs::InitiateUploadResponse as u8);
         // e=1, s=1, n=0 (4 bytes used)

@@ -135,9 +135,7 @@ impl NmtHandler {
             NmtCommand::StartRemoteNode => NmtState::Operational,
             NmtCommand::StopRemoteNode => NmtState::Stopped,
             NmtCommand::EnterPreOperational => NmtState::PreOperational,
-            NmtCommand::ResetNode | NmtCommand::ResetCommunication => {
-                NmtState::Initializing
-            }
+            NmtCommand::ResetNode | NmtCommand::ResetCommunication => NmtState::Initializing,
         };
         if self.state == new_state {
             return NmtTransition::None;
@@ -170,24 +168,39 @@ mod tests {
         nmt.boot_complete();
 
         // Start (broadcast)
-        assert_eq!(nmt.process_command(NmtCommand::StartRemoteNode, 0, node), NmtTransition::StateChanged);
+        assert_eq!(
+            nmt.process_command(NmtCommand::StartRemoteNode, 0, node),
+            NmtTransition::StateChanged
+        );
         assert_eq!(nmt.state(), NmtState::Operational);
 
         // Stop (addressed)
-        assert_eq!(nmt.process_command(NmtCommand::StopRemoteNode, 5, node), NmtTransition::StateChanged);
+        assert_eq!(
+            nmt.process_command(NmtCommand::StopRemoteNode, 5, node),
+            NmtTransition::StateChanged
+        );
         assert_eq!(nmt.state(), NmtState::Stopped);
 
         // Wrong target - no change
-        assert_eq!(nmt.process_command(NmtCommand::StartRemoteNode, 3, node), NmtTransition::None);
+        assert_eq!(
+            nmt.process_command(NmtCommand::StartRemoteNode, 3, node),
+            NmtTransition::None
+        );
         assert_eq!(nmt.state(), NmtState::Stopped);
 
         // ResetNode
-        assert_eq!(nmt.process_command(NmtCommand::ResetNode, 0, node), NmtTransition::ResetApplication);
+        assert_eq!(
+            nmt.process_command(NmtCommand::ResetNode, 0, node),
+            NmtTransition::ResetApplication
+        );
         assert_eq!(nmt.state(), NmtState::Initializing);
 
         // ResetCommunication
         nmt.boot_complete();
-        assert_eq!(nmt.process_command(NmtCommand::ResetCommunication, 0, node), NmtTransition::ResetCommunication);
+        assert_eq!(
+            nmt.process_command(NmtCommand::ResetCommunication, 0, node),
+            NmtTransition::ResetCommunication
+        );
         assert_eq!(nmt.state(), NmtState::Initializing);
     }
 
@@ -201,8 +214,16 @@ mod tests {
 
     #[test]
     fn heartbeat_byte_roundtrip() {
-        for state in [NmtState::Initializing, NmtState::Stopped, NmtState::Operational, NmtState::PreOperational] {
-            assert_eq!(NmtState::from_heartbeat_byte(state.heartbeat_byte()), Some(state));
+        for state in [
+            NmtState::Initializing,
+            NmtState::Stopped,
+            NmtState::Operational,
+            NmtState::PreOperational,
+        ] {
+            assert_eq!(
+                NmtState::from_heartbeat_byte(state.heartbeat_byte()),
+                Some(state)
+            );
         }
         assert_eq!(NmtState::from_heartbeat_byte(0xFF), None);
     }
@@ -213,7 +234,10 @@ mod tests {
 
         let frame = NmtCommand::StartRemoteNode.to_frame(0);
         assert_eq!(frame.data(), &[0x01, 0x00]);
-        assert_eq!(frame.id(), embedded_can::Id::Standard(embedded_can::StandardId::new(0).unwrap()));
+        assert_eq!(
+            frame.id(),
+            embedded_can::Id::Standard(embedded_can::StandardId::new(0).unwrap())
+        );
 
         let frame = NmtCommand::ResetNode.to_frame(5);
         assert_eq!(frame.data(), &[0x81, 0x05]);

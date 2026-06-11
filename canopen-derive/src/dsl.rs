@@ -1,5 +1,5 @@
 use syn::parse::{Parse, ParseStream};
-use syn::{braced, bracketed, parenthesized, Ident, LitStr, LitInt, Result, Token, Visibility};
+use syn::{braced, bracketed, parenthesized, Ident, LitInt, LitStr, Result, Token, Visibility};
 
 /// Top-level OD definition parsed from the macro input.
 #[derive(Debug)]
@@ -182,9 +182,9 @@ fn parse_entry(input: ParseStream) -> Result<OdEntry> {
     let index_content;
     bracketed!(index_content in input);
     let index_lit: LitInt = index_content.parse()?;
-    let index: u16 = index_lit.base10_parse().map_err(|_| {
-        syn::Error::new(index_lit.span(), "expected u16 index")
-    })?;
+    let index: u16 = index_lit
+        .base10_parse()
+        .map_err(|_| syn::Error::new(index_lit.span(), "expected u16 index"))?;
 
     // Parse name
     let name: Ident = input.parse()?;
@@ -291,9 +291,9 @@ fn parse_sub_entry(input: ParseStream) -> Result<SubEntry> {
     let sub_content;
     bracketed!(sub_content in input);
     let sub_lit: LitInt = sub_content.parse()?;
-    let subindex: u8 = sub_lit.base10_parse().map_err(|_| {
-        syn::Error::new(sub_lit.span(), "expected u8 subindex")
-    })?;
+    let subindex: u8 = sub_lit
+        .base10_parse()
+        .map_err(|_| syn::Error::new(sub_lit.span(), "expected u8 subindex"))?;
 
     let name: Ident = input.parse()?;
     input.parse::<Token![:]>()?;
@@ -325,9 +325,9 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
     let num_content;
     bracketed!(num_content in input);
     let num_lit: LitInt = num_content.parse()?;
-    let number: u8 = num_lit.base10_parse().map_err(|_| {
-        syn::Error::new(num_lit.span(), "expected PDO number 1-4")
-    })?;
+    let number: u8 = num_lit
+        .base10_parse()
+        .map_err(|_| syn::Error::new(num_lit.span(), "expected PDO number 1-4"))?;
     if number < 1 || number > 4 {
         return Err(syn::Error::new(num_lit.span(), "PDO number must be 1-4"));
     }
@@ -395,9 +395,9 @@ fn parse_var_def(input: ParseStream) -> Result<VarDef> {
     let capacity = if input.peek(Token![<]) {
         input.parse::<Token![<]>()?;
         let cap_lit: LitInt = input.parse()?;
-        let cap: usize = cap_lit.base10_parse().map_err(|_| {
-            syn::Error::new(cap_lit.span(), "expected capacity (usize)")
-        })?;
+        let cap: usize = cap_lit
+            .base10_parse()
+            .map_err(|_| syn::Error::new(cap_lit.span(), "expected capacity (usize)"))?;
         input.parse::<Token![>]>()?;
         Some(cap)
     } else {
