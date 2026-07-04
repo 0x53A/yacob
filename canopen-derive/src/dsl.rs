@@ -344,12 +344,14 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
         while !params.is_empty() {
             let key: Ident = params.parse()?;
             params.parse::<Token![=]>()?;
-            let val: LitInt = params.parse()?;
             match key.to_string().as_str() {
-                "cob_id" => cob_id = Some(val.base10_parse()?),
-                "transmission_type" => transmission_type = val.base10_parse()?,
-                "inhibit_time" => inhibit_time = val.base10_parse()?,
-                "event_timer" => event_timer = val.base10_parse()?,
+                "cob_id" => {
+                    let val: LitInt = params.parse()?;
+                    cob_id = Some(val.base10_parse()?);
+                }
+                "transmission_type" => transmission_type = parse_transmission_type(&params)?,
+                "inhibit_time" => inhibit_time = parse_time_value(&params, &INHIBIT_TIME_SPEC)?,
+                "event_timer" => event_timer = parse_time_value(&params, &EVENT_TIMER_SPEC)?,
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -392,6 +394,159 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
         event_timer,
         mappings,
     })
+}
+
+/// Parse a transmission type: either a raw CiA 301 value (`255`) or a keyword
+/// (`event_driven`, `event_driven_manufacturer`, `sync_acyclic`,
+/// `sync_cyclic(N)`, `rtr_sync`, `rtr_event`).
+fn parse_transmission_type(input: ParseStream) -> Result<u8> {
+    if input.peek(LitInt) {
+        let lit: LitInt = input.parse()?;
+        let raw: u8 = lit.base10_parse()?;
+        if (241..=251).contains(&raw) {
+            return Err(syn::Error::new(
+                lit.span(),
+                format!("transmission type {raw} is reserved (CiA 301); valid values are 0 (sync acyclic), 1-240 (sync cyclic), 252/253 (RTR), 254/255 (event-driven)"),
+            ));
+        }
+        return Ok(raw);
+    }
+
+    let kw: Ident = input.parse().map_err(|_| {
+        input.error("expected a transmission type: raw value (e.g. 255) or keyword (event_driven, sync_acyclic, sync_cyclic(N), rtr_sync, rtr_event)")
+    })?;
+    match kw.to_string().as_str() {
+        "event_driven" => Ok(255),
+        "event_driven_manufacturer" => Ok(254),
+        "rtr_event" => Ok(253),
+        "rtr_sync" => Ok(252),
+        "sync_acyclic" => Ok(0),
+        "sync_cyclic" => {
+            let n_content;
+            parenthesized!(n_content in input);
+            let n_lit: LitInt = n_content.parse()?;
+            let n: u8 = n_lit.base10_parse()?;
+            if !(1..=240).contains(&n) {
+                return Err(syn::Error::new(
+                    n_lit.span(),
+                    "sync_cyclic(N): N must be 1..=240 (send every N SYNCs)",
+                ));
+            }
+            Ok(n)
+        }
+        other => Err(syn::Error::new(
+            kw.span(),
+            format!("unknown transmission type `{other}`, expected event_driven, event_driven_manufacturer, sync_acyclic, sync_cyclic(N), rtr_sync, rtr_event, or a raw CiA 301 value"),
+        )),
+    }
+}
+
+/// How a DSL time parameter maps to its CiA 301 wire representation.
+struct TimeSpec {
+    /// Parameter name for error messages.
+    param: &'static str,
+    /// Size of one wire unit in nanoseconds.
+    unit_ns: u64,
+    /// Human-readable wire unit for error messages.
+    unit_name: &'static str,
+}
+
+static INHIBIT_TIME_SPEC: TimeSpec = TimeSpec {
+    param: "inhibit_time",
+    unit_ns: 100_000, // 100 µs
+    unit_name: "100µs",
+};
+
+static EVENT_TIMER_SPEC: TimeSpec = TimeSpec {
+    param: "event_timer",
+    unit_ns: 1_000_000, // 1 ms
+    unit_name: "1ms",
+};
+
+/// Parse a time parameter value. Accepts either a raw integer in the CiA 301
+/// wire unit (spec-exact, quirks included) or a unit-suffixed literal:
+/// `500` (raw), `50ms`, `100us`, `0.1s`.
+fn parse_time_value(input: ParseStream, spec: &TimeSpec) -> Result<u16> {
+    let lit: syn::Lit = input.parse()?;
+
+    let (value_ns, span) = match &lit {
+        syn::Lit::Int(li) => {
+            match li.suffix() {
+                // Raw value: spec wire units, passed through unchanged.
+                "" => return li.base10_parse::<u16>(),
+                suffix => {
+                    let v: u64 = li.base10_parse()?;
+                    let ns = v
+                        .checked_mul(suffix_to_ns(suffix, li.span(), spec)?)
+                        .ok_or_else(|| syn::Error::new(li.span(), "time value overflows"))?;
+                    (ns as f64, li.span())
+                }
+            }
+        }
+        syn::Lit::Float(lf) => {
+            let suffix = lf.suffix();
+            if suffix.is_empty() {
+                return Err(syn::Error::new(
+                    lf.span(),
+                    format!(
+                        "float {} values need a unit suffix (us, ms, s), e.g. `{} = 0.1s`; \
+                         raw {} units must be integers",
+                        spec.param, spec.param, spec.unit_name
+                    ),
+                ));
+            }
+            let v: f64 = lf.base10_parse()?;
+            (v * suffix_to_ns(suffix, lf.span(), spec)? as f64, lf.span())
+        }
+        other => {
+            return Err(syn::Error::new_spanned(
+                other,
+                format!(
+                    "expected a time value: raw integer in {} units, or a suffixed literal like 50ms or 0.1s",
+                    spec.unit_name
+                ),
+            ));
+        }
+    };
+
+    let units = value_ns / spec.unit_ns as f64;
+    let rounded = units.round();
+    if (units - rounded).abs() > 1e-6 {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "{} value is not representable: CiA 301 stores {} in {} units",
+                spec.param, spec.param, spec.unit_name
+            ),
+        ));
+    }
+    if rounded < 0.0 || rounded > u16::MAX as f64 {
+        let max_s = u16::MAX as f64 * spec.unit_ns as f64 / 1e9;
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "{} value out of range: maximum is {}s (u16 in {} units)",
+                spec.param, max_s, spec.unit_name
+            ),
+        ));
+    }
+    Ok(rounded as u16)
+}
+
+fn suffix_to_ns(suffix: &str, span: proc_macro2::Span, spec: &TimeSpec) -> Result<u64> {
+    match suffix {
+        "us" => Ok(1_000),
+        "ms" => Ok(1_000_000),
+        "s" => Ok(1_000_000_000),
+        other => Err(syn::Error::new(
+            span,
+            format!(
+                "unknown time unit `{other}` for {}, expected us, ms, or s \
+                 (or an unsuffixed integer in raw {} units)",
+                spec.param, spec.unit_name
+            ),
+        )),
+    }
 }
 
 fn parse_var_def(input: ParseStream) -> Result<VarDef> {

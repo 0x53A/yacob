@@ -10,13 +10,12 @@
 #![no_main]
 
 use canopen_core::cobid::NodeId;
-use canopen_core::node::{Node, NodeConfig};
+use canopen_core::node::{Node, NodeConfig, SharedNode};
 use canopen_core::time::Clock;
 use canopen_core::transport::{CanError, CanFrame};
 use canopen_core::OdEventSignal;
 use canopen_derive::object_dictionary;
 
-use core::cell::RefCell;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
@@ -26,7 +25,6 @@ use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::{bind_interrupts, can, peripherals};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Ticker};
 
@@ -64,25 +62,26 @@ object_dictionary! {
             [2] echo_out: u16 = 0, ro, pdo;   // node mirrors echo_in here
         };
 
-        // TPDO1: data this node sends (0x181 for node 1)
-        // - transmission_type: EVENT_DRIVEN (255) = send on change,
-        //   not tied to SYNC. Other options: SYNC_ACYCLIC (0), sync_cyclic(N).
-        // - inhibit_time: minimum 50ms between sends (in 100μs units)
-        // - event_timer: periodic fallback — send at least every 1000ms even
-        //   if nothing changed. Set to 0 to only send on explicit triggers.
+        // TPDO1: data this node sends (0x181 for node 1).
+        // - event_driven: send on change, not tied to SYNC. Other options:
+        //   sync_acyclic, sync_cyclic(N), or a raw CiA 301 value (e.g. 255).
+        // - inhibit_time: minimum spacing between sends. event_timer: periodic
+        //   fallback — send even if nothing changed (omit to disable). Both
+        //   take unit suffixes (50ms, 0.1s, 500us) or raw CiA 301 values.
         // - Fields are packed into one CAN frame: [button (1 byte) | echo_out (2 bytes)]
-        tpdo[1](transmission_type = 255, inhibit_time = 500, event_timer = 1000) {
+        tpdo[1](transmission_type = event_driven, inhibit_time = 50ms, event_timer = 1s) {
             button,
             echo_out,
         };
 
-        // RPDO1: data this node receives (0x201 for node 1)
-        // - transmission_type: EVENT_DRIVEN (255) = apply values to OD immediately
-        //   when the frame arrives. With SYNC_ACYCLIC (0), values would be buffered
-        //   and only applied on the next SYNC pulse (useful for coordinated updates).
+        // RPDO1: data this node receives (0x201 for node 1).
+        // - event_driven: apply values to the OD immediately on arrival. With
+        //   sync_acyclic, values would be buffered until the next SYNC pulse
+        //   (useful for coordinated updates).
         // - Fields are unpacked from the CAN frame: [led (1 byte) | echo_in (2 bytes)]
-        // - Writing to these triggers an OdEvent, which wakes main via EVENT_SIGNAL.
-        rpdo[1](transmission_type = 255) {
+        // - Writing to these emits a typed NodeOdChange, which wakes main via
+        //   EVENT_SIGNAL.
+        rpdo[1](transmission_type = event_driven) {
             led,
             echo_in,
         };
@@ -96,8 +95,7 @@ static RX_CHANNEL: Channel<CriticalSectionRawMutex, CanFrame, 16> = Channel::new
 static EVENT_SIGNAL: OdEventSignal = OdEventSignal::new();
 
 /// The CANopen node, shared between the protocol task and main.
-static NODE: Mutex<CriticalSectionRawMutex, RefCell<Option<Node<NodeOd, 1, 1>>>> =
-    Mutex::new(RefCell::new(None));
+static NODE: SharedNode<NodeOd, 1, 1> = SharedNode::new();
 
 // ---------- Clock ----------
 
@@ -195,11 +193,7 @@ async fn protocol_task() {
 
     loop {
         ticker.next().await;
-        NODE.lock(|cell| {
-            let mut borrow = cell.borrow_mut();
-            let node = borrow.as_mut().unwrap();
-            node.process(&mut transport, &clock);
-        });
+        NODE.with(|node| node.process(&mut transport, &clock));
     }
 }
 
@@ -251,29 +245,27 @@ async fn main(spawner: Spawner) {
     // CANopen node — PDO config comes from the OD (declared in the macro above)
     let node_id = NodeId::new(1).unwrap();
     let od = NodeOd::new();
-    let mut node: Node<NodeOd, 1, 1> = Node::new(
-        NodeConfig::<1, 1> {
-            node_id,
+    let mut node: NodeOdNode = Node::new(
+        NodeConfig {
             heartbeat_interval_ms: 500,
             auto_start: true,
-            tpdo: od.tpdo_configs(node_id),
-            rpdo: od.rpdo_configs(node_id),
-            identity: canopen_core::LssIdentity::default(),
+            ..NodeConfig::from_od(&od, node_id)
         },
         od,
     );
     node.set_event_signal(&EVENT_SIGNAL);
-    NODE.lock(|cell| cell.borrow_mut().replace(node));
+
+    info!(
+        "node {} running — TPDO1 {:#05X}, RPDO1 {:#05X}",
+        node_id.raw(),
+        node.tpdo_cob_id(0).unwrap(),
+        node.rpdo_cob_id(0).unwrap()
+    );
+
+    NODE.init(node);
 
     // Protocol runs in the background
     spawner.must_spawn(protocol_task());
-
-    info!(
-        "node {} running — TPDO1 0x{:03X}, RPDO1 0x{:03X}",
-        node_id.raw(),
-        0x180u16 + node_id.raw() as u16,
-        0x200u16 + node_id.raw() as u16
-    );
 
     // ---------- Application logic ----------
     //
@@ -282,16 +274,17 @@ async fn main(spawner: Spawner) {
 
     loop {
         match select(EVENT_SIGNAL.wait(), button.wait_for_any_edge()).await {
-            // Protocol stack changed the OD (SDO download or RPDO write)
+            // Protocol stack changed the OD (SDO download or RPDO write).
+            // next_change() decodes events into NodeOdChange — one variant per
+            // writable OD entry, carrying the current value. The match is
+            // exhaustive: adding a writable field to the OD is a compile
+            // error here until it's handled.
             Either::First(_) => {
-                NODE.lock(|cell| {
-                    let mut borrow = cell.borrow_mut();
-                    let node = borrow.as_mut().unwrap();
-
-                    while let Some(evt) = node.next_event() {
-                        match (evt.index, evt.subindex) {
-                            (0x6200, 1) => {
-                                let on = node.od().led != 0;
+                NODE.with(|node| {
+                    while let Some(change) = node.next_change() {
+                        match change {
+                            NodeOdChange::Led(v) => {
+                                let on = v != 0;
                                 info!("LED {}", if on { "on" } else { "off" });
                                 if on {
                                     led.set_high()
@@ -299,12 +292,10 @@ async fn main(spawner: Spawner) {
                                     led.set_low()
                                 }
                             }
-                            (0x2000, 1) => {
-                                let val = node.od().echo_in;
-                                info!("echo {:#06X}", val);
-                                node.od_mut().echo_out = val;
+                            NodeOdChange::EchoIn(v) => {
+                                info!("echo {:#06X}", v);
+                                node.od_mut().echo_out = v;
                             }
-                            _ => {}
                         }
                     }
                 });
@@ -314,11 +305,7 @@ async fn main(spawner: Spawner) {
             Either::Second(_) => {
                 let pressed = button.is_low();
                 info!("button {}", if pressed { "dn" } else { "up" });
-                NODE.lock(|cell| {
-                    let mut borrow = cell.borrow_mut();
-                    let node = borrow.as_mut().unwrap();
-                    node.od_mut().button = pressed as u8;
-                });
+                NODE.with(|node| node.od_mut().button = pressed as u8);
             }
         }
     }

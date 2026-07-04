@@ -35,8 +35,15 @@ fn main() {
 
     // Echo loopback: write echo_in (0x2000:1), node mirrors to echo_out (0x2000:2)
     println!("\nWriting echo_in (0x2000:1) = 0x1234...");
-    sdo_download(&mut slcan, target, 0x2000, 1, &0x1234u16.to_le_bytes(), timeout)
-        .expect("SDO failed");
+    sdo_download(
+        &mut slcan,
+        target,
+        0x2000,
+        1,
+        &0x1234u16.to_le_bytes(),
+        timeout,
+    )
+    .expect("SDO failed");
     let data = sdo_upload(&mut slcan, target, 0x2000, 2, timeout).expect("SDO failed");
     let echoed = u16::from_le_bytes([data[0], data[1]]);
     println!("  echo_out (0x2000:2): {:#06X}", echoed);

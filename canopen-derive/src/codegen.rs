@@ -1094,6 +1094,128 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         (0x1022, 0) => Err(canopen_core::od::OdError::ReadOnly),
     });
 
+    // ---- Generate OD address constants ----
+    // One `pub const FIELD: (u16, u8)` per entry, so application code can
+    // refer to OD addresses by name instead of magic numbers.
+    let mut addr_consts: Vec<TokenStream> = Vec::new();
+    for e in &flat {
+        let const_name = format_ident!("{}", to_screaming_snake(&e.field_name.to_string()));
+        let index = e.index;
+        let sub = e.subindex;
+        let doc = format!(
+            "OD address of `{}` (0x{:04X}:{}).",
+            e.field_name, index, sub
+        );
+        addr_consts.push(quote! {
+            #[doc = #doc]
+            pub const #const_name: (u16, u8) = (#index, #sub);
+        });
+    }
+    for a in &arrays {
+        let const_name = format_ident!("{}_INDEX", to_screaming_snake(&a.field_name.to_string()));
+        let index = a.index;
+        let count = a.def.count;
+        let doc = format!(
+            "OD index of array `{}` (0x{:04X}, subindices 1..={}).",
+            a.field_name, index, count
+        );
+        addr_consts.push(quote! {
+            #[doc = #doc]
+            pub const #const_name: u16 = #index;
+        });
+    }
+
+    // ---- Generate typed change enum + OdChanges impl ----
+    // One variant per writable entry: the protocol stack can only ever modify
+    // rw/wo entries (SDO download, RPDO), so events map onto these variants.
+    let change_name = format_ident!("{}Change", name);
+    let mut change_variants: Vec<TokenStream> = Vec::new();
+    let mut decode_arms: Vec<TokenStream> = Vec::new();
+    for e in &flat {
+        if !matches!(e.var.access, AccessKind::Rw | AccessKind::Wo) {
+            continue;
+        }
+        let variant = format_ident!("{}", to_camel_case(&e.field_name.to_string()));
+        let fname = &e.field_name;
+        let index = e.index;
+        let sub = e.subindex;
+        let ty_str = e.var.type_name.to_string();
+        if is_variable_length_type(&ty_str) {
+            // Value not carried: read `od().field` if needed.
+            let doc = format!("`{}` (0x{:04X}:{}) was written.", fname, index, sub);
+            change_variants.push(quote! { #[doc = #doc] #variant });
+            decode_arms.push(quote! {
+                (#index, #sub) => Some(#change_name::#variant),
+            });
+        } else {
+            let ty = &e.var.type_name;
+            let doc = format!(
+                "`{}` (0x{:04X}:{}) was written; carries the current value.",
+                fname, index, sub
+            );
+            change_variants.push(quote! { #[doc = #doc] #variant(#ty) });
+            decode_arms.push(quote! {
+                (#index, #sub) => Some(#change_name::#variant(self.#fname)),
+            });
+        }
+    }
+    for a in &arrays {
+        if !matches!(a.def.access, AccessKind::Rw | AccessKind::Wo) {
+            continue;
+        }
+        let variant = format_ident!("{}", to_camel_case(&a.field_name.to_string()));
+        let fname = &a.field_name;
+        let index = a.index;
+        let count_u8 = a.def.count as u8;
+        let ty = &a.def.element_type;
+        let doc = format!(
+            "`{}[subindex]` (0x{:04X}) was written; carries (subindex, current value).",
+            fname, index
+        );
+        change_variants.push(quote! { #[doc = #doc] #variant(u8, #ty) });
+        decode_arms.push(quote! {
+            (#index, sub) if sub >= 1 && sub <= #count_u8 =>
+                Some(#change_name::#variant(sub, self.#fname[(sub as usize) - 1])),
+        });
+    }
+
+    let change_doc = format!(
+        "Typed OD change, decoded from an `OdEvent` by [`{name}::decode_event`] \
+         (usually via `node.next_change()`). One variant per writable OD entry."
+    );
+
+    // ---- Node type alias + PdoConfigSource impl ----
+    let tc = tpdo_count;
+    let rc = rpdo_count;
+    let node_alias = format_ident!("{}Node", name);
+    let alias_doc = format!(
+        "[`Node`](canopen_core::node::Node) preconfigured for [`{name}`] ({tc} TPDO, {rc} RPDO)."
+    );
+
+    let pdo_source_impl = if has_pdos {
+        quote! {
+            impl canopen_core::pdo::PdoConfigSource<#tc, #rc> for #name {
+                fn tpdo_configs(&self, node_id: canopen_core::cobid::NodeId) -> [canopen_core::pdo::TpdoConfig; #tc] {
+                    #name::tpdo_configs(self, node_id)
+                }
+                fn rpdo_configs(&self, node_id: canopen_core::cobid::NodeId) -> [canopen_core::pdo::RpdoConfig; #rc] {
+                    #name::rpdo_configs(self, node_id)
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl canopen_core::pdo::PdoConfigSource<0, 0> for #name {
+                fn tpdo_configs(&self, _node_id: canopen_core::cobid::NodeId) -> [canopen_core::pdo::TpdoConfig; 0] {
+                    []
+                }
+                fn rpdo_configs(&self, _node_id: canopen_core::cobid::NodeId) -> [canopen_core::pdo::RpdoConfig; 0] {
+                    []
+                }
+            }
+        }
+    };
+
     // ---- Assemble output ----
     let meta_len = all_meta_entries.len();
 
@@ -1115,6 +1237,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
 
             /// Deflate-compressed EDS content, served via 0x1021 (Store EDS).
             pub const EDS_COMPRESSED: &'static [u8] = &[#(#eds_compressed_bytes),*];
+
+            #(#addr_consts)*
 
             pub fn new() -> Self {
                 Self {
@@ -1159,6 +1283,28 @@ pub fn generate(od: OdDefinition) -> TokenStream {
 
             #validate_write_impl
         }
+
+        #[doc = #change_doc]
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        #vis enum #change_name {
+            #(#change_variants,)*
+        }
+
+        impl canopen_core::od::OdChanges for #name {
+            type Change = #change_name;
+
+            fn decode_event(&self, event: canopen_core::od::OdEvent) -> Option<#change_name> {
+                match (event.index, event.subindex) {
+                    #(#decode_arms)*
+                    _ => None,
+                }
+            }
+        }
+
+        #pdo_source_impl
+
+        #[doc = #alias_doc]
+        #vis type #node_alias = canopen_core::node::Node<#name, #tc, #rc>;
     }
 }
 
@@ -1176,6 +1322,20 @@ fn gen_pdo_meta(index: u16, subindex: u8, dt: &str, access: &str, entry_name: &s
             max_size: None,
         }
     }
+}
+
+/// `echo_in` → `EchoIn` (for change enum variant names).
+fn to_camel_case(name: &str) -> String {
+    name.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 fn to_screaming_snake(name: &str) -> String {

@@ -59,6 +59,31 @@ pub enum OdEventSource {
     Rpdo,
 }
 
+/// Typed decoding of [`OdEvent`]s, implemented by `object_dictionary!`-generated ODs.
+///
+/// The macro generates a `${Name}Change` enum with one variant per writable
+/// entry (carrying the current value for fixed-size types) and implements
+/// this trait, so application code can match on named variants instead of
+/// raw index/subindex pairs:
+///
+/// ```ignore
+/// while let Some(change) = node.next_change() {
+///     match change {
+///         MyOdChange::Led(v) => set_led(v != 0),
+///         MyOdChange::Setpoint(v) => update(v),
+///     }
+/// }
+/// ```
+pub trait OdChanges {
+    /// Generated change enum (`${Name}Change`).
+    type Change;
+
+    /// Decode an event into a typed change, reading the current value from
+    /// the OD. Returns `None` for entries without an application-level
+    /// variant (e.g. auto-generated PDO communication parameters).
+    fn decode_event(&self, event: OdEvent) -> Option<Self::Change>;
+}
+
 /// Signal type for async notification of OD events.
 ///
 /// Place in a `static` and pass to [`Node::set_event_signal`]. An async task

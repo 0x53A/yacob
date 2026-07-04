@@ -725,3 +725,151 @@ fn validate_write_macro_sdo_server_rejects() {
     // No event should have been pushed
     assert!(events.is_empty());
 }
+
+// ---- New DSL surface: keywords, unit suffixes, consts, change enum ----
+
+object_dictionary! {
+    pub struct SugarOd {
+        [0x6000] inputs: record {
+            [1] button: u8 = 0, ro, pdo;
+        };
+        [0x6200] outputs: record {
+            [1] led: u8 = 0, rw, pdo;
+        };
+        [0x2000] echo: record {
+            [1] echo_in: u16 = 0, rw, pdo;
+            [2] echo_out: u16 = 0, ro, pdo;
+        };
+        [0x2020] firmware: domain<64>, rw;
+        [0x2030] thresholds: array<u16, 4>, rw;
+
+        // 50ms in 100µs units = 500; 1s in ms = 1000
+        tpdo[1](transmission_type = event_driven, inhibit_time = 50ms, event_timer = 1s) {
+            button,
+            echo_out,
+        };
+        // float with unit suffix: 0.1s = 100ms → event_timer = 100
+        tpdo[2](transmission_type = sync_cyclic(4), event_timer = 0.1s) {
+            echo_out,
+        };
+        rpdo[1](transmission_type = event_driven) {
+            led,
+            echo_in,
+        };
+    }
+}
+
+#[test]
+fn dsl_transmission_type_keywords_and_time_suffixes() {
+    let od = SugarOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(1).unwrap();
+    let tpdo = od.tpdo_configs(node_id);
+
+    assert_eq!(tpdo[0].transmission_type, 255); // event_driven
+    assert_eq!(tpdo[0].inhibit_time_100us, 500); // 50ms
+    assert_eq!(tpdo[0].event_timer_ms, 1000); // 1s
+
+    assert_eq!(tpdo[1].transmission_type, 4); // sync_cyclic(4)
+    assert_eq!(tpdo[1].event_timer_ms, 100); // 0.1s
+
+    let rpdo = od.rpdo_configs(node_id);
+    assert_eq!(rpdo[0].transmission_type, 255);
+}
+
+#[test]
+fn generated_address_consts() {
+    assert_eq!(SugarOd::BUTTON, (0x6000, 1));
+    assert_eq!(SugarOd::LED, (0x6200, 1));
+    assert_eq!(SugarOd::ECHO_IN, (0x2000, 1));
+    assert_eq!(SugarOd::FIRMWARE, (0x2020, 0));
+    assert_eq!(SugarOd::THRESHOLDS_INDEX, 0x2030);
+
+    // Consts are structural-match, so they work as match patterns.
+    let evt = (0x6200u16, 1u8);
+    match evt {
+        SugarOd::LED => {}
+        _ => panic!("const pattern did not match"),
+    }
+}
+
+#[test]
+fn change_enum_decodes_events() {
+    use canopen_core::od::{OdChanges, OdEvent, OdEventSource};
+
+    let mut od = SugarOd::new();
+    od.led = 1;
+    od.echo_in = 0xBEEF;
+    od.thresholds[2] = 77;
+
+    let evt = |index, subindex| OdEvent {
+        index,
+        subindex,
+        source: OdEventSource::Sdo,
+    };
+
+    assert_eq!(od.decode_event(evt(0x6200, 1)), Some(SugarOdChange::Led(1)));
+    assert_eq!(
+        od.decode_event(evt(0x2000, 1)),
+        Some(SugarOdChange::EchoIn(0xBEEF))
+    );
+    // Variable-length entries: unit variant, value read from the OD if needed.
+    assert_eq!(
+        od.decode_event(evt(0x2020, 0)),
+        Some(SugarOdChange::Firmware)
+    );
+    // Arrays carry (subindex, value).
+    assert_eq!(
+        od.decode_event(evt(0x2030, 3)),
+        Some(SugarOdChange::Thresholds(3, 77))
+    );
+
+    // Read-only entries can't be changed by the stack: no variant.
+    assert_eq!(od.decode_event(evt(0x6000, 1)), None);
+    // Auto-generated PDO comm params have no application-level variant.
+    assert_eq!(od.decode_event(evt(0x1800, 2)), None);
+}
+
+#[test]
+fn node_next_change_drains_typed() {
+    use canopen_core::node::{Node, NodeConfig};
+
+    let node_id = canopen_core::cobid::NodeId::new(1).unwrap();
+    let od = SugarOd::new();
+    let config = NodeConfig {
+        heartbeat_interval_ms: 500,
+        auto_start: true,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    assert_eq!(config.tpdo.len(), 2);
+    assert_eq!(config.rpdo.len(), 1);
+
+    // The generated alias fixes the PDO counts.
+    let mut node: SugarOdNode = Node::new(config, od);
+
+    // Simulate an SDO write to `led` via the OD + event path: write through
+    // the SDO server would enqueue an event; here we check the typed drain on
+    // an empty queue plus the COB-ID accessors.
+    assert_eq!(node.next_change(), None);
+    assert_eq!(node.tpdo_cob_id(0), Some(0x181));
+    assert_eq!(node.rpdo_cob_id(0), Some(0x201));
+}
+
+#[test]
+fn transmission_type_enum_round_trip() {
+    use canopen_core::TransmissionType;
+
+    assert_eq!(TransmissionType::EventDriven.raw(), 255);
+    assert_eq!(TransmissionType::SyncAcyclic.raw(), 0);
+    assert_eq!(TransmissionType::SyncCyclic(4).raw(), 4);
+    assert_eq!(u8::from(TransmissionType::RtrSync), 252);
+
+    assert_eq!(
+        TransmissionType::from_raw(255),
+        Some(TransmissionType::EventDriven)
+    );
+    assert_eq!(
+        TransmissionType::from_raw(7),
+        Some(TransmissionType::SyncCyclic(7))
+    );
+    assert_eq!(TransmissionType::from_raw(245), None); // reserved
+}

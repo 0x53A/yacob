@@ -36,6 +36,31 @@ pub struct NodeConfig<const TPDO: usize = 4, const RPDO: usize = 4> {
     pub identity: LssIdentity,
 }
 
+impl<const TPDO: usize, const RPDO: usize> NodeConfig<TPDO, RPDO> {
+    /// Build a config with PDO settings pulled from the OD (declared in the
+    /// `object_dictionary!` macro) and defaults for the rest: heartbeat every
+    /// 1000 ms, no auto-start, default LSS identity.
+    ///
+    /// Override the defaults with struct update syntax:
+    /// ```ignore
+    /// let config = NodeConfig {
+    ///     heartbeat_interval_ms: 500,
+    ///     auto_start: true,
+    ///     ..NodeConfig::from_od(&od, node_id)
+    /// };
+    /// ```
+    pub fn from_od(od: &impl crate::pdo::PdoConfigSource<TPDO, RPDO>, node_id: NodeId) -> Self {
+        Self {
+            node_id,
+            heartbeat_interval_ms: 1000,
+            auto_start: false,
+            tpdo: od.tpdo_configs(node_id),
+            rpdo: od.rpdo_configs(node_id),
+            identity: LssIdentity::default(),
+        }
+    }
+}
+
 /// A CANopen node. Ties together NMT, SDO server, PDO engines, and heartbeat.
 ///
 /// Generic over the object dictionary type, PDO counts, event queue size, and dirty set size.
@@ -177,6 +202,34 @@ impl<
     /// made by the protocol stack (SDO downloads, RPDO writes).
     pub fn next_event(&mut self) -> Option<OdEvent> {
         self.event_queue.pop_front()
+    }
+
+    /// Drain the next OD event and decode it into the OD's typed change enum.
+    ///
+    /// Events without an application-level variant (e.g. writes to
+    /// auto-generated PDO communication parameters) are skipped. The value
+    /// carried by the variant is read at drain time, so a burst of writes to
+    /// the same entry yields the freshest value.
+    pub fn next_change(&mut self) -> Option<OD::Change>
+    where
+        OD: crate::od::OdChanges,
+    {
+        while let Some(evt) = self.event_queue.pop_front() {
+            if let Some(change) = self.od.decode_event(evt) {
+                return Some(change);
+            }
+        }
+        None
+    }
+
+    /// Resolved COB-ID of TPDO `n` (0-indexed: 0 = TPDO1), if configured.
+    pub fn tpdo_cob_id(&self, n: usize) -> Option<u16> {
+        self.tpdo.config(n).map(|c| c.cob_id)
+    }
+
+    /// Resolved COB-ID of RPDO `n` (0-indexed: 0 = RPDO1), if configured.
+    pub fn rpdo_cob_id(&self, n: usize) -> Option<u16> {
+        self.rpdo.config(n).map(|c| c.cob_id)
     }
 
     /// Number of events dropped due to event queue overflow.
@@ -615,6 +668,87 @@ impl<
         }
 
         let _ = count; // suppress unused warning when embassy feature is off
+    }
+}
+
+/// A [`Node`] in a `static`, shared between the protocol task and application
+/// code. Wraps the `Mutex<RefCell<Option<Node>>>` pattern that Embassy
+/// firmware otherwise spells out at every access.
+///
+/// ```ignore
+/// static NODE: SharedNode<MyOd, 1, 1> = SharedNode::new();
+///
+/// // Setup:
+/// NODE.init(node);
+///
+/// // Anywhere:
+/// NODE.with(|node| node.od_mut().button = 1);
+/// ```
+#[cfg(feature = "embassy")]
+pub struct SharedNode<
+    OD: ObjectDictionary,
+    const TPDO: usize = 4,
+    const RPDO: usize = 4,
+    const EVT_QUEUE: usize = 16,
+    const DIRTY_SET: usize = 8,
+> {
+    inner: embassy_sync::blocking_mutex::Mutex<
+        embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+        core::cell::RefCell<Option<Node<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>>>,
+    >,
+}
+
+#[cfg(feature = "embassy")]
+impl<
+        OD: ObjectDictionary,
+        const TPDO: usize,
+        const RPDO: usize,
+        const EVT_QUEUE: usize,
+        const DIRTY_SET: usize,
+    > SharedNode<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+{
+    pub const fn new() -> Self {
+        Self {
+            inner: embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(None)),
+        }
+    }
+
+    /// Store the node. Call once during setup, before any `with()`.
+    pub fn init(&self, node: Node<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>) {
+        self.inner.lock(|cell| {
+            cell.borrow_mut().replace(node);
+        });
+    }
+
+    /// Run `f` with exclusive access to the node (inside a critical section —
+    /// keep it short).
+    ///
+    /// Panics if called before [`init`](Self::init).
+    pub fn with<R>(
+        &self,
+        f: impl FnOnce(&mut Node<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>) -> R,
+    ) -> R {
+        self.inner.lock(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let node = borrow
+                .as_mut()
+                .expect("SharedNode::with() called before init()");
+            f(node)
+        })
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<
+        OD: ObjectDictionary,
+        const TPDO: usize,
+        const RPDO: usize,
+        const EVT_QUEUE: usize,
+        const DIRTY_SET: usize,
+    > Default for SharedNode<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 

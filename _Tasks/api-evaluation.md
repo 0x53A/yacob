@@ -123,3 +123,52 @@ The original `upload()`/`download()` are unchanged for callers who handle timeou
 ## All items complete
 
 All 8 identified API gaps have been addressed, plus 3 bonus fixes discovered during implementation.
+
+## Round 2: DSL & Application-Boundary Ergonomics (2026-07-04)
+
+> **Note (same day):** the typed-change-*drain* part below (`next_change()`)
+> was re-designed after discussing write-burst semantics — see
+> `application-models.md`. The DSL/consts/config/SharedNode work stands; the
+> event queue and drain APIs will be replaced by the three application models
+> described there.
+
+Review of `examples/stm32-node/src/main.rs` found the macro stopped helping
+exactly at the application boundary: event dispatch matched on raw
+`(0x6200, 1)` tuples, node setup repeated PDO config the OD already declared,
+and the DSL used raw CiA 301 wire values (`transmission_type = 255`,
+`inhibit_time = 500` in 100µs units). All implemented:
+
+### Typed change enum [DONE]
+`object_dictionary!` generates `${Name}Change` (one variant per writable
+entry, carrying the current value; arrays as `(subindex, value)`;
+variable-length as unit variants) plus an `OdChanges` impl.
+`node.next_change()` drains events typed — the application match is
+exhaustive, so a new writable field is a compile error until handled.
+
+### Address constants [DONE]
+`MyOd::LED: (u16, u8)` per entry (structural-match, usable as patterns),
+`MyOd::ARR_INDEX: u16` for arrays.
+
+### SharedNode [DONE]
+`SharedNode<OD, T, R>` (embassy feature) replaces the
+`Mutex<RefCell<Option<Node>>>` + lock/borrow/unwrap ritual with
+`NODE.init(node)` / `NODE.with(|node| ...)`.
+
+### Config from OD [DONE]
+Generated `PdoConfigSource` impl + `NodeConfig::from_od(&od, node_id)`;
+override the rest via struct update syntax. Generated `${Name}Node` type
+alias fixes the PDO count const generics. `node.tpdo_cob_id(n)` /
+`rpdo_cob_id(n)` expose resolved COB-IDs (no more `0x180 + node_id` math).
+
+### DSL: spec-exact values OR readable forms [DONE]
+- `transmission_type` accepts keywords (`event_driven`, `sync_acyclic`,
+  `sync_cyclic(N)`, `rtr_sync`, `rtr_event`, `event_driven_manufacturer`)
+  or raw CiA 301 values (reserved 241–251 rejected). Runtime
+  `TransmissionType` enum with `raw()`/`from_raw()`.
+- `inhibit_time`/`event_timer` accept raw integers in spec wire units
+  (quirks included: 100µs vs 1ms) or unit-suffixed literals `50ms`,
+  `500us`, `0.1s` (floats require a suffix; compile error if not exactly
+  representable in the wire unit). Field names are never unit-suffixed.
+
+Deferred: a `canopen-embassy` helper crate absorbing the CAN channel/pump-task
+boilerplate (written once per firmware, hardware-specific, low leverage).

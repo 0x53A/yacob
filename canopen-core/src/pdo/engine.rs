@@ -46,6 +46,78 @@ pub const fn sync_cyclic(n: u8) -> u8 {
     n
 }
 
+/// PDO transmission type (CiA 301 §7.5.2.31).
+///
+/// Typed view of the raw `u8` transmission type. Both forms are accepted
+/// everywhere: use the enum for readability, or raw values if you speak
+/// fluent CANopen (`TransmissionType::from_raw(255)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum TransmissionType {
+    /// 0 — synchronous acyclic: transmitted on the next SYNC after a trigger.
+    SyncAcyclic,
+    /// 1..=240 — synchronous cyclic: transmitted every N SYNC messages.
+    SyncCyclic(u8),
+    /// 252 — RTR-only, sampled on SYNC (TPDO only).
+    RtrSync,
+    /// 253 — RTR-only, event-driven (TPDO only).
+    RtrEvent,
+    /// 254 — event-driven, manufacturer-specific trigger.
+    EventDrivenManufacturer,
+    /// 255 — event-driven, device-profile-specific trigger.
+    EventDriven,
+}
+
+impl TransmissionType {
+    /// The raw CiA 301 wire value.
+    pub const fn raw(self) -> u8 {
+        match self {
+            Self::SyncAcyclic => SYNC_ACYCLIC,
+            Self::SyncCyclic(n) => {
+                assert!(n >= 1 && n <= 240, "SyncCyclic: n must be 1..=240");
+                n
+            }
+            Self::RtrSync => 252,
+            Self::RtrEvent => 253,
+            Self::EventDrivenManufacturer => EVENT_DRIVEN_MANUFACTURER,
+            Self::EventDriven => EVENT_DRIVEN,
+        }
+    }
+
+    /// Decode a raw CiA 301 value. Returns `None` for the reserved
+    /// range 241..=251.
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::SyncAcyclic),
+            1..=240 => Some(Self::SyncCyclic(raw)),
+            252 => Some(Self::RtrSync),
+            253 => Some(Self::RtrEvent),
+            254 => Some(Self::EventDrivenManufacturer),
+            255 => Some(Self::EventDriven),
+            _ => None,
+        }
+    }
+}
+
+impl From<TransmissionType> for u8 {
+    fn from(tt: TransmissionType) -> u8 {
+        tt.raw()
+    }
+}
+
+/// Source of PDO configuration — implemented by `object_dictionary!`-generated
+/// ODs, whose PDO declarations carry everything needed to build the configs.
+///
+/// [`crate::node::NodeConfig::from_od`] uses this to pull PDO configuration
+/// straight from the OD instead of the application repeating it.
+pub trait PdoConfigSource<const TPDO: usize, const RPDO: usize> {
+    /// Build TPDO configs from current OD values. COB-IDs of 0 are resolved
+    /// to the predefined defaults (0x180 + node_id, ...) using `node_id`.
+    fn tpdo_configs(&self, node_id: crate::cobid::NodeId) -> [TpdoConfig; TPDO];
+    /// Build RPDO configs from current OD values.
+    fn rpdo_configs(&self, node_id: crate::cobid::NodeId) -> [RpdoConfig; RPDO];
+}
+
 /// Configuration for one TPDO (transmit PDO).
 #[derive(Clone, Debug)]
 pub struct TpdoConfig<const MAX_MAPPINGS: usize = 8> {

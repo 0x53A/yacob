@@ -1,6 +1,8 @@
 pub mod engine;
 
-pub use engine::{PdoMapping, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine};
+pub use engine::{
+    PdoConfigSource, PdoMapping, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine, TransmissionType,
+};
 
 /// Helper for generated code: create an empty Vec (avoids generated code importing heapless).
 pub fn heapless_vec_new<T, const N: usize>() -> heapless::Vec<T, N> {
