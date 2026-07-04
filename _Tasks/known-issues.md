@@ -2,6 +2,18 @@
 
 ## Open
 
+### Sync-type RPDOs are applied immediately instead of buffered until SYNC
+
+`RpdoEngine::process()` writes mapped values to the OD at frame reception
+regardless of transmission type. Per CiA 301, RPDOs with transmission type
+0..=240 must buffer received data and apply it on the next SYNC (coordinated
+updates). The stm32-node DSL comment describing buffer-until-SYNC is intent,
+not implementation; `on_sync()` exists only on the TPDO side.
+
+**Fix:** pending buffer per sync-type RPDO in `RpdoEngine`, applied in SYNC
+handling. Planned as part of the application-models work — see
+`application-models.md` ("SYNC-based RPDOs across the models").
+
 ### Low-level SdoClient has no transfer timeout
 
 The raw `SdoClient` state machine has no built-in timeout. This is largely mitigated by `SdoDriver` (the async high-level driver) which delegates timeout to the caller via `embassy_time::with_timeout` or similar, and `sdo_helpers` on Linux uses `block_on_with_timeout`. But embedded users calling `SdoClient` directly have no protection.
