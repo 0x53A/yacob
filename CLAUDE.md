@@ -16,11 +16,11 @@ CANopen protocol stack for embedded Rust. `no_std`, `no_alloc`, uses `embedded-c
 
 ```sh
 cargo build                  # workspace (Linux side)
-cargo test                   # 151 unit + integration tests
+cargo test                   # 161 unit + integration tests
 
 # Interop tests (python-canopen over UDP multicast, no root needed)
 cd interop-tests
-uv run pytest -v             # 26 tests
+uv run pytest -v             # 27 tests
 
 # STM32 firmware (separate project)
 cd examples/stm32-node
@@ -135,7 +135,7 @@ while let Some(hb) = demux.try_recv_heartbeat() { ... }
 |---|---|---|
 | `alloc` | off | Enables `Dcf` runtime parser, `extern crate alloc` |
 | `std` | off | Enables std error impls, implies `alloc` |
-| `embassy` | off | Enables `OdEventSignal` (embassy_sync) |
+| `embassy` | off | Enables `OdEventSignal` (embassy_sync) and a real timer for `SdoDriver` timeouts on silent buses (embassy_time) |
 | `defmt` | off | Enables defmt formatting |
 
 ## Transports

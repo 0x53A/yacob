@@ -44,13 +44,24 @@ object_dictionary! {
             [3] revision: u32 = 0x0001_0000, ro;
             [4] serial_number: u32 = 0x0000_0001, ro;
         };
+        // CiA 401-style process I/O. Perspective is the physical process,
+        // not the bus: an "input" is read from the world and published on
+        // the bus (TPDO); an "output" is commanded from the bus (RPDO)
+        // and driven into the world.
         [0x6000] inputs: record {
             [1] button: u8 = 0, ro, pdo;      // PB7 (0=released, 1=pressed)
-            [2] echo_in: u16 = 0, rw, pdo;    // written by remote, echoed to echo_out
         };
         [0x6200] outputs: record {
             [1] led: u8 = 0, rw, pdo;         // PB8 (0=off, 1=on)
-            [2] echo_out: u16 = 0, ro, pdo;   // mirrors echo_in
+        };
+
+        // Bus-loopback test object. It has no physical-world meaning, so it
+        // lives in the manufacturer-specific area (0x2000..=0x5FFF) instead
+        // of the device-profile area. Names are from the device's view:
+        // echo_in arrives from the bus, echo_out is sent back.
+        [0x2000] echo: record {
+            [1] echo_in: u16 = 0, rw, pdo;    // written by remote
+            [2] echo_out: u16 = 0, ro, pdo;   // node mirrors echo_in here
         };
 
         // TPDO1: data this node sends (0x181 for node 1)
@@ -205,16 +216,16 @@ async fn main(spawner: Spawner) {
         use embassy_stm32::rcc::*;
         config.rcc.pll = Some(Pll {
             source: PllSource::HSI,
-            prediv: PllPreDiv::DIV4,   // 16MHz / 4 = 4MHz
-            mul: PllMul::MUL85,        // 4MHz * 85 = 340MHz VCO
+            prediv: PllPreDiv::DIV4, // 16MHz / 4 = 4MHz
+            mul: PllMul::MUL85,      // 4MHz * 85 = 340MHz VCO
             divp: None,
             divq: None,
             divr: Some(PllRDiv::DIV2), // 340MHz / 2 = 170MHz
         });
         config.rcc.sys = Sysclk::PLL1_R;
-        config.rcc.ahb_pre = AHBPrescaler::DIV1;  // 170MHz
-        config.rcc.apb1_pre = APBPrescaler::DIV1;  // 170MHz
-        config.rcc.apb2_pre = APBPrescaler::DIV1;  // 170MHz
+        config.rcc.ahb_pre = AHBPrescaler::DIV1; // 170MHz
+        config.rcc.apb1_pre = APBPrescaler::DIV1; // 170MHz
+        config.rcc.apb2_pre = APBPrescaler::DIV1; // 170MHz
         config.rcc.mux.fdcansel = mux::Fdcansel::PCLK1;
     }
 
@@ -227,8 +238,10 @@ async fn main(spawner: Spawner) {
     // FDCAN1: PA11 (RX) / PA12 (TX), 500 kbit/s
     let mut can = CanConfigurator::new(p.FDCAN1, p.PA11, p.PA12, Irqs);
     can.set_bitrate(500_000);
-    can.properties()
-        .set_standard_filter(StandardFilterSlot::_0, StandardFilter::accept_all_into_fifo0());
+    can.properties().set_standard_filter(
+        StandardFilterSlot::_0,
+        StandardFilter::accept_all_into_fifo0(),
+    );
     let can = can.into_normal_mode();
     let (tx, rx, _props) = can.split();
 
@@ -245,6 +258,7 @@ async fn main(spawner: Spawner) {
             auto_start: true,
             tpdo: od.tpdo_configs(node_id),
             rpdo: od.rpdo_configs(node_id),
+            identity: canopen_core::LssIdentity::default(),
         },
         od,
     );
@@ -254,8 +268,12 @@ async fn main(spawner: Spawner) {
     // Protocol runs in the background
     spawner.must_spawn(protocol_task());
 
-    info!("node {} running — TPDO1 0x{:03X}, RPDO1 0x{:03X}",
-        node_id.raw(), 0x180u16 + node_id.raw() as u16, 0x200u16 + node_id.raw() as u16);
+    info!(
+        "node {} running — TPDO1 0x{:03X}, RPDO1 0x{:03X}",
+        node_id.raw(),
+        0x180u16 + node_id.raw() as u16,
+        0x200u16 + node_id.raw() as u16
+    );
 
     // ---------- Application logic ----------
     //
@@ -275,9 +293,13 @@ async fn main(spawner: Spawner) {
                             (0x6200, 1) => {
                                 let on = node.od().led != 0;
                                 info!("LED {}", if on { "on" } else { "off" });
-                                if on { led.set_high() } else { led.set_low() }
+                                if on {
+                                    led.set_high()
+                                } else {
+                                    led.set_low()
+                                }
                             }
-                            (0x6000, 2) => {
+                            (0x2000, 1) => {
                                 let val = node.od().echo_in;
                                 info!("echo {:#06X}", val);
                                 node.od_mut().echo_out = val;

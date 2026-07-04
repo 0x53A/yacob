@@ -253,6 +253,15 @@ impl<const N: usize> RpdoEngine<N> {
         od: &mut OD,
         events: &mut Deque<OdEvent, EVT_QUEUE>,
     ) -> bool {
+        self.process_with_drop_count(frame, od, events).0
+    }
+
+    pub fn process_with_drop_count<OD: ObjectDictionary, const EVT_QUEUE: usize>(
+        &self,
+        frame: &CanFrame,
+        od: &mut OD,
+        events: &mut Deque<OdEvent, EVT_QUEUE>,
+    ) -> (bool, u32) {
         for pdo in &self.pdos {
             if !pdo.enabled || frame.raw_id() != pdo.cob_id {
                 continue;
@@ -260,6 +269,7 @@ impl<const N: usize> RpdoEngine<N> {
 
             let data = frame.data();
             let mut bit_offset: usize = 0;
+            let mut dropped = 0u32;
 
             for mapping in &pdo.mappings {
                 let byte_offset = bit_offset / 8;
@@ -277,6 +287,7 @@ impl<const N: usize> RpdoEngine<N> {
                 {
                     if events.is_full() {
                         let _ = events.pop_front();
+                        dropped = dropped.saturating_add(1);
                     }
                     let _ = events.push_back(OdEvent {
                         index: mapping.index,
@@ -286,9 +297,9 @@ impl<const N: usize> RpdoEngine<N> {
                 }
                 bit_offset += mapping.bit_length as usize;
             }
-            return true;
+            return (true, dropped);
         }
-        false
+        (false, 0)
     }
 }
 

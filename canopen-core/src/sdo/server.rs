@@ -46,11 +46,14 @@ struct BlockDownloadState {
     subindex: u8,
     buf: [u8; 889],
     offset: usize,
-    #[allow(dead_code)] // retained for future size validation
     total_len: usize, // expected size (0 if unknown)
     blksize: u8,
-    seqno: u8, // last received sequence number
-    crc: u16,
+    seqno: u8, // last received sequence number within the current sub-block
+    /// Set after the final segment (bit 7) is acknowledged; the next frame
+    /// is expected to be the End Block Download request, not a segment.
+    awaiting_end: bool,
+    /// Client requested CRC verification in the initiate frame.
+    crc_enabled: bool,
     last_activity_us: u64,
 }
 
@@ -171,12 +174,19 @@ impl SdoServer {
         nmt_state: NmtState,
         now_us: u64,
     ) -> Result<(), ()> {
-        let cs = command_specifier(request[0]);
-
-        // During active block download, CCS=0 frames are block segments
-        if matches!(&self.transfer, Some(TransferState::BlockDownload(_))) && cs == 0 {
-            return self.handle_block_download_segment(request, response, now_us);
+        // While receiving block download sub-blocks, byte 0 carries a sequence
+        // number (1..=127, bit 7 set on the final segment), so it aliases every
+        // command specifier. Per CiA 301 the only non-segment frame in this
+        // phase is a client abort, which is exactly 0x80. Once the final
+        // segment has been acknowledged (`awaiting_end`), normal dispatch
+        // resumes so the End Block Download request (CCS=6) is routed below.
+        if let Some(TransferState::BlockDownload(state)) = &self.transfer {
+            if !state.awaiting_end && request[0] != 0x80 {
+                return self.handle_block_download_segment(request, response, now_us);
+            }
         }
+
+        let cs = command_specifier(request[0]);
 
         match cs {
             cs if cs == Ccs::InitiateUpload as u8 => {
@@ -310,12 +320,15 @@ impl SdoServer {
         let size_indicated = (request[0] & 0x01) != 0;
 
         if expedited {
-            let n = if size_indicated {
-                ((request[0] >> 2) & 0x03) as usize
+            let data_len = if size_indicated {
+                4 - (((request[0] >> 2) & 0x03) as usize)
             } else {
-                0
+                // Size not indicated: per CiA 301 the server uses the object's
+                // known length; without it, all 4 data bytes are taken.
+                od.lookup(index, subindex)
+                    .and_then(|meta| meta.data_type.size())
+                    .map_or(4, |size| size.min(4))
             };
-            let data_len = 4 - n;
             let data = &request[4..4 + data_len];
 
             if let Err(e) = od.validate_write(index, subindex, data) {
@@ -492,52 +505,60 @@ impl SdoServer {
                     offset: 0,
                     blksize,
                     seqno: 0, // waiting for "start upload" from client
-                    crc: 0xFFFF,
+                    crc: 0,
                     last_activity_us: now_us,
                 }));
 
                 Ok(())
             }
             3 => {
-                // Start block upload (client says "go") or ACK sub-block
+                // Start block upload (client says "go")
                 match &mut self.transfer {
-                    Some(TransferState::BlockUpload(state)) => {
-                        if state.seqno == 0 && state.offset == 0 {
-                            // "Start upload" — begin sending first sub-block
-                            state.seqno = 1;
-                            state.last_activity_us = now_us;
-                            Err(()) // no immediate response frame; poll_block_upload sends segments
-                        } else if state.seqno == 0 {
-                            // ACK for a sub-block
-                            let _ackseq = request[1];
-                            let new_blksize = request[2];
-                            state.blksize = new_blksize.min(MAX_BLKSIZE);
-                            state.last_activity_us = now_us;
+                    Some(TransferState::BlockUpload(state))
+                        if state.seqno == 0 && state.offset == 0 =>
+                    {
+                        // Begin sending the first sub-block
+                        state.seqno = 1;
+                        state.last_activity_us = now_us;
+                        Err(()) // no immediate response frame; poll_block_upload sends segments
+                    }
+                    _ => {
+                        *response = encode_abort(0, 0, AbortCode::InvalidCommandSpecifier);
+                        Ok(())
+                    }
+                }
+            }
+            2 => {
+                // Sub-block ACK from client (cs=2, block upload response)
+                match &mut self.transfer {
+                    Some(TransferState::BlockUpload(state)) if state.seqno == 0 => {
+                        let _ackseq = request[1];
+                        let new_blksize = request[2];
+                        state.blksize = new_blksize.min(MAX_BLKSIZE);
+                        state.last_activity_us = now_us;
 
-                            if state.offset >= state.total_len {
-                                // All data sent — send end block upload
-                                let n_unused = if state.total_len % 7 == 0 {
-                                    0
-                                } else {
-                                    7 - (state.total_len % 7)
-                                };
-                                let crc = finalize_crc16(state.crc);
-                                // SCS=6, sc=1 (end), n in bits 2-4
-                                *response = [0; 8];
-                                response[0] = (6 << 5) | 0x01 | ((n_unused as u8 & 0x07) << 2);
-                                response[1] = (crc & 0xFF) as u8;
-                                response[2] = (crc >> 8) as u8;
-                                self.transfer = None;
-                                Ok(())
+                        if state.offset >= state.total_len {
+                            // All data sent — send end block upload
+                            let n_unused = if state.total_len % 7 == 0 {
+                                0
                             } else {
-                                // More data to send — start next sub-block
-                                state.seqno = 1;
-                                Err(()) // poll_block_upload sends segments
-                            }
+                                7 - (state.total_len % 7)
+                            };
+                            let crc = state.crc;
+                            // SCS=6, sc=1 (end), n in bits 2-4
+                            *response = [0; 8];
+                            response[0] = (6 << 5) | 0x01 | ((n_unused as u8 & 0x07) << 2);
+                            response[1] = (crc & 0xFF) as u8;
+                            response[2] = (crc >> 8) as u8;
+                            self.transfer = None;
+                            Ok(())
                         } else {
-                            Err(()) // unexpected
+                            // More data to send — start next sub-block
+                            state.seqno = 1;
+                            Err(()) // poll_block_upload sends segments
                         }
                     }
+                    Some(TransferState::BlockUpload(_)) => Err(()), // mid sub-block: ignore
                     _ => {
                         *response = encode_abort(0, 0, AbortCode::InvalidCommandSpecifier);
                         Ok(())
@@ -572,7 +593,7 @@ impl SdoServer {
                 // Initiate block download
                 let (index, subindex) = parse_index_sub(request);
                 let size_indicated = (request[0] & 0x02) != 0;
-                let _crc_supported = (request[0] & 0x04) != 0;
+                let crc_enabled = (request[0] & 0x04) != 0;
 
                 if nmt_state == NmtState::Operational && is_pdo_config_index(index) {
                     *response = encode_abort(index, subindex, AbortCode::DataTransferDeviceState);
@@ -606,7 +627,8 @@ impl SdoServer {
                     total_len,
                     blksize: MAX_BLKSIZE,
                     seqno: 0,
-                    crc: 0xFFFF,
+                    awaiting_end: false,
+                    crc_enabled,
                     last_activity_us: now_us,
                 }));
 
@@ -617,19 +639,47 @@ impl SdoServer {
                 match &mut self.transfer {
                     Some(TransferState::BlockDownload(state)) => {
                         let n_unused = ((request[0] >> 2) & 0x07) as usize;
-                        let _client_crc = (request[1] as u16) | ((request[2] as u16) << 8);
+                        let client_crc = (request[1] as u16) | ((request[2] as u16) << 8);
+
+                        // The final segment always carries 7 data bytes, of
+                        // which at least one must be valid, so only 0..=6 unused
+                        // bytes are possible. Reject n=7 rather than silently
+                        // truncating a full segment of payload.
+                        if n_unused > 6 || state.offset < n_unused {
+                            let (index, subindex) = (state.index, state.subindex);
+                            self.transfer = None;
+                            *response = encode_abort(index, subindex, AbortCode::DataTransferError);
+                            return Ok(());
+                        }
 
                         // Trim unused bytes from the last segment
-                        if state.offset >= n_unused {
-                            state.offset -= n_unused;
-                        }
+                        state.offset -= n_unused;
 
                         let index = state.index;
                         let subindex = state.subindex;
                         let data_len = state.offset;
+                        let total_len = state.total_len;
+                        let crc_enabled = state.crc_enabled;
                         let mut write_buf = [0u8; 889];
                         write_buf[..data_len].copy_from_slice(&state.buf[..data_len]);
                         self.transfer = None;
+
+                        // If the initiate request declared a size, the received
+                        // data must match it (CiA 301).
+                        if total_len != 0 && data_len != total_len {
+                            *response = encode_abort(index, subindex, AbortCode::DataTransferError);
+                            return Ok(());
+                        }
+
+                        // Verify the client's CRC over the received data
+                        // (computed here rather than per-segment, since the
+                        // final segment's padding is excluded).
+                        if crc_enabled
+                            && crc16_ccitt_update(0, &write_buf[..data_len]) != client_crc
+                        {
+                            *response = encode_abort(index, subindex, AbortCode::CrcError);
+                            return Ok(());
+                        }
 
                         // SCS=5, sc=1 (end)
                         *response = [0; 8];
@@ -690,23 +740,40 @@ impl SdoServer {
 
         let seqno = request[0] & 0x7F;
         let is_last = (request[0] & 0x80) != 0;
+        let expected_seqno = state.seqno.wrapping_add(1);
+        if seqno == 0 || seqno != expected_seqno {
+            let (index, subindex) = (state.index, state.subindex);
+            self.transfer = None;
+            *response = encode_abort(index, subindex, AbortCode::InvalidSequenceNumber);
+            return Ok(());
+        }
 
-        // Copy 7 data bytes
+        // Copy 7 data bytes. A non-final segment that doesn't fit means the
+        // transfer exceeds the buffer (possible when no size was indicated).
         let space = 889 - state.offset;
+        if !is_last && space < 7 {
+            let (index, subindex) = (state.index, state.subindex);
+            self.transfer = None;
+            *response = encode_abort(index, subindex, AbortCode::OutOfMemory);
+            return Ok(());
+        }
         let copy_len = space.min(7);
         state.buf[state.offset..state.offset + copy_len].copy_from_slice(&request[1..1 + copy_len]);
-        state.crc = crc16_ccitt_update(state.crc, &request[1..1 + copy_len]);
         state.offset += copy_len;
         state.seqno = seqno;
         state.last_activity_us = now_us;
 
         if is_last || seqno >= state.blksize {
-            // End of sub-block — send ACK
-            // SCS=2 (block download response)
+            // End of sub-block — send ACK: SCS=5, ss=2 (block download response)
             *response = [0; 8];
-            response[0] = 2 << 5; // SCS=2
+            response[0] = (5 << 5) | 0x02;
             response[1] = state.seqno; // ackseq
             response[2] = state.blksize; // blksize for next sub-block
+            if is_last {
+                state.awaiting_end = true;
+            } else {
+                state.seqno = 0; // next sub-block restarts at seqno 1
+            }
             Ok(())
         } else {
             Err(()) // no response for intermediate segments
@@ -714,7 +781,8 @@ impl SdoServer {
     }
 }
 
-/// CRC-16/CCITT (polynomial 0x1021, init 0xFFFF) — used by block SDO.
+/// CRC-16/CCITT with initial value 0 (aka CRC-16/XMODEM, polynomial 0x1021)
+/// as specified by CiA 301 for block SDO transfers.
 fn crc16_ccitt_update(crc: u16, data: &[u8]) -> u16 {
     let mut crc = crc;
     for &byte in data {
@@ -727,10 +795,6 @@ fn crc16_ccitt_update(crc: u16, data: &[u8]) -> u16 {
             }
         }
     }
-    crc
-}
-
-fn finalize_crc16(crc: u16) -> u16 {
     crc
 }
 
@@ -771,6 +835,8 @@ mod tests {
         error_register: u8,
         writable_u16: u16,
         long_data: [u8; 20],
+        big_data: [u8; 400],
+        big_data_len: usize,
     }
 
     impl TestOd {
@@ -780,6 +846,8 @@ mod tests {
                 error_register: 0,
                 writable_u16: 0x1234,
                 long_data: [0xAA; 20],
+                big_data: [0; 400],
+                big_data_len: 0,
             }
         }
     }
@@ -821,6 +889,15 @@ mod tests {
             name: "long_data",
             max_size: None,
         },
+        OdEntryMeta {
+            index: 0x2002,
+            subindex: 0,
+            data_type: DataType::OctetString,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "big_data",
+            max_size: Some(400),
+        },
     ];
 
     impl ObjectDictionary for TestOd {
@@ -848,6 +925,10 @@ mod tests {
                     buf[..20].copy_from_slice(&self.long_data);
                     Ok(20)
                 }
+                (0x2002, 0) => {
+                    buf[..self.big_data_len].copy_from_slice(&self.big_data[..self.big_data_len]);
+                    Ok(self.big_data_len)
+                }
                 _ => Err(OdError::NotFound),
             }
         }
@@ -867,6 +948,14 @@ mod tests {
                         return Err(OdError::ValueTooLong);
                     }
                     self.long_data[..data.len()].copy_from_slice(data);
+                    Ok(())
+                }
+                (0x2002, 0) => {
+                    if data.len() > 400 {
+                        return Err(OdError::ValueTooLong);
+                    }
+                    self.big_data[..data.len()].copy_from_slice(data);
+                    self.big_data_len = data.len();
                     Ok(())
                 }
                 _ => Err(OdError::NotFound),
@@ -1149,5 +1238,359 @@ mod tests {
 
         // Transfer should be cleared
         assert!(server.check_timeout(10_000_000).is_none());
+    }
+
+    #[test]
+    fn block_download_rejects_out_of_sequence_segment() {
+        let mut server = SdoServer::new();
+        let mut od = TestOd::new();
+        let mut resp = [0u8; 8];
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        // Initiate block download to 0x2001:0 with a 7-byte size.
+        let init_req = [0xC2, 0x01, 0x20, 0x00, 7, 0, 0, 0];
+        server
+            .process(
+                &init_req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                0,
+            )
+            .unwrap();
+        assert_eq!(resp[0], 0xA4);
+
+        // First block segment must have seqno 1. Starting at 2 should abort.
+        let bad_segment = [0x82, 1, 2, 3, 4, 5, 6, 7];
+        server
+            .process(
+                &bad_segment,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(command_specifier(resp[0]), Scs::AbortTransfer as u8);
+        let code = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
+        assert_eq!(code, AbortCode::InvalidSequenceNumber as u32);
+        // Abort must be addressed to the active transfer, not 0x0000:00.
+        assert_eq!(u16::from_le_bytes([resp[1], resp[2]]), 0x2001);
+        assert_eq!(resp[3], 0);
+    }
+
+    #[test]
+    fn block_download_rejects_declared_size_mismatch() {
+        let mut server = SdoServer::new();
+        let mut od = TestOd::new();
+        let mut resp = [0u8; 8];
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        // Declare an 8-byte block download to 0x2001:0.
+        let init_req = [0xC2, 0x01, 0x20, 0x00, 8, 0, 0, 0];
+        server
+            .process(
+                &init_req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                0,
+            )
+            .unwrap();
+        assert_eq!(resp[0], 0xA4);
+
+        // Send only 7 bytes and mark this as the final segment.
+        let last_segment = [0x81, 1, 2, 3, 4, 5, 6, 7];
+        server
+            .process(
+                &last_segment,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                1,
+            )
+            .unwrap();
+        assert_eq!(resp[0], (5 << 5) | 0x02, "sub-block ACK");
+
+        // End block download should abort because actual length != declared length.
+        let end_req = [0xC1, 0, 0, 0, 0, 0, 0, 0];
+        server
+            .process(
+                &end_req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(command_specifier(resp[0]), Scs::AbortTransfer as u8);
+        let code = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
+        assert_eq!(code, AbortCode::DataTransferError as u32);
+    }
+
+    #[test]
+    fn block_download_rejects_invalid_unused_byte_count() {
+        let mut server = SdoServer::new();
+        let mut od = TestOd::new();
+        let mut resp = [0u8; 8];
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        // Initiate block download without size indication and without CRC,
+        // so neither existing check can catch the truncation.
+        let init_req = [0xC0, 0x01, 0x20, 0x00, 0, 0, 0, 0];
+        server
+            .process(
+                &init_req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                0,
+            )
+            .unwrap();
+        assert_eq!(resp[0], 0xA4);
+
+        // One final 7-byte segment.
+        let segment = [0x81, 1, 2, 3, 4, 5, 6, 7];
+        server
+            .process(
+                &segment,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                1,
+            )
+            .unwrap();
+        assert_eq!(resp[0], (5 << 5) | 0x02);
+
+        // n_unused=7 is invalid for block download; only 0..=6 can be valid.
+        let end_req = [0xC1 | (7 << 2), 0, 0, 0, 0, 0, 0, 0];
+        server
+            .process(
+                &end_req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(command_specifier(resp[0]), Scs::AbortTransfer as u8);
+        let code = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
+        // CiA 301 prescribes no abort code for an invalid n; this is our
+        // implementation's choice, asserted to pin it down.
+        assert_eq!(code, AbortCode::DataTransferError as u32);
+
+        // The malformed end frame must not silently truncate and write data.
+        assert_eq!(od.long_data, [0xAA; 20]);
+    }
+
+    #[test]
+    fn block_download_roundtrip_completes() {
+        let mut server = SdoServer::new();
+        let mut od = TestOd::new();
+        let mut resp = [0u8; 8];
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        // Initiate block download to 0x2001:0, 7 bytes, size indicated.
+        let init_req = [0xC2, 0x01, 0x20, 0x00, 7, 0, 0, 0];
+        server
+            .process(
+                &init_req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                0,
+            )
+            .unwrap();
+        assert_eq!(resp[0], 0xA4);
+
+        // Single final segment, seqno 1, 7 data bytes.
+        let segment = [0x81, 1, 2, 3, 4, 5, 6, 7];
+        server
+            .process(
+                &segment,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                1,
+            )
+            .unwrap();
+        assert_eq!(resp[0], (5 << 5) | 0x02, "sub-block ACK expected");
+        assert_eq!(resp[1], 1, "ackseq");
+
+        // End block download (0xC1, n=0) must be routed to the end handler,
+        // not misread as a data segment.
+        let end_req = [0xC1, 0, 0, 0, 0, 0, 0, 0];
+        server
+            .process(
+                &end_req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            resp[0],
+            (5 << 5) | 0x01,
+            "end block ACK expected, got {:#04x} (abort code {:#010x})",
+            resp[0],
+            u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]])
+        );
+        assert_eq!(&od.long_data[..7], &[1, 2, 3, 4, 5, 6, 7]);
+        // Transfer is finished.
+        assert!(server.check_timeout(10_000_000).is_none());
+    }
+
+    #[test]
+    fn block_download_with_more_than_31_segments_completes() {
+        let mut server = SdoServer::new();
+        let mut od = TestOd::new();
+        let mut resp = [0u8; 8];
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        // 40 segments * 7 bytes = 280 bytes; seqno crosses 31 (where byte 0
+        // no longer has command specifier 0) and 64/96 (aliasing other CCS
+        // values), which previously misdispatched mid-block segments.
+        let total: usize = 280;
+        let mut payload = [0u8; 280];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+
+        let init_req = [0xC2, 0x02, 0x20, 0x00, 24, 1, 0, 0]; // 280 LE
+        server
+            .process(
+                &init_req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                0,
+            )
+            .unwrap();
+        assert_eq!(resp[0], 0xA4);
+
+        for seg in 0..40u8 {
+            let seqno = seg + 1;
+            let is_last = seqno == 40;
+            let mut frame = [0u8; 8];
+            frame[0] = seqno | if is_last { 0x80 } else { 0 };
+            frame[1..8].copy_from_slice(&payload[seg as usize * 7..seg as usize * 7 + 7]);
+            let result = server.process(
+                &frame,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                seqno as u64,
+            );
+            if is_last {
+                assert_eq!(result, Ok(()), "final segment must be ACKed");
+                assert_eq!(
+                    resp[0],
+                    (5 << 5) | 0x02,
+                    "sub-block ACK, got {:#04x}",
+                    resp[0]
+                );
+                assert_eq!(resp[1], 40, "ackseq");
+            } else {
+                assert_eq!(
+                    result,
+                    Err(()),
+                    "segment {seqno} must be consumed silently, got response {:#04x}",
+                    resp[0]
+                );
+            }
+        }
+
+        let end_req = [0xC1, 0, 0, 0, 0, 0, 0, 0];
+        server
+            .process(
+                &end_req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                100,
+            )
+            .unwrap();
+        assert_eq!(resp[0], (5 << 5) | 0x01, "end block ACK");
+        assert_eq!(od.big_data_len, total);
+        assert_eq!(&od.big_data[..total], &payload[..]);
+    }
+
+    #[test]
+    fn block_download_abort_frame_cancels_transfer() {
+        let mut server = SdoServer::new();
+        let mut od = TestOd::new();
+        let mut resp = [0u8; 8];
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        let init_req = [0xC2, 0x01, 0x20, 0x00, 14, 0, 0, 0];
+        server
+            .process(
+                &init_req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                0,
+            )
+            .unwrap();
+
+        // Client abort (byte 0 == 0x80) mid-transfer: no response, state cleared.
+        let abort = [0x80, 0x01, 0x20, 0x00, 0, 0, 4, 5];
+        let result = server.process(
+            &abort,
+            &mut od,
+            &mut resp,
+            &mut events,
+            NmtState::PreOperational,
+            1,
+        );
+        assert_eq!(result, Err(()));
+        assert!(
+            server.check_timeout(10_000_000).is_none(),
+            "transfer cleared"
+        );
+    }
+
+    #[test]
+    fn expedited_download_without_size_indication_uses_object_size() {
+        let mut server = SdoServer::new();
+        let mut od = TestOd::new();
+        let mut resp = [0u8; 8];
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        // CCS=1, e=1, s=0 (0x22): expedited download, size not indicated.
+        // All 4 data bytes are present, but 0x2000:0 is a u16 — the server
+        // must clamp to the object size instead of failing the write.
+        let req = [0x22, 0x00, 0x20, 0x00, 0xEF, 0xBE, 0xAD, 0xDE];
+        server
+            .process(
+                &req,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::PreOperational,
+                0,
+            )
+            .unwrap();
+        assert_eq!(resp[0], 0x60, "download response, got {:#04x}", resp[0]);
+        assert_eq!(od.writable_u16, 0xBEEF);
     }
 }

@@ -3,14 +3,14 @@ use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 
 /// Flatten an OdDefinition into a list of (index, subindex, name, VarDef).
-struct FlatEntry {
-    index: u16,
-    subindex: u8,
-    field_name: syn::Ident,
-    var: VarDef,
+pub(crate) struct FlatEntry {
+    pub(crate) index: u16,
+    pub(crate) subindex: u8,
+    pub(crate) field_name: syn::Ident,
+    pub(crate) var: VarDef,
 }
 
-fn flatten(entries: &[OdEntry]) -> Vec<FlatEntry> {
+pub(crate) fn flatten(entries: &[OdEntry]) -> Vec<FlatEntry> {
     let mut flat = Vec::new();
     for entry in entries {
         match &entry.kind {
@@ -65,14 +65,21 @@ fn collect_arrays(entries: &[OdEntry]) -> Vec<ArrayEntry> {
 }
 
 /// Resolved PDO mapping: field name → (index, subindex, bit_length).
-struct ResolvedMapping {
+pub(crate) struct ResolvedMapping {
     index: u16,
     subindex: u8,
     bit_length: u8,
 }
 
+impl ResolvedMapping {
+    /// The CiA 301 PDO mapping entry value: index << 16 | subindex << 8 | bits.
+    pub(crate) fn raw(&self) -> u32 {
+        (self.index as u32) << 16 | (self.subindex as u32) << 8 | self.bit_length as u32
+    }
+}
+
 /// Resolve PDO field names to (index, subindex, bit_length) using the flat entry list.
-fn resolve_pdo_mappings(pdo: &PdoDef, flat: &[FlatEntry]) -> Vec<ResolvedMapping> {
+pub(crate) fn resolve_pdo_mappings(pdo: &PdoDef, flat: &[FlatEntry]) -> Vec<ResolvedMapping> {
     let pdo_label = format!(
         "{}[{}]",
         match pdo.direction {
@@ -378,7 +385,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         } else if ty_str == "bool" {
             array_write_arms.push(quote! {
                 (#index, sub @ 1..=#count) => {
-                    if data.len() < 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                    if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                     self.#fname[(sub as usize) - 1] = data[0] != 0;
                     Ok(())
                 }
@@ -386,7 +393,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         } else if size == 1 {
             array_write_arms.push(quote! {
                 (#index, sub @ 1..=#count) => {
-                    if data.len() < 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                    if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                     self.#fname[(sub as usize) - 1] = data[0] as #ty;
                     Ok(())
                 }
@@ -394,7 +401,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         } else {
             array_write_arms.push(quote! {
                 (#index, sub @ 1..=#count) => {
-                    if data.len() < #size { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                    if data.len() != #size { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                     let mut arr = [0u8; #size];
                     arr.copy_from_slice(&data[..#size]);
                     self.#fname[(sub as usize) - 1] = #ty::from_le_bytes(arr);
@@ -451,8 +458,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                 .map(|mappings| {
                     let mut vals = [0u32; 8];
                     for (i, m) in mappings.iter().enumerate() {
-                        vals[i] =
-                            (m.index as u32) << 16 | (m.subindex as u32) << 8 | m.bit_length as u32;
+                        vals[i] = m.raw();
                     }
                     let v = vals;
                     quote! { [#(#v),*] }
@@ -481,8 +487,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                 .map(|mappings| {
                     let mut vals = [0u32; 8];
                     for (i, m) in mappings.iter().enumerate() {
-                        vals[i] =
-                            (m.index as u32) << 16 | (m.subindex as u32) << 8 | m.bit_length as u32;
+                        vals[i] = m.raw();
                     }
                     let v = vals;
                     quote! { [#(#v),*] }
@@ -567,7 +572,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         });
         pdo_write_arms.push(quote! {
             (#comm_idx, 1) => {
-                if data.len() < 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                if data.len() != 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                 let mut arr = [0u8; 4];
                 arr.copy_from_slice(&data[..4]);
                 self.tpdo_cob_id[#n] = u32::from_le_bytes(arr);
@@ -581,7 +586,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             .push(quote! { (#comm_idx, 2) => { buf[0] = self.tpdo_transmission_type[#n]; Ok(1) } });
         pdo_write_arms.push(quote! {
             (#comm_idx, 2) => {
-                if data.is_empty() { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                 self.tpdo_transmission_type[#n] = data[0];
                 Ok(())
             }
@@ -598,7 +603,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         });
         pdo_write_arms.push(quote! {
             (#comm_idx, 3) => {
-                if data.len() < 2 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                if data.len() != 2 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                 let mut arr = [0u8; 2];
                 arr.copy_from_slice(&data[..2]);
                 self.tpdo_inhibit_time[#n] = u16::from_le_bytes(arr);
@@ -617,7 +622,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         });
         pdo_write_arms.push(quote! {
             (#comm_idx, 5) => {
-                if data.len() < 2 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                if data.len() != 2 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                 let mut arr = [0u8; 2];
                 arr.copy_from_slice(&data[..2]);
                 self.tpdo_event_timer[#n] = u16::from_le_bytes(arr);
@@ -636,7 +641,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             .push(quote! { (#map_idx, 0) => { buf[0] = self.tpdo_mapping_count[#n]; Ok(1) } });
         pdo_write_arms.push(quote! {
             (#map_idx, 0) => {
-                if data.is_empty() { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                 self.tpdo_mapping_count[#n] = data[0];
                 Ok(())
             }
@@ -658,7 +663,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     if self.tpdo_mapping_count[#n] != 0 {
                         return Err(canopen_core::od::OdError::ReadOnly);
                     }
-                    if data.len() < 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                    if data.len() != 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                     let mut arr = [0u8; 4];
                     arr.copy_from_slice(&data[..4]);
                     self.tpdo_mappings[#n][#arr_idx] = u32::from_le_bytes(arr);
@@ -692,7 +697,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         });
         pdo_write_arms.push(quote! {
             (#comm_idx, 1) => {
-                if data.len() < 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                if data.len() != 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                 let mut arr = [0u8; 4];
                 arr.copy_from_slice(&data[..4]);
                 self.rpdo_cob_id[#n] = u32::from_le_bytes(arr);
@@ -706,7 +711,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             .push(quote! { (#comm_idx, 2) => { buf[0] = self.rpdo_transmission_type[#n]; Ok(1) } });
         pdo_write_arms.push(quote! {
             (#comm_idx, 2) => {
-                if data.is_empty() { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                 self.rpdo_transmission_type[#n] = data[0];
                 Ok(())
             }
@@ -722,7 +727,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             .push(quote! { (#map_idx, 0) => { buf[0] = self.rpdo_mapping_count[#n]; Ok(1) } });
         pdo_write_arms.push(quote! {
             (#map_idx, 0) => {
-                if data.is_empty() { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                 self.rpdo_mapping_count[#n] = data[0];
                 Ok(())
             }
@@ -743,7 +748,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     if self.rpdo_mapping_count[#n] != 0 {
                         return Err(canopen_core::od::OdError::ReadOnly);
                     }
-                    if data.len() < 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                    if data.len() != 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                     let mut arr = [0u8; 4];
                     arr.copy_from_slice(&data[..4]);
                     self.rpdo_mappings[#n][#arr_idx] = u32::from_le_bytes(arr);
@@ -886,7 +891,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             if ty_str == "bool" {
                 quote! {
                     (#index, #subindex) => {
-                        if data.len() < 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                        if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                         self.#fname = data[0] != 0;
                         Ok(())
                     }
@@ -894,7 +899,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             } else if size == 1 {
                 quote! {
                     (#index, #subindex) => {
-                        if data.len() < 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                        if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                         self.#fname = data[0] as #ty;
                         Ok(())
                     }
@@ -902,7 +907,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             } else {
                 quote! {
                     (#index, #subindex) => {
-                        if data.len() < #size { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                        if data.len() != #size { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                         let mut arr = [0u8; #size];
                         arr.copy_from_slice(&data[..#size]);
                         self.#fname = #ty::from_le_bytes(arr);

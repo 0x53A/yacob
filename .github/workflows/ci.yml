@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --workspace --exclude hil-tests
+
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      - name: Build vcan_node example
+        run: cargo build --example vcan_node -p canopen-linux
+      - name: Run interop tests (python-canopen over UDP multicast)
+        working-directory: interop-tests
+        run: uv run pytest -v
+
+  stm32-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        example: [stm32-node, stm32-fwupdate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/${{ matrix.example }}
+      - name: Build firmware
+        run: cargo build --release
+        working-directory: examples/${{ matrix.example }}

@@ -374,6 +374,12 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
             mapping_content.parse::<Token![,]>()?;
         }
     }
+    if mappings.len() > 8 {
+        return Err(syn::Error::new(
+            mappings[8].span(),
+            "a PDO can map at most 8 objects (CiA 301)",
+        ));
+    }
 
     input.parse::<Token![;]>()?;
 

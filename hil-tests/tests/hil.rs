@@ -97,13 +97,17 @@ fn t05_sdo_write_readback() {
         sdo_download(
             transport,
             target_node(),
-            0x6200,
-            2,
+            0x2000,
+            1,
             &0xBEEFu16.to_le_bytes(),
             TIMEOUT,
         )
         .expect("SDO download failed");
-        let data = sdo_upload(transport, target_node(), 0x6200, 2, TIMEOUT).unwrap();
+        let data = sdo_upload(transport, target_node(), 0x2000, 1, TIMEOUT).unwrap();
+        assert_eq!(u16::from_le_bytes([data[0], data[1]]), 0xBEEF);
+
+        // The firmware mirrors echo_in (0x2000:1) into echo_out (0x2000:2).
+        let data = sdo_upload(transport, target_node(), 0x2000, 2, TIMEOUT).unwrap();
         assert_eq!(u16::from_le_bytes([data[0], data[1]]), 0xBEEF);
     });
 }

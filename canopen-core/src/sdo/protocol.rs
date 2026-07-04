@@ -7,6 +7,7 @@ pub enum AbortCode {
     InvalidCommandSpecifier = 0x0504_0001,
     InvalidBlockSize = 0x0504_0002,
     InvalidSequenceNumber = 0x0504_0003,
+    CrcError = 0x0504_0004,
     OutOfMemory = 0x0504_0005,
     UnsupportedAccess = 0x0601_0000,
     WriteOnlyObject = 0x0601_0001,

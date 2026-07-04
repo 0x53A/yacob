@@ -20,10 +20,6 @@ The `dsl.rs` parser rejects `const` as an access type with an error message sayi
 
 **Fix:** Either remove the variant or support `const` (which in CANopen means read-only and the value never changes — semantically the same as `ro` for our purposes).
 
-### Block SDO not yet tested via interop tests
-
-Block upload and download are implemented in the server but the interop test suite only exercises expedited and segmented transfers. python-canopen supports block transfers, so adding interop tests would be straightforward.
-
 ### LSS FastScan not implemented
 
 The LSS slave supports Switch Mode Global, Switch Mode Selective, Configure Node ID, Store Configuration, and identity inquiries. FastScan (command 0x51) is not implemented.
@@ -34,9 +30,37 @@ The LSS slave supports Switch Mode Global, Switch Mode Selective, Configure Node
 
 **Fix:** Replace `pending: Option<CanFrame>` with a small `heapless::Deque<CanFrame, 4>` and drain all pending frames in `Node::process()`.
 
-### `BlockDownloadState::total_len` is stored but never validated
+### `SdoClient` treats every abort response as fatal
 
-The server stores the expected download size from the block initiate frame but never validates that the actual received data matches it. Per CiA 301 the server should abort if the sizes don't match.
+The low-level client currently cancels the active transfer on any abort frame received on the SDO response COB-ID. In a multi-client diagnostic setup, another client's rejected request can produce an abort for a different index/subindex on the same default SDO channel.
+
+**Fix:** While a transfer is active, ignore aborts for unrelated index/subindex. Abort `0x0000:00` should remain channel-level and cancel the active transfer. An abort matching the active transfer's index/subindex should cancel.
+
+### `SdoServer` busy-channel behavior is underspecified
+
+If a second initiate request arrives while a segmented or block transfer is active on the same SDO channel, the server should reject the second request without clearing the active transfer when possible. This matters for multiple diagnostic clients sharing the default SDO channel.
+
+**Fix:** Add explicit busy-state handling for initiate upload/download/block requests during active transfers. Abort the second request using its requested index/subindex. Preserve the active transfer unless the incoming frame is a valid-looking continuation or a true channel-level error.
+
+### SDO protocol/state aborts often use `0x0000:00`
+
+Several SDO server protocol/state error paths respond with abort index/subindex `0x0000:00`. That is appropriate for some channel-level errors, but it makes multi-client diagnostic tools cancel unrelated transfers unnecessarily.
+
+**Fix:** Prefer the active transfer's index/subindex or the incoming request's index/subindex whenever known. Reserve `0x0000:00` for genuinely channel-level or unparseable errors. (2026-07-04: block download paths now use the active transfer's index/subindex; other paths still pending.)
+
+### SDO timed transfers on non-embassy wake-driven executors
+
+`SdoDriver::upload_timed`/`download_timed` check the clock deadline on every poll and, with the `embassy` feature, arm an `embassy_time::Timer` so the timeout fires on a silent bus. On a wake-driven executor *without* the `embassy` feature there is still no wakeup source for the deadline; the executor must re-poll periodically (the canopen-linux blocking helpers do).
+
+### SDO collision behavior lacks focused tests
+
+There are tests for ordinary transfers and some block sequence errors, but not for multi-client same-channel collision behavior.
+
+**Fix:** Add tests for:
+- unrelated initiate request while a transfer is busy,
+- same-register initiate request while a transfer is busy,
+- abort filtering in `SdoClient`,
+- valid-looking continuation frame collision behavior.
 
 ## Ergonomic Improvements (backlog)
 
@@ -51,6 +75,110 @@ Users must always specify every field including `identity: LssIdentity::default(
 ### PDO config requires verbose heapless Vec construction
 
 Setting up TPDO/RPDO configs requires manually creating `heapless::Vec`, calling `.push()` with `.unwrap()`. Helper methods or a small builder would improve ergonomics.
+
+### Configurable and additional SDO channels
+
+The stack only supports the predefined default SDO channel (`0x600 + node_id` / `0x580 + node_id`). Classic CANopen supports additional SDO server/client channels via communication parameter objects such as `0x1201+` and `0x1280+`.
+
+**Improvement:** Make SDO client/server COB-IDs configurable, support multiple independent `SdoServer` state machines on a node, and expose the corresponding OD communication parameter entries.
+
+### Expose SDO server busy state for diagnostics
+
+`SdoServer` does not expose whether a segmented/block transfer is active or which object it targets.
+
+**Improvement:** Add `is_busy()` and active transfer metadata accessors so applications and diagnostic tooling can avoid starting optional SDO work while a local server channel is occupied.
+
+## Fixed (2026-07-04 code review)
+
+### Block download broke at the End frame and on seqno ≥ 32
+
+The dispatch condition for routing block-download segments sniffed byte-pattern
+ranges of byte 0. The End Block Download frame (0xC1) was misrouted into the
+segment handler (aborting every block download at completion), and non-final
+segments with seqno 32..127 (whose top bits alias other command specifiers)
+fell through to normal command dispatch, corrupting the transfer.
+
+**Fixed in:** `canopen-core/src/sdo/server.rs` — `BlockDownloadState` now
+tracks an explicit `awaiting_end` phase: while receiving sub-blocks, every
+frame except an exact `0x80` client abort is a segment; after the final
+segment is acked, normal dispatch resumes so End Block Download is routed
+correctly. Covered by roundtrip and >31-segment unit tests plus the
+python-canopen interop test.
+
+### Block download sub-block ACK used the wrong command specifier
+
+The ACK was sent as `0x40` (bare `2 << 5`); CiA 301 specifies SCS=5 with
+ss=2, i.e. `0xA2`. python-canopen aborted every block download on the first
+sub-block ACK.
+
+**Fixed in:** `canopen-core/src/sdo/server.rs`.
+
+### Block upload sub-block ACK was never accepted
+
+The client's ACK arrives with sub-command 2 (`0xA2 & 3`), but the handler
+only matched sub-commands 0/1/3 (ACK handling was wrongly folded into the
+"start" branch), so every block upload died with InvalidCommandSpecifier
+after the first sub-block.
+
+**Fixed in:** `canopen-core/src/sdo/server.rs` — sub-command 2 (ACK) and 3
+(start) are now separate branches.
+
+### Block SDO CRC used the wrong init value and was never verified
+
+CRC ran with init 0xFFFF; CiA 301 (and python-canopen) use CRC-16/XMODEM with
+init 0. Block uploads failed the client's CRC check. On download the CRC also
+wrongly included last-segment padding and the client's CRC was never checked.
+
+**Fixed in:** `canopen-core/src/sdo/server.rs` — init 0 everywhere; download
+CRC is computed over the trimmed data at End Block Download and verified when
+the client negotiated CRC (aborts with new `AbortCode::CrcError`).
+
+### `BlockDownloadState::total_len` is now validated
+
+Declared size vs. received size mismatch aborts with `DataTransferError`
+per CiA 301.
+
+### Multi-sub-block downloads aborted on the second sub-block
+
+`state.seqno` was never reset after a sub-block ACK, so the next sub-block's
+first segment (seqno 1) failed sequence validation. Currently only reachable
+if `MAX_BLKSIZE` or the 889-byte buffer changes, but fixed defensively; a
+non-final segment that no longer fits the buffer now aborts with
+`OutOfMemory` instead of being silently truncated.
+
+### Expedited download without size indication rejected small objects
+
+The generated OD write arms were tightened to exact-length checks, but the
+server passed all 4 expedited data bytes when the size bit was clear, so
+writes to u8/u16/bool objects from masters that omit the size bit failed with
+DataTypeMismatch. The server now clamps to the object's size from OD metadata
+(CiA 301: server uses the object's known length). Array element write arms
+were also aligned to the same exact-length policy as scalar/record arms.
+
+**Fixed in:** `canopen-core/src/sdo/server.rs`, `canopen-derive/src/codegen.rs`.
+
+### Oversized `SdoClient::start_download` hung the async driver
+
+When the payload exceeded `BUF`, `start_download` returned a fabricated abort
+frame; `SdoDriver::download` transmitted it and waited forever for a response
+(or returned a misleading `Timeout`). `start_download` now returns
+`Result<CanFrame, ()>` and the driver surfaces `SdoError::TooLarge`
+(mirrored in canopen-linux's `SdoError`).
+
+### SDO timed transfers hung on silent bus under wake-driven executors
+
+`receive_response_timed` only checked the deadline when polled and never
+armed a wakeup, so `upload_timed`/`download_timed` hung forever on Embassy if
+the peer never answered. With the `embassy` feature (which now pulls in
+`embassy-time`), a timer is armed alongside the receive future. See the Open
+note for the non-embassy caveat.
+
+### Block SDO interop test enabled
+
+`vcan_node` gained a `[0x2001] blob: octet_string<64>` object and the
+python-canopen block download/upload roundtrip test now runs (27 interop
+tests). The PDO with >8 mappings case is now a compile error in the DSL, and
+generated EDS index lists are sorted again.
 
 ## Fixed (2026-04-04 code review)
 

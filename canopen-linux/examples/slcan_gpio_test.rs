@@ -1,4 +1,4 @@
-//! Test GPIO integration: read button/uptime, toggle LED via SDO.
+//! Test GPIO integration: read button, toggle LED, check echo loopback via SDO.
 
 use canopen_core::cobid::NodeId;
 use canopen_linux::sdo_helpers::*;
@@ -22,12 +22,6 @@ fn main() {
     let data = sdo_upload(&mut slcan, target, 0x6000, 1, timeout).expect("SDO failed");
     println!("  Button: {} (0=released, 1=pressed)\n", data[0]);
 
-    // Read uptime (0x6000:2)
-    println!("Reading uptime (0x6000:2)...");
-    let data = sdo_upload(&mut slcan, target, 0x6000, 2, timeout).expect("SDO failed");
-    let uptime = u16::from_le_bytes([data[0], data[1]]);
-    println!("  Uptime: {}s\n", uptime);
-
     // Turn LED on
     println!("Turning LED ON (0x6200:1 = 1)...");
     sdo_download(&mut slcan, target, 0x6200, 1, &[1], timeout).expect("SDO failed");
@@ -39,8 +33,12 @@ fn main() {
     sdo_download(&mut slcan, target, 0x6200, 1, &[0], timeout).expect("SDO failed");
     println!("  LED should be OFF now");
 
-    // Read uptime again
-    let data = sdo_upload(&mut slcan, target, 0x6000, 2, timeout).expect("SDO failed");
-    let uptime2 = u16::from_le_bytes([data[0], data[1]]);
-    println!("\n  Uptime: {}s (delta: {}s)", uptime2, uptime2 - uptime);
+    // Echo loopback: write echo_in (0x2000:1), node mirrors to echo_out (0x2000:2)
+    println!("\nWriting echo_in (0x2000:1) = 0x1234...");
+    sdo_download(&mut slcan, target, 0x2000, 1, &0x1234u16.to_le_bytes(), timeout)
+        .expect("SDO failed");
+    let data = sdo_upload(&mut slcan, target, 0x2000, 2, timeout).expect("SDO failed");
+    let echoed = u16::from_le_bytes([data[0], data[1]]);
+    println!("  echo_out (0x2000:2): {:#06X}", echoed);
+    assert_eq!(echoed, 0x1234, "echo mismatch");
 }

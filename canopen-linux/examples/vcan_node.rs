@@ -37,6 +37,7 @@ object_dictionary! {
             [1] input1: u8 = 0, ro, pdo;
             [2] input2: u16 = 0, ro, pdo;
         };
+        [0x2001] blob: octet_string<64>, rw;
         [0x6200] outputs: record {
             [1] output1: u8 = 0, rw, pdo;
             [2] output2: u16 = 0, rw, pdo;

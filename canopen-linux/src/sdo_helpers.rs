@@ -17,6 +17,8 @@ pub enum SdoError {
     Timeout,
     ProtocolError,
     TransportError,
+    /// Download data exceeds the SDO client's transfer buffer.
+    TooLarge,
 }
 
 impl std::fmt::Display for SdoError {
@@ -26,6 +28,7 @@ impl std::fmt::Display for SdoError {
             Self::Timeout => write!(f, "SDO timeout"),
             Self::ProtocolError => write!(f, "SDO protocol error"),
             Self::TransportError => write!(f, "CAN transport error"),
+            Self::TooLarge => write!(f, "SDO download data exceeds client buffer"),
         }
     }
 }
@@ -39,6 +42,7 @@ impl<E: core::fmt::Debug> From<AsyncSdoError<E>> for SdoError {
             AsyncSdoError::ProtocolError => Self::ProtocolError,
             AsyncSdoError::Transport(_) => Self::TransportError,
             AsyncSdoError::Timeout => Self::Timeout,
+            AsyncSdoError::TooLarge => Self::TooLarge,
         }
     }
 }

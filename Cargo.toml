@@ -8,6 +8,7 @@ members = [
 ]
 exclude = [
     "examples/stm32-node",
+    "examples/stm32-fwupdate",
 ]
 
 [workspace.package]

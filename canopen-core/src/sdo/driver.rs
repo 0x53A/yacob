@@ -41,6 +41,8 @@ pub enum SdoError<E: core::fmt::Debug> {
     Transport(E),
     /// Transfer timed out waiting for a response.
     Timeout,
+    /// Download data does not fit the client's transfer buffer.
+    TooLarge,
 }
 
 impl<E: core::fmt::Debug> core::fmt::Display for SdoError<E> {
@@ -50,6 +52,7 @@ impl<E: core::fmt::Debug> core::fmt::Display for SdoError<E> {
             Self::ProtocolError => write!(f, "SDO protocol error"),
             Self::Transport(e) => write!(f, "CAN transport error: {:?}", e),
             Self::Timeout => write!(f, "SDO timeout"),
+            Self::TooLarge => write!(f, "SDO download data exceeds client buffer"),
         }
     }
 }
@@ -122,7 +125,9 @@ impl SdoDriver {
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<(), SdoError<E>> {
         let mut client = SdoClient::<256>::new(self.target);
-        let req = client.start_download(index, subindex, data);
+        let req = client
+            .start_download(index, subindex, data)
+            .map_err(|()| SdoError::TooLarge)?;
         can.transmit(&req).await.map_err(SdoError::Transport)?;
 
         loop {
@@ -247,6 +252,10 @@ impl SdoDriver {
     /// Like [`upload`](Self::upload), but aborts with [`SdoError::Timeout`] if
     /// the transfer doesn't complete within `timeout_us` microseconds.
     ///
+    /// On a completely silent bus the timeout fires via an armed timer when
+    /// the `embassy` feature is enabled; without it, the executor must re-poll
+    /// periodically (as the canopen-linux blocking helpers do).
+    ///
     /// ```ignore
     /// let clock = EmbassyClock;
     /// let len = sdo.upload_timed(0x1000, 0, &mut buf, &mut can, 2_000_000, &clock).await?;
@@ -290,7 +299,9 @@ impl SdoDriver {
     /// Write a value with a timeout.
     ///
     /// Like [`download`](Self::download), but aborts with [`SdoError::Timeout`] if
-    /// the transfer doesn't complete within `timeout_us` microseconds.
+    /// the transfer doesn't complete within `timeout_us` microseconds. See
+    /// [`upload_timed`](Self::upload_timed) for the silent-bus timeout
+    /// requirements.
     pub async fn download_timed<E: core::fmt::Debug>(
         &self,
         index: u16,
@@ -302,7 +313,9 @@ impl SdoDriver {
     ) -> Result<(), SdoError<E>> {
         let deadline = clock.now_us().wrapping_add(timeout_us);
         let mut client = SdoClient::<256>::new(self.target);
-        let req = client.start_download(index, subindex, data);
+        let req = client
+            .start_download(index, subindex, data)
+            .map_err(|()| SdoError::TooLarge)?;
         can.transmit(&req).await.map_err(SdoError::Transport)?;
 
         loop {
@@ -336,18 +349,47 @@ impl SdoDriver {
         }
     }
 
-    /// Receive with deadline check before each await.
+    /// Receive with deadline enforcement.
+    ///
+    /// The `clock` deadline is checked on every poll, which is sufficient for
+    /// executors that re-poll periodically (like the canopen-linux blocking
+    /// helpers). With the `embassy` feature an `embassy_time::Timer` is armed
+    /// as well, so the timeout also fires on wake-driven executors when the
+    /// bus is completely silent.
     async fn receive_response_timed<E: core::fmt::Debug>(
         &self,
         can: &mut impl AsyncCan<Error = E>,
         deadline: u64,
         clock: &impl Clock,
     ) -> Result<CanFrame, SdoError<E>> {
+        use core::future::Future;
+        use core::task::Poll;
+
         loop {
-            if clock.now_us() >= deadline {
+            let remaining = deadline.saturating_sub(clock.now_us());
+            if remaining == 0 {
                 return Err(SdoError::Timeout);
             }
-            let frame = can.receive().await.map_err(SdoError::Transport)?;
+            #[cfg(feature = "embassy")]
+            let mut timer = core::pin::pin!(embassy_time::Timer::after(
+                embassy_time::Duration::from_micros(remaining)
+            ));
+            let mut receive = core::pin::pin!(can.receive());
+            let frame = core::future::poll_fn(|cx| {
+                if clock.now_us() >= deadline {
+                    return Poll::Ready(Err(SdoError::Timeout));
+                }
+                if let Poll::Ready(result) = receive.as_mut().poll(cx) {
+                    return Poll::Ready(result.map_err(SdoError::Transport));
+                }
+                #[cfg(feature = "embassy")]
+                if timer.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(SdoError::Timeout));
+                }
+                Poll::Pending
+            })
+            .await?;
+
             if frame.raw_id() == self.response_cob && frame.raw_dlc() == 8 {
                 return Ok(frame);
             }
@@ -440,6 +482,28 @@ mod tests {
 
     #[derive(Debug)]
     struct MockError;
+
+    struct NeverRespondsCan;
+
+    impl AsyncCan for NeverRespondsCan {
+        type Error = MockError;
+
+        async fn transmit(&mut self, _frame: &CanFrame) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        async fn receive(&mut self) -> Result<CanFrame, MockError> {
+            core::future::pending().await
+        }
+    }
+
+    struct CellClock(core::cell::Cell<u64>);
+
+    impl Clock for CellClock {
+        fn now_us(&self) -> u64 {
+            self.0.get()
+        }
+    }
 
     impl<OD: ObjectDictionary> AsyncCan for MockAsyncCan<'_, OD> {
         type Error = MockError;
@@ -555,21 +619,24 @@ mod tests {
         }
     }
 
+    /// No-op waker for manual polling in tests.
+    fn noop_waker() -> core::task::Waker {
+        use core::task::{RawWaker, RawWakerVTable, Waker};
+
+        fn no_op(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    }
+
     // Helper to run async test in a minimal executor
     fn block_on<F: core::future::Future>(f: F) -> F::Output {
         use core::pin::pin;
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        use core::task::{Context, Poll};
 
-        fn raw_waker() -> RawWaker {
-            fn no_op(_: *const ()) {}
-            fn clone(p: *const ()) -> RawWaker {
-                RawWaker::new(p, &VTABLE)
-            }
-            const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
-            RawWaker::new(core::ptr::null(), &VTABLE)
-        }
-
-        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut f = pin!(f);
 
@@ -843,5 +910,42 @@ mod tests {
                 other => panic!("expected Timeout, got {:?}", other),
             }
         });
+    }
+
+    #[test]
+    fn timed_upload_times_out_while_receive_is_pending() {
+        use core::future::Future;
+        use core::pin::pin;
+        use core::task::{Context, Poll};
+
+        let target = NodeId::new(1).unwrap();
+        let driver = SdoDriver::new(target);
+        let mut can = NeverRespondsCan;
+        let clock = CellClock(core::cell::Cell::new(0));
+        let mut buf = [0u8; 4];
+        let mut fut = pin!(driver.upload_timed(0x1000, 0, &mut buf, &mut can, 100, &clock));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        clock.0.set(101);
+
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(SdoError::Timeout))
+        ));
+    }
+
+    #[test]
+    fn download_larger_than_client_buffer_returns_too_large() {
+        let target = NodeId::new(1).unwrap();
+        let driver = SdoDriver::new(target);
+        // Driver's internal SdoClient buffer is 256 bytes.
+        let data = [0x55u8; 257];
+
+        // Fails before any CAN interaction — NeverRespondsCan would hang otherwise.
+        let mut can = NeverRespondsCan;
+        let result = block_on(driver.download(0x2001, 0, &data, &mut can));
+        assert!(matches!(result, Err(SdoError::TooLarge)));
     }
 }

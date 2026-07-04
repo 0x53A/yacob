@@ -116,22 +116,37 @@ pub fn generate_eds(od: &OdDefinition) -> String {
     writeln!(out).unwrap();
 
     // Categorise indices
-    let mut all_indices: Vec<u16> = od.entries.iter().map(|e| e.index).collect();
-    all_indices.sort();
-    all_indices.dedup();
+    let mut user_indices: Vec<u16> = od.entries.iter().map(|e| e.index).collect();
+    user_indices.sort();
+    user_indices.dedup();
+    let mut pdo_indices = Vec::new();
+    for pdo in &od.pdos {
+        match pdo.direction {
+            PdoDirection::Tpdo => {
+                pdo_indices.push(0x1800 + (pdo.number - 1) as u16);
+                pdo_indices.push(0x1A00 + (pdo.number - 1) as u16);
+            }
+            PdoDirection::Rpdo => {
+                pdo_indices.push(0x1400 + (pdo.number - 1) as u16);
+                pdo_indices.push(0x1600 + (pdo.number - 1) as u16);
+            }
+        }
+    }
+    pdo_indices.sort();
+    pdo_indices.dedup();
 
-    let mandatory: Vec<u16> = all_indices
+    let mandatory: Vec<u16> = user_indices
         .iter()
         .copied()
         .filter(|i| *i < 0x2000)
         .collect();
-    let optional: Vec<u16> = Vec::new(); // CiA optional range not distinguished in DSL
-    let manufacturer: Vec<u16> = all_indices
+    let optional: Vec<u16> = pdo_indices;
+    let manufacturer: Vec<u16> = user_indices
         .iter()
         .copied()
         .filter(|i| *i >= 0x2000 && *i < 0x6000)
         .collect();
-    let standardised: Vec<u16> = all_indices
+    let standardised: Vec<u16> = user_indices
         .iter()
         .copied()
         .filter(|i| *i >= 0x6000)
@@ -220,6 +235,12 @@ pub fn generate_eds(od: &OdDefinition) -> String {
         }
     }
 
+    let flat_entries = crate::codegen::flatten(&od.entries);
+    for pdo in &od.pdos {
+        let mappings = crate::codegen::resolve_pdo_mappings(pdo, &flat_entries);
+        write_pdo_eds(&mut out, pdo, &mappings);
+    }
+
     out
 }
 
@@ -249,6 +270,154 @@ fn write_var_props(out: &mut String, fe: &FlatEdsEntry, obj_type: u8) {
     )
     .unwrap();
     writeln!(out, "PDOMapping={}", if fe.pdo_mappable { 1 } else { 0 }).unwrap();
+}
+
+fn write_record_header(out: &mut String, index: u16, name: &str, sub_number: u8) {
+    writeln!(out, "[{:04X}]", index).unwrap();
+    writeln!(out, "ParameterName={name}").unwrap();
+    writeln!(out, "ObjectType=0x9").unwrap();
+    writeln!(out, "SubNumber={sub_number}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn write_pdo_sub(
+    out: &mut String,
+    index: u16,
+    subindex: u8,
+    name: &str,
+    data_type: u16,
+    access: &str,
+    default_value: &str,
+) {
+    writeln!(out, "[{:04X}sub{:X}]", index, subindex).unwrap();
+    writeln!(out, "ParameterName={name}").unwrap();
+    writeln!(out, "ObjectType=0x7").unwrap();
+    writeln!(out, "DataType=0x{data_type:04X}").unwrap();
+    writeln!(out, "AccessType={access}").unwrap();
+    writeln!(out, "DefaultValue={default_value}").unwrap();
+    writeln!(out, "PDOMapping=0").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn predefined_pdo_cob_id(direction: PdoDirection, number: u8) -> String {
+    let base = match direction {
+        PdoDirection::Tpdo => 0x180 + 0x100 * (number as u16 - 1),
+        PdoDirection::Rpdo => 0x200 + 0x100 * (number as u16 - 1),
+    };
+    format!("$NODEID+0x{base:X}")
+}
+
+fn pdo_cob_id_default(pdo: &PdoDef) -> String {
+    pdo.cob_id
+        .map(|cob_id| format!("0x{cob_id:X}"))
+        .unwrap_or_else(|| predefined_pdo_cob_id(pdo.direction, pdo.number))
+}
+
+fn write_pdo_eds(out: &mut String, pdo: &PdoDef, mappings: &[crate::codegen::ResolvedMapping]) {
+    let (comm_base, map_base, prefix) = match pdo.direction {
+        PdoDirection::Tpdo => (0x1800u16, 0x1A00u16, "TPDO"),
+        PdoDirection::Rpdo => (0x1400u16, 0x1600u16, "RPDO"),
+    };
+    let comm_idx = comm_base + (pdo.number - 1) as u16;
+    let map_idx = map_base + (pdo.number - 1) as u16;
+    let is_tpdo = pdo.direction == PdoDirection::Tpdo;
+    // TPDO comm params: sub 0-3 + 5; RPDO: sub 0-2.
+    let (sub_number, highest_sub) = if is_tpdo { (5, "5") } else { (3, "2") };
+
+    write_record_header(
+        out,
+        comm_idx,
+        &format!("{prefix}{} Communication", pdo.number),
+        sub_number,
+    );
+    write_pdo_sub(
+        out,
+        comm_idx,
+        0,
+        "Number of Entries",
+        0x0005,
+        "ro",
+        highest_sub,
+    );
+    write_pdo_sub(
+        out,
+        comm_idx,
+        1,
+        "COB-ID",
+        0x0007,
+        "rw",
+        &pdo_cob_id_default(pdo),
+    );
+    write_pdo_sub(
+        out,
+        comm_idx,
+        2,
+        "Transmission Type",
+        0x0005,
+        "rw",
+        &format!("0x{:X}", pdo.transmission_type),
+    );
+    if is_tpdo {
+        write_pdo_sub(
+            out,
+            comm_idx,
+            3,
+            "Inhibit Time",
+            0x0006,
+            "rw",
+            &format!("0x{:X}", pdo.inhibit_time),
+        );
+        write_pdo_sub(
+            out,
+            comm_idx,
+            5,
+            "Event Timer",
+            0x0006,
+            "rw",
+            &format!("0x{:X}", pdo.event_timer),
+        );
+    }
+
+    write_pdo_mapping_eds(
+        out,
+        map_idx,
+        &format!("{prefix}{} Mapping", pdo.number),
+        mappings,
+    );
+}
+
+fn write_pdo_mapping_eds(
+    out: &mut String,
+    index: u16,
+    name: &str,
+    mappings: &[crate::codegen::ResolvedMapping],
+) {
+    write_record_header(out, index, name, 9);
+    write_pdo_sub(
+        out,
+        index,
+        0,
+        "Number of Mapped Objects",
+        0x0005,
+        "rw",
+        &format!("0x{:X}", mappings.len()),
+    );
+
+    for sub in 1..=8u8 {
+        let default_value = mappings
+            .get((sub - 1) as usize)
+            .map(|m| format!("0x{:08X}", m.raw()))
+            .unwrap_or_else(|| "0x00000000".to_string());
+        write_pdo_sub(
+            out,
+            index,
+            sub,
+            &format!("Mapping Entry {sub}"),
+            0x0007,
+            "rw",
+            &default_value,
+        );
+    }
 }
 
 /// Write the EDS file to the given path (relative to CARGO_MANIFEST_DIR, or absolute).

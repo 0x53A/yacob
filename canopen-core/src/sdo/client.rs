@@ -93,8 +93,15 @@ impl<const BUF: usize> SdoClient<BUF> {
         CanFrame::new(self.tx_cobid(), &data).unwrap()
     }
 
-    /// Start a download (write) transfer. Returns the initiate request frame to send.
-    pub fn start_download(&mut self, index: u16, subindex: u8, value: &[u8]) -> CanFrame {
+    /// Start a download (write) transfer. Returns the initiate request frame
+    /// to send, or `Err(())` if `value` does not fit the client's `BUF`-byte
+    /// transfer buffer (nothing is sent; the client stays idle).
+    pub fn start_download(
+        &mut self,
+        index: u16,
+        subindex: u8,
+        value: &[u8],
+    ) -> Result<CanFrame, ()> {
         if value.len() <= 4 {
             // Expedited download
             self.state = State::WaitingDownloadInitResponse { index, subindex };
@@ -107,8 +114,15 @@ impl<const BUF: usize> SdoClient<BUF> {
             data[2] = (index >> 8) as u8;
             data[3] = subindex;
             data[4..4 + value.len()].copy_from_slice(value);
-            CanFrame::new(self.tx_cobid(), &data).unwrap()
+            Ok(CanFrame::new(self.tx_cobid(), &data).unwrap())
         } else {
+            if value.len() > BUF {
+                self.state = State::Idle;
+                self.total_len = 0;
+                self.offset = 0;
+                return Err(());
+            }
+
             // Segmented download — store data in shared buffer
             self.state = State::WaitingDownloadInitResponse { index, subindex };
             self.buf[..value.len()].copy_from_slice(value);
@@ -122,7 +136,7 @@ impl<const BUF: usize> SdoClient<BUF> {
             data[2] = (index >> 8) as u8;
             data[3] = subindex;
             data[4..8].copy_from_slice(&(value.len() as u32).to_le_bytes());
-            CanFrame::new(self.tx_cobid(), &data).unwrap()
+            Ok(CanFrame::new(self.tx_cobid(), &data).unwrap())
         }
     }
 
@@ -537,7 +551,9 @@ mod tests {
             blob: [0; 20],
         };
 
-        let req = client.start_download(0x2000, 0, &0xCAFEu16.to_le_bytes());
+        let req = client
+            .start_download(0x2000, 0, &0xCAFEu16.to_le_bytes())
+            .unwrap();
         match run_transfer(&mut client, &mut server, &mut od, req) {
             SdoClientResult::DownloadComplete => {
                 assert_eq!(od.val_u16, 0xCAFE);
@@ -581,13 +597,27 @@ mod tests {
         let data: [u8; 20] = [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
         ];
-        let req = client.start_download(0x2001, 0, &data);
+        let req = client.start_download(0x2001, 0, &data).unwrap();
         match run_transfer(&mut client, &mut server, &mut od, req) {
             SdoClientResult::DownloadComplete => {
                 assert_eq!(od.blob, data);
             }
             _ => panic!("expected DownloadComplete"),
         }
+    }
+
+    #[test]
+    fn client_download_larger_than_buffer_fails_without_sending() {
+        let target = NodeId::new(1).unwrap();
+        let mut client = SdoClient::<256>::new(target);
+        let data = [0x55u8; 257];
+
+        assert!(client.start_download(0x2001, 0, &data).is_err());
+        // Client must stay idle so it can be reused.
+        let req = client
+            .start_download(0x2000, 0, &0xCAFEu16.to_le_bytes())
+            .unwrap();
+        assert_eq!(req.data()[0] >> 5, Ccs::InitiateDownload as u8);
     }
 
     #[test]

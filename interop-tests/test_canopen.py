@@ -182,6 +182,27 @@ class TestSdoExpedited:
 
 
 # ---------------------------------------------------------------------------
+# SDO — Block transfer
+# ---------------------------------------------------------------------------
+
+
+class TestSdoBlockTransfer:
+    def test_block_download_roundtrip(self, network, node):
+        """Block download via python-canopen should write a large octet string."""
+        payload = bytes(range(32))
+
+        # size must be declared: without it python-canopen cannot flag the
+        # final segment and silently truncates the transfer.
+        with node.sdo[0x2001].open(
+            "wb", buffering=7, size=len(payload), block_transfer=True
+        ) as fp:
+            fp.write(payload)
+
+        with node.sdo[0x2001].open("rb", buffering=7, block_transfer=True) as fp:
+            assert fp.read(len(payload)) == payload
+
+
+# ---------------------------------------------------------------------------
 # SDO — Identity record
 # ---------------------------------------------------------------------------
 

@@ -499,12 +499,12 @@ impl<
                 // For RPDO: we receive on RPDO COB-IDs (which are the remote's TPDO)
                 // The RPDO engine matches on COB-ID, so just feed it the frame
                 if self.nmt.state() == NmtState::Operational {
-                    let was_full = self.event_queue.is_full();
-                    self.rpdo
-                        .process(frame, &mut self.od, &mut self.event_queue);
-                    if was_full && self.event_queue.is_full() {
-                        self.event_overflow_count = self.event_overflow_count.saturating_add(1);
-                    }
+                    let (_, dropped) = self.rpdo.process_with_drop_count(
+                        frame,
+                        &mut self.od,
+                        &mut self.event_queue,
+                    );
+                    self.event_overflow_count = self.event_overflow_count.saturating_add(dropped);
                 }
             }
 
@@ -1017,6 +1017,56 @@ mod tests {
         assert_eq!(evt2.source, OdEventSource::Sdo);
 
         assert!(node.next_event().is_none());
+    }
+
+    #[test]
+    fn event_queue_drop_count_includes_drops_inside_multi_mapping_rpdo() {
+        let mut rpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        rpdo_mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        rpdo_mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 2,
+                bit_length: 8,
+            })
+            .unwrap();
+
+        let config = NodeConfig::<1, 1> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            auto_start: true,
+            tpdo: [TpdoConfig::default()],
+            rpdo: [RpdoConfig {
+                cob_id: 0x201,
+                transmission_type: 255,
+                mappings: rpdo_mappings,
+                enabled: true,
+            }],
+            identity: LssIdentity::default(),
+        };
+        let od = EventTestOd {
+            device_type: 0x191,
+            output1: 0,
+            output2: 0,
+            input1: 0,
+        };
+        let mut node: Node<EventTestOd, 1, 1, 1, 8> = Node::new(config, od);
+        let mut transport = MailboxTransport::<32, 32>::new();
+
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+
+        let rpdo_frame = CanFrame::new(0x201, &[0x11, 0x22]).unwrap();
+        transport.store_received(rpdo_frame).unwrap();
+        node.process(&mut transport, &TestClock(1000));
+
+        assert_eq!(node.events_dropped(), 1);
     }
 
     #[test]

@@ -1,4 +1,8 @@
-//! CANopen firmware-update node for Nucleo-G431KB.
+//! CANopen firmware-update bootloader for Nucleo-G431KB.
+//!
+//! This is a dedicated bootloader node — it contains no application logic beyond
+//! receiving firmware over CANopen, validating it, and resetting into the new image.
+//! A separate application firmware is expected to be uploaded via the CiA 302 protocol.
 //!
 //! Implements CiA 302 programming objects for firmware download over SDO:
 //!
@@ -21,6 +25,13 @@
 //! - `Node::request_reset()` — CANopen-layer reset on program_control=0x80
 //! - `NmtCommand::to_frame()` — build NMT frames from no_std code
 //! - `events_dropped()` — monitor event queue overflow
+//!
+//! ## Implementation status
+//!
+//! Flash erase/write operations are stubbed (CRC is computed but nothing is actually
+//! programmed). The reset command does a CANopen-layer reset rather than a hard
+//! `SCB::sys_reset()`. A production bootloader would also need boot-image selection
+//! logic (e.g. a flag in backup RAM checked on startup).
 //!
 //! ## Remaining limitations
 //!
@@ -129,7 +140,12 @@ impl FwUpdateOd {
     /// Reject firmware data writes when flash is in error state.
     /// This prevents the SDO server from accepting chunks that can't be programmed,
     /// giving the master a clean SDO abort instead of silently dropping data.
-    fn check_program_state(&self, index: u16, subindex: u8, _data: &[u8]) -> Result<(), canopen_core::od::OdError> {
+    fn check_program_state(
+        &self,
+        index: u16,
+        subindex: u8,
+        _data: &[u8],
+    ) -> Result<(), canopen_core::od::OdError> {
         // Reject writes to Program Data (0x1F50) when flash is in error state
         if index == 0x1F50 && subindex == 1 && self.flash_status == flash_status::ERROR {
             return Err(canopen_core::od::OdError::HardwareError);
@@ -161,8 +177,11 @@ impl FwProgrammer {
 
     /// Erase the update flash region.
     fn erase(&mut self) {
-        info!("Erasing flash region 0x{:08X}..0x{:08X}",
-              FW_UPDATE_BASE, FW_UPDATE_BASE + FW_UPDATE_SIZE);
+        info!(
+            "Erasing flash region 0x{:08X}..0x{:08X}",
+            FW_UPDATE_BASE,
+            FW_UPDATE_BASE + FW_UPDATE_SIZE
+        );
 
         // In real firmware: use embassy_stm32::flash::Flash to erase pages.
         // For this example we just reset state.
@@ -180,14 +199,21 @@ impl FwProgrammer {
         let addr = FW_UPDATE_BASE + self.offset;
 
         if self.offset + data.len() as u32 > FW_UPDATE_SIZE {
-            error!("Chunk at offset 0x{:X} would exceed flash region", self.offset);
+            error!(
+                "Chunk at offset 0x{:X} would exceed flash region",
+                self.offset
+            );
             return false;
         }
 
         // In real firmware:
         // flash.blocking_write(addr, data).unwrap();
-        info!("Flash write: 0x{:08X} + {} bytes (total {})",
-              addr, data.len(), self.offset + data.len() as u32);
+        info!(
+            "Flash write: 0x{:08X} + {} bytes (total {})",
+            addr,
+            data.len(),
+            self.offset + data.len() as u32
+        );
 
         self.crc_state.update(data);
         self.offset += data.len() as u32;
@@ -198,8 +224,10 @@ impl FwProgrammer {
     fn validate(&self, expected_crc: u32) -> bool {
         // Clone the digest to finalize without consuming it
         let computed = self.crc_state.clone().finalize();
-        info!("CRC check: computed=0x{:08X} expected=0x{:08X} ({} bytes)",
-              computed, expected_crc, self.offset);
+        info!(
+            "CRC check: computed=0x{:08X} expected=0x{:08X} ({} bytes)",
+            computed, expected_crc, self.offset
+        );
         computed == expected_crc
     }
 
@@ -262,8 +290,12 @@ async fn can_tx_task(mut tx: CanTx<'static>) {
         let frame = TX_CHANNEL.receive().await;
         let id = embedded_can::StandardId::new(frame.raw_id()).unwrap();
         match Frame::new_data(id, frame.data()) {
-            Ok(f) => { tx.write(&f).await; }
-            Err(_) => { warn!("Failed to create CAN frame"); }
+            Ok(f) => {
+                tx.write(&f).await;
+            }
+            Err(_) => {
+                warn!("Failed to create CAN frame");
+            }
         }
     }
 }
@@ -345,8 +377,10 @@ async fn main(spawner: Spawner) {
     // FDCAN1: PA11 (RX) / PA12 (TX), 500 kbit/s
     let mut can = CanConfigurator::new(p.FDCAN1, p.PA11, p.PA12, Irqs);
     can.set_bitrate(500_000);
-    can.properties()
-        .set_standard_filter(StandardFilterSlot::_0, StandardFilter::accept_all_into_fifo0());
+    can.properties().set_standard_filter(
+        StandardFilterSlot::_0,
+        StandardFilter::accept_all_into_fifo0(),
+    );
     let can = can.into_normal_mode();
     let (tx, rx, _props) = can.split();
 
@@ -363,6 +397,7 @@ async fn main(spawner: Spawner) {
             auto_start: true,
             tpdo: od.tpdo_configs(node_id),
             rpdo: [],
+            identity: canopen_core::LssIdentity::default(),
         },
         od,
     );
@@ -394,8 +429,7 @@ async fn main(spawner: Spawner) {
                                 // Note: check_program_state() already rejected this
                                 // write if flash was in error state, so we don't need
                                 // to re-check here.
-                                let chunk = node.od().firmware_chunk.as_slice();
-                                if chunk.is_empty() {
+                                if node.od().firmware_chunk.as_slice().is_empty() {
                                     continue;
                                 }
 
@@ -403,11 +437,16 @@ async fn main(spawner: Spawner) {
                                 node.od_mut().flash_status = flash_status::PROGRAMMING;
                                 led.set_high();
 
+                                let chunk = node.od().firmware_chunk.as_slice();
                                 if programmer.write_chunk(chunk) {
                                     info!("Chunk OK, {} bytes total", programmer.bytes_written());
                                 } else {
                                     node.od_mut().flash_status = flash_status::ERROR;
-                                    node.set_error(0x5000, canopen_core::error_register::GENERIC, &[]);
+                                    node.set_error(
+                                        0x5000,
+                                        canopen_core::error_register::GENERIC,
+                                        &[],
+                                    );
                                     error!("Flash write failed");
                                 }
                             }
@@ -429,13 +468,20 @@ async fn main(spawner: Spawner) {
                                     1 => {
                                         let expected_crc = node.od().expected_crc;
                                         if programmer.validate(expected_crc) {
-                                            info!("Firmware valid! {} bytes", programmer.bytes_written());
+                                            info!(
+                                                "Firmware valid! {} bytes",
+                                                programmer.bytes_written()
+                                            );
                                             node.od_mut().flash_status = flash_status::VALID;
                                             led.set_low();
                                         } else {
                                             error!("CRC mismatch!");
                                             node.od_mut().flash_status = flash_status::ERROR;
-                                            node.set_error(0x5000, canopen_core::error_register::GENERIC, &[]);
+                                            node.set_error(
+                                                0x5000,
+                                                canopen_core::error_register::GENERIC,
+                                                &[],
+                                            );
                                         }
                                     }
                                     // Reset — reboot into new firmware
@@ -451,8 +497,10 @@ async fn main(spawner: Spawner) {
                                             // which image to boot, then do a hard reset:
                                             // cortex_m::peripheral::SCB::sys_reset();
                                         } else {
-                                            warn!("Cannot reset — firmware not validated (status={})",
-                                                  node.od().flash_status);
+                                            warn!(
+                                                "Cannot reset — firmware not validated (status={})",
+                                                node.od().flash_status
+                                            );
                                         }
                                     }
                                     _ => {

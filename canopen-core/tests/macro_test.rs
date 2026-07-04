@@ -53,10 +53,18 @@ fn macro_od_write() {
     // Write output1
     od.write(0x6200, 1, &[0xFF]).unwrap();
     assert_eq!(od.output1, 0xFF);
+    assert_eq!(
+        od.write(0x6200, 1, &[0x12, 0x34]),
+        Err(canopen_core::od::OdError::DataTypeMismatch)
+    );
 
     // Write output2
     od.write(0x6200, 2, &0x1234u16.to_le_bytes()).unwrap();
     assert_eq!(od.output2, 0x1234);
+    assert_eq!(
+        od.write(0x6200, 2, &[0x78, 0x56, 0x34, 0x12]),
+        Err(canopen_core::od::OdError::DataTypeMismatch)
+    );
 
     // Read-only should fail
     assert!(od.write(0x1000, 0, &[0; 4]).is_err());
@@ -449,6 +457,23 @@ fn pdo_od_rpdo_configs_helper() {
     assert_eq!(configs[0].transmission_type, 255);
     assert_eq!(configs[0].mappings.len(), 2);
     assert!(configs[0].enabled);
+}
+
+#[test]
+fn pdo_od_eds_includes_pdo_registers() {
+    let eds = PdoTestOd::EDS;
+
+    assert!(eds.contains("[1800]"));
+    assert!(eds.contains("[1800sub5]"));
+    assert!(eds.contains("DefaultValue=0x3E8"));
+    assert!(eds.contains("[1A00]"));
+    assert!(eds.contains("[1A00sub1]"));
+    assert!(eds.contains("DefaultValue=0x60000108"));
+    assert!(eds.contains("[1400]"));
+    assert!(eds.contains("[1600]"));
+    assert!(eds.contains("DefaultValue=0x62000108"));
+    assert!(eds.contains("DefaultValue=$NODEID+0x180"));
+    assert!(eds.contains("DefaultValue=$NODEID+0x200"));
 }
 
 // ---- Store EDS on-device (0x1021/0x1022) ----
