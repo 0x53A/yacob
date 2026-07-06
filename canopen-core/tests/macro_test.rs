@@ -873,3 +873,31 @@ fn transmission_type_enum_round_trip() {
     );
     assert_eq!(TransmissionType::from_raw(245), None); // reserved
 }
+
+// ---- const access ----
+
+object_dictionary! {
+    pub struct ConstAccessOd {
+        [0x1000] device_type: u32 = 0x191, const;
+        [0x2000] level: u16 = 7, rw;
+    }
+}
+
+#[test]
+fn const_access_behaves_like_ro() {
+    let mut od = ConstAccessOd::new();
+
+    let meta = od.lookup(0x1000, 0).unwrap();
+    assert_eq!(meta.access, canopen_core::od::AccessType::Const);
+
+    let mut buf = [0u8; 8];
+    let len = od.read(0x1000, 0, &mut buf).unwrap();
+    assert_eq!(len, 4);
+    assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 0x191);
+
+    // Writes are rejected
+    assert!(od.write(0x1000, 0, &0u32.to_le_bytes()).is_err());
+
+    // Generated EDS declares const access
+    assert!(ConstAccessOd::EDS.contains("AccessType=const"));
+}

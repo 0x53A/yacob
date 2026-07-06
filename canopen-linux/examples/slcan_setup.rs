@@ -6,7 +6,7 @@
 //!
 //! Usage: cargo run --example slcan_setup -- /dev/ttyACM1
 
-use canopen_linux::slcan::{SlcanBitrate, SlcanTransport};
+use canopen_linux::slcan::SlcanBitrate;
 use embedded_can::nb::Can;
 use std::time::{Duration, Instant};
 
@@ -34,7 +34,8 @@ fn main() {
 
     // Now open — this will init via S6/O
     println!("Initializing SLCAN (S6, O)...");
-    let mut slcan = SlcanTransport::open(&port, SlcanBitrate::S6).expect("Failed to open SLCAN");
+    let mut slcan =
+        canopen_linux::slcan::open(&port, SlcanBitrate::S6).expect("Failed to open SLCAN");
 
     // Verify
     println!("Verifying — listening for CAN frames...");

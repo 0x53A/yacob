@@ -26,7 +26,7 @@ fn with_transport<R>(f: impl FnOnce(&mut SlcanTransport) -> R) -> R {
     if guard.is_none() {
         let port = std::env::var("SLCAN_PORT").unwrap_or_else(|_| "/dev/ttyACM1".to_string());
         *guard = Some(
-            SlcanTransport::open(&port, SlcanBitrate::S6)
+            canopen_linux::slcan::open(&port, SlcanBitrate::S6)
                 .unwrap_or_else(|e| panic!("Failed to open SLCAN on {}: {}", port, e)),
         );
     }

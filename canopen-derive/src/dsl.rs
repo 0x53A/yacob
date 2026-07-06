@@ -576,22 +576,17 @@ fn parse_var_def(input: ParseStream) -> Result<VarDef> {
         None
     };
 
-    // Parse access type
-    let access_ident: Ident = input.parse()?;
+    // Parse access type (`const` is a Rust keyword, so accept keywords too)
+    let access_ident: Ident = input.call(syn::ext::IdentExt::parse_any)?;
     let access = match access_ident.to_string().as_str() {
         "ro" => AccessKind::Ro,
         "rw" => AccessKind::Rw,
         "wo" => AccessKind::Wo,
-        "const" => {
-            return Err(syn::Error::new(
-                access_ident.span(),
-                "use `ro` for const access (use Rust const for compile-time constants)",
-            ));
-        }
+        "const" => AccessKind::Const,
         other => {
             return Err(syn::Error::new(
                 access_ident.span(),
-                format!("unknown access type `{other}`, expected ro, rw, or wo"),
+                format!("unknown access type `{other}`, expected ro, rw, wo, or const"),
             ));
         }
     };

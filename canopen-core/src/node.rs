@@ -376,8 +376,8 @@ impl<
             let _ = transport.transmit(&hb);
         }
 
-        // EMCY
-        if let Some(emcy_frame) = self.emcy.take_pending() {
+        // EMCY (drain all pending frames — burst errors queue several)
+        while let Some(emcy_frame) = self.emcy.take_pending() {
             let _ = transport.transmit(&emcy_frame);
         }
 

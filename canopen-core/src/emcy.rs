@@ -57,10 +57,14 @@ pub mod error_register {
 /// Call `set_error()` to report a new error. The frame will be sent on the
 /// next `Node::process()` call. Call `clear_error()` to clear error bits
 /// and send an "error reset" EMCY (code 0x0000).
+///
+/// Up to 4 EMCY frames can be pending at once (burst errors between two
+/// `Node::process()` calls). On overflow the oldest frame is dropped — later
+/// frames carry the accumulated error register.
 pub struct EmcyProducer {
     node_id: NodeId,
     error_register: u8,
-    pending: Option<CanFrame>,
+    pending: heapless::Deque<CanFrame, 4>,
 }
 
 impl EmcyProducer {
@@ -68,8 +72,15 @@ impl EmcyProducer {
         Self {
             node_id,
             error_register: 0,
-            pending: None,
+            pending: heapless::Deque::new(),
         }
+    }
+
+    fn queue(&mut self, frame: CanFrame) {
+        if self.pending.is_full() {
+            self.pending.pop_front();
+        }
+        let _ = self.pending.push_back(frame);
     }
 
     /// Current error register value (for OD 0x1001 reads).
@@ -81,7 +92,7 @@ impl EmcyProducer {
     /// queues an EMCY frame with the given error code and optional vendor data.
     pub fn set_error(&mut self, error_code: u16, register_bits: u8, vendor_data: &[u8]) {
         self.error_register |= register_bits | error_register::GENERIC;
-        self.pending = Some(build_emcy_frame(
+        self.queue(build_emcy_frame(
             self.node_id,
             error_code,
             self.error_register,
@@ -95,7 +106,7 @@ impl EmcyProducer {
         self.error_register &= !register_bits;
         if self.error_register == 0 {
             // Also clear the generic bit
-            self.pending = Some(build_emcy_frame(
+            self.queue(build_emcy_frame(
                 self.node_id,
                 EmcyErrorCode::NoError as u16,
                 0,
@@ -107,7 +118,7 @@ impl EmcyProducer {
     /// Clear all errors and send error-reset EMCY.
     pub fn clear_all(&mut self) {
         self.error_register = 0;
-        self.pending = Some(build_emcy_frame(
+        self.queue(build_emcy_frame(
             self.node_id,
             EmcyErrorCode::NoError as u16,
             0,
@@ -115,9 +126,9 @@ impl EmcyProducer {
         ));
     }
 
-    /// Take the pending EMCY frame to transmit, if any.
+    /// Take the oldest pending EMCY frame to transmit, if any.
     pub fn take_pending(&mut self) -> Option<CanFrame> {
-        self.pending.take()
+        self.pending.pop_front()
     }
 }
 
@@ -164,5 +175,50 @@ mod tests {
         assert_eq!(emcy.error_register(), 0);
         let frame = emcy.take_pending().unwrap();
         assert_eq!(frame.data()[0..2], [0x00, 0x00]); // NoError
+    }
+
+    #[test]
+    fn emcy_burst_queues_multiple_frames() {
+        let node = NodeId::new(1).unwrap();
+        let mut emcy = EmcyProducer::new(node);
+
+        emcy.set_error(0x2000, error_register::CURRENT, &[]);
+        emcy.set_error(0x3000, error_register::VOLTAGE, &[]);
+        emcy.set_error(0x4000, error_register::TEMPERATURE, &[]);
+
+        // Drained in order, each carrying the register state at queue time.
+        let f1 = emcy.take_pending().unwrap();
+        assert_eq!(f1.data()[0..2], [0x00, 0x20]);
+        let f2 = emcy.take_pending().unwrap();
+        assert_eq!(f2.data()[0..2], [0x00, 0x30]);
+        let f3 = emcy.take_pending().unwrap();
+        assert_eq!(f3.data()[0..2], [0x00, 0x40]);
+        assert_eq!(
+            f3.data()[2],
+            error_register::CURRENT
+                | error_register::VOLTAGE
+                | error_register::TEMPERATURE
+                | error_register::GENERIC
+        );
+        assert!(emcy.take_pending().is_none());
+    }
+
+    #[test]
+    fn emcy_overflow_drops_oldest() {
+        let node = NodeId::new(1).unwrap();
+        let mut emcy = EmcyProducer::new(node);
+
+        for code in [0x1000u16, 0x2000, 0x3000, 0x4000, 0x5000] {
+            emcy.set_error(code, error_register::GENERIC, &[]);
+        }
+
+        // Queue holds 4; the oldest (0x1000) was dropped.
+        let f = emcy.take_pending().unwrap();
+        assert_eq!(f.data()[0..2], [0x00, 0x20]);
+        assert!(emcy.take_pending().is_some());
+        assert!(emcy.take_pending().is_some());
+        let last = emcy.take_pending().unwrap();
+        assert_eq!(last.data()[0..2], [0x00, 0x50]);
+        assert!(emcy.take_pending().is_none());
     }
 }

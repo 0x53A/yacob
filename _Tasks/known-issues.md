@@ -20,33 +20,9 @@ The raw `SdoClient` state machine has no built-in timeout. This is largely mitig
 
 **Note:** The SDO *server* does have a 5s timeout. This issue is about the low-level *client* only. Prefer `SdoDriver` for new code.
 
-### `SlcanTransport` is unix-only but not gated
-
-The SLCAN transport uses `libc` ioctls, `/dev/tty` paths, and unix fd operations, but the module has no `#[cfg(unix)]` gate. It compiles on Linux only.
-
-**Fix:** Add `#[cfg(unix)]` to the module declaration in `lib.rs`, or gate the whole `slcan` module behind a feature flag.
-
-### `AccessKind::Const` exists but is rejected by the parser
-
-The `dsl.rs` parser rejects `const` as an access type with an error message saying to use `ro`. But the `AccessKind::Const` variant still exists.
-
-**Fix:** Either remove the variant or support `const` (which in CANopen means read-only and the value never changes — semantically the same as `ro` for our purposes).
-
 ### LSS FastScan not implemented
 
 The LSS slave supports Switch Mode Global, Switch Mode Selective, Configure Node ID, Store Configuration, and identity inquiries. FastScan (command 0x51) is not implemented.
-
-### `EmcyProducer` only queues one pending EMCY frame
-
-`EmcyProducer::set_error()` overwrites the pending frame. If called twice before the next `Node::process()`, the first EMCY is silently lost. In burst-error scenarios (e.g. multiple sensors failing simultaneously), this drops diagnostics.
-
-**Fix:** Replace `pending: Option<CanFrame>` with a small `heapless::Deque<CanFrame, 4>` and drain all pending frames in `Node::process()`.
-
-### `SdoClient` treats every abort response as fatal
-
-The low-level client currently cancels the active transfer on any abort frame received on the SDO response COB-ID. In a multi-client diagnostic setup, another client's rejected request can produce an abort for a different index/subindex on the same default SDO channel.
-
-**Fix:** While a transfer is active, ignore aborts for unrelated index/subindex. Abort `0x0000:00` should remain channel-level and cancel the active transfer. An abort matching the active transfer's index/subindex should cancel.
 
 ### `SdoServer` busy-channel behavior is underspecified
 
@@ -71,7 +47,7 @@ There are tests for ordinary transfers and some block sequence errors, but not f
 **Fix:** Add tests for:
 - unrelated initiate request while a transfer is busy,
 - same-register initiate request while a transfer is busy,
-- abort filtering in `SdoClient`,
+- ~~abort filtering in `SdoClient`~~ (done 2026-07-06, see Fixed section),
 - valid-looking continuation frame collision behavior.
 
 ## Ergonomic Improvements (backlog)
@@ -99,6 +75,51 @@ The stack only supports the predefined default SDO channel (`0x600 + node_id` / 
 `SdoServer` does not expose whether a segmented/block transfer is active or which object it targets.
 
 **Improvement:** Add `is_busy()` and active transfer metadata accessors so applications and diagnostic tooling can avoid starting optional SDO work while a local server channel is occupied.
+
+## Fixed (2026-07-06)
+
+### `SlcanTransport` is unix-only but not gated
+
+**Fixed in:** `canopen-linux/src/lib.rs` — module declaration and re-export
+are now behind `#[cfg(unix)]`.
+
+Follow-up refactor: the SLCAN protocol driver moved to
+`canopen_core::slcan::SlcanTransport<P: SerialPort>` (sans-IO, `no_std`,
+tested against an in-memory fake port). Only the unix termios/DTR backend
+(`UnixSerialPort` + the `open()`/`open_raw()` init helpers) remains in
+`canopen-linux` behind `#[cfg(unix)]`. `IoPort<T>` (core, `std` feature)
+adapts any `std::io::Read + Write` — e.g. the `serialport` crate on
+Windows (`COM1`) or macOS. The `!HUPCL` fast-reopen trick stays a
+unix-backend detail.
+
+### `AccessKind::Const` exists but was rejected by the parser
+
+The DSL now accepts `const` as an access type (parsed via `parse_any` since
+`const` is a Rust keyword). It behaves like `ro` for reads/writes; the meta
+entry carries `AccessType::Const` and the exported EDS declares
+`AccessType=const` (valid per CiA 306; the EDS importer already mapped
+`const` back to read-only).
+
+**Fixed in:** `canopen-derive/src/dsl.rs`, `canopen-derive/src/eds_export.rs`.
+
+### `EmcyProducer` only queued one pending EMCY frame
+
+`set_error()` overwrote the pending frame, dropping diagnostics in
+burst-error scenarios. Now a `heapless::Deque<CanFrame, 4>` queues frames
+(oldest dropped on overflow — later frames carry the accumulated error
+register) and `Node::process()` drains all pending frames.
+
+**Fixed in:** `canopen-core/src/emcy.rs`, `canopen-core/src/node.rs`.
+
+### `SdoClient` treated every abort response as fatal
+
+While a transfer is active, aborts whose index/subindex match neither the
+active object nor channel-level `0x0000:00` now return the new
+`SdoClientResult::IgnoredAbort` and leave the transfer running; `SdoDriver`
+keeps waiting. Covered by unit tests (unrelated abort ignored + transfer
+completes, matching abort cancels, `0x0000:00` cancels).
+
+**Fixed in:** `canopen-core/src/sdo/client.rs`, `canopen-core/src/sdo/driver.rs`.
 
 ## Fixed (2026-07-04 code review)
 

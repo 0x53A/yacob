@@ -24,7 +24,8 @@ fn type_to_eds_code(ty: &str) -> u16 {
 
 fn access_to_eds(access: AccessKind) -> &'static str {
     match access {
-        AccessKind::Ro | AccessKind::Const => "ro",
+        AccessKind::Ro => "ro",
+        AccessKind::Const => "const",
         AccessKind::Rw => "rw",
         AccessKind::Wo => "wo",
     }

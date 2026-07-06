@@ -109,6 +109,7 @@ impl SdoDriver {
                     can.transmit(&next).await.map_err(SdoError::Transport)?;
                 }
                 SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
+                SdoClientResult::IgnoredAbort => {}
                 SdoClientResult::DownloadComplete | SdoClientResult::Error => {
                     return Err(SdoError::ProtocolError)
                 }
@@ -140,6 +141,7 @@ impl SdoDriver {
                     can.transmit(&next).await.map_err(SdoError::Transport)?;
                 }
                 SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
+                SdoClientResult::IgnoredAbort => {}
                 SdoClientResult::UploadComplete { .. } | SdoClientResult::Error => {
                     return Err(SdoError::ProtocolError)
                 }
@@ -289,6 +291,7 @@ impl SdoDriver {
                     can.transmit(&next).await.map_err(SdoError::Transport)?;
                 }
                 SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
+                SdoClientResult::IgnoredAbort => {}
                 SdoClientResult::DownloadComplete | SdoClientResult::Error => {
                     return Err(SdoError::ProtocolError)
                 }
@@ -328,6 +331,7 @@ impl SdoDriver {
                     can.transmit(&next).await.map_err(SdoError::Transport)?;
                 }
                 SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
+                SdoClientResult::IgnoredAbort => {}
                 SdoClientResult::UploadComplete { .. } | SdoClientResult::Error => {
                     return Err(SdoError::ProtocolError)
                 }

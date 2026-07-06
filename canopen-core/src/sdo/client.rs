@@ -12,6 +12,10 @@ pub enum SdoClientResult {
     SendNext(CanFrame),
     /// Transfer aborted by server.
     Aborted(AbortCode),
+    /// Abort for an unrelated index/subindex while a transfer is active
+    /// (e.g. another client's rejected request on the same SDO channel).
+    /// The active transfer continues; keep waiting for the real response.
+    IgnoredAbort,
     /// Protocol error (unexpected response).
     Error,
 }
@@ -144,8 +148,32 @@ impl<const BUF: usize> SdoClient<BUF> {
     pub fn process_response(&mut self, response: &[u8; 8]) -> SdoClientResult {
         let cs = command_specifier(response[0]);
 
-        // Check for abort
+        // Check for abort. While a transfer is active, only an abort
+        // addressing the active object — or the channel-level 0x0000:00 —
+        // cancels it; aborts for unrelated objects (another client's
+        // rejected request on the same channel) are ignored.
         if cs == Scs::AbortTransfer as u8 {
+            let abort_index = u16::from_le_bytes([response[1], response[2]]);
+            let abort_sub = response[3];
+            let active = match &self.state {
+                State::Idle => None,
+                State::WaitingUploadInitResponse { index, subindex }
+                | State::WaitingDownloadInitResponse { index, subindex } => {
+                    Some((*index, *subindex))
+                }
+                State::UploadSegmented {
+                    index, subindex, ..
+                }
+                | State::DownloadSegmented {
+                    index, subindex, ..
+                } => Some((*index, *subindex)),
+            };
+            if let Some((index, subindex)) = active {
+                let channel_level = abort_index == 0 && abort_sub == 0;
+                if !channel_level && (abort_index, abort_sub) != (index, subindex) {
+                    return SdoClientResult::IgnoredAbort;
+                }
+            }
             self.state = State::Idle;
             let code = u32::from_le_bytes([response[4], response[5], response[6], response[7]]);
             // Find matching abort code
@@ -618,6 +646,69 @@ mod tests {
             .start_download(0x2000, 0, &0xCAFEu16.to_le_bytes())
             .unwrap();
         assert_eq!(req.data()[0] >> 5, Ccs::InitiateDownload as u8);
+    }
+
+    /// Build a server abort frame payload for the given object and code.
+    fn abort_payload(index: u16, subindex: u8, code: u32) -> [u8; 8] {
+        let mut data = [0u8; 8];
+        data[0] = (Scs::AbortTransfer as u8) << 5;
+        data[1] = (index & 0xFF) as u8;
+        data[2] = (index >> 8) as u8;
+        data[3] = subindex;
+        data[4..8].copy_from_slice(&code.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn client_ignores_abort_for_unrelated_object() {
+        let target = NodeId::new(1).unwrap();
+        let mut client = SdoClient::<256>::new(target);
+        let _req = client.start_upload(0x1000, 0);
+
+        // Another client's request for a different object was rejected.
+        let unrelated = abort_payload(0x2000, 3, 0x0602_0000);
+        assert!(matches!(
+            client.process_response(&unrelated),
+            SdoClientResult::IgnoredAbort
+        ));
+
+        // The active transfer still completes with the real response.
+        let mut resp = [0u8; 8];
+        resp[0] = (Scs::InitiateUploadResponse as u8) << 5 | 0x03; // expedited, size, n=0
+        resp[4..8].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        match client.process_response(&resp) {
+            SdoClientResult::UploadComplete { data_len } => assert_eq!(data_len, 4),
+            _ => panic!("expected UploadComplete"),
+        }
+    }
+
+    #[test]
+    fn client_cancels_on_abort_for_active_object() {
+        let target = NodeId::new(1).unwrap();
+        let mut client = SdoClient::<256>::new(target);
+        let _req = client.start_upload(0x1000, 0);
+
+        let matching = abort_payload(0x1000, 0, 0x0602_0000);
+        match client.process_response(&matching) {
+            SdoClientResult::Aborted(code) => assert_eq!(code, AbortCode::ObjectNotFound),
+            _ => panic!("expected Aborted"),
+        }
+    }
+
+    #[test]
+    fn client_cancels_on_channel_level_abort() {
+        let target = NodeId::new(1).unwrap();
+        let mut client = SdoClient::<256>::new(target);
+        let _req = client.start_upload(0x1000, 0);
+
+        // Abort 0x0000:00 is channel-level and cancels the active transfer.
+        let channel = abort_payload(0x0000, 0, 0x0504_0001);
+        match client.process_response(&channel) {
+            SdoClientResult::Aborted(code) => {
+                assert_eq!(code, AbortCode::InvalidCommandSpecifier)
+            }
+            _ => panic!("expected Aborted"),
+        }
     }
 
     #[test]

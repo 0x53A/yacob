@@ -3,6 +3,9 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "std")]
+extern crate std;
+
 pub use heapless;
 
 pub mod can_router;
@@ -18,6 +21,7 @@ pub mod node;
 pub mod od;
 pub mod pdo;
 pub mod sdo;
+pub mod slcan;
 pub mod sync;
 pub mod time;
 pub mod transport;

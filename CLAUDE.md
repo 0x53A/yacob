@@ -158,11 +158,18 @@ while let Some(hb) = demux.try_recv_heartbeat() { ... }
 | Transport | Crate | Needs root | Use case |
 |---|---|---|---|
 | `SocketcanTransport` | canopen-linux | Yes (vcan setup) | Linux socketcan |
-| `SlcanTransport` | canopen-linux | No | Serial SLCAN adapters |
+| `SlcanTransport<P: SerialPort>` | canopen-core | No | Serial SLCAN adapters |
 | `UdpMulticastTransport` | canopen-linux | No | Cross-process testing, CI |
 | `MailboxTransport` | canopen-core | N/A | ISR↔task bridging on MCU |
 
 All implement `embedded_can::nb::Can<Frame = CanFrame>`.
+
+The SLCAN protocol driver (`canopen_core::slcan`) is sans-IO and generic over
+the `SerialPort` byte-stream trait, so it works in `no_std` (e.g. over an MCU
+UART). Backends: `canopen_linux::slcan::UnixSerialPort` (unix-only, with
+`slcan::open(path, bitrate)` handling the CDC-ACM DTR-reset init dance) and
+`canopen_core::slcan::IoPort<T>` (`std` feature) wrapping any
+`std::io::Read + Write`, e.g. the `serialport` crate on Windows/macOS.
 
 ## HIL Test Setup
 

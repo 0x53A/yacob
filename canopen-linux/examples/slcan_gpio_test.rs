@@ -2,12 +2,12 @@
 
 use canopen_core::cobid::NodeId;
 use canopen_linux::sdo_helpers::*;
-use canopen_linux::slcan::{SlcanBitrate, SlcanTransport};
+use canopen_linux::slcan::SlcanBitrate;
 use std::time::Duration;
 
 fn main() {
     let mut slcan =
-        SlcanTransport::open("/dev/ttyACM1", SlcanBitrate::S6).expect("Failed to open SLCAN");
+        canopen_linux::slcan::open("/dev/ttyACM1", SlcanBitrate::S6).expect("Failed to open SLCAN");
 
     let target = NodeId::new(1).unwrap();
     let timeout = Duration::from_secs(3);
