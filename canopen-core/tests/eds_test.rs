@@ -172,16 +172,30 @@ fn eds_pdo_device_configs() {
     let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
 
     let tpdo_cfgs = od.tpdo_configs(node_id);
-    assert_eq!(tpdo_cfgs.len(), 1);
+    assert_eq!(tpdo_cfgs.len(), 2);
+    assert_eq!(tpdo_cfgs[0].od_number, 1);
     assert_eq!(tpdo_cfgs[0].cob_id, 0x180 + 5); // predefined default
     assert_eq!(tpdo_cfgs[0].transmission_type, 255);
     assert_eq!(tpdo_cfgs[0].inhibit_time_100us, 0x1F4);
     assert_eq!(tpdo_cfgs[0].event_timer_ms, 0x64);
     assert_eq!(tpdo_cfgs[0].mappings.len(), 1);
 
+    // TPDO7: beyond the pre-defined connection set; the EDS declares
+    // $NODEID+0x1C2, which resolves per node (0x1C2 + 5 here)
+    assert_eq!(tpdo_cfgs[1].od_number, 7);
+    assert_eq!(tpdo_cfgs[1].cob_id, 0x1C7);
+    assert_eq!(tpdo_cfgs[1].mappings.len(), 1);
+
     let rpdo_cfgs = od.rpdo_configs(node_id);
-    assert_eq!(rpdo_cfgs.len(), 1);
+    assert_eq!(rpdo_cfgs.len(), 2);
+    assert_eq!(rpdo_cfgs[0].od_number, 1);
     assert_eq!(rpdo_cfgs[0].cob_id, 0x200 + 5);
     assert_eq!(rpdo_cfgs[0].transmission_type, 255);
     assert_eq!(rpdo_cfgs[0].mappings.len(), 1);
+
+    // RPDO2 is comm-only in the EDS (no mapping section): its comm params
+    // must survive import so it can be remapped at runtime.
+    assert_eq!(rpdo_cfgs[1].od_number, 2);
+    assert_eq!(rpdo_cfgs[1].cob_id, 0x300 + 5);
+    assert_eq!(rpdo_cfgs[1].mappings.len(), 0);
 }

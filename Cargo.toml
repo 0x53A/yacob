@@ -4,7 +4,11 @@ members = [
     "canopen-core",
     "canopen-derive",
     "canopen-linux",
+    "canopen-web",
+    "canwsd-proto",
+    "examples/canopen-egui",
     "hil-tests",
+    "tools/canwsd",
 ]
 exclude = [
     "examples/stm32-node",

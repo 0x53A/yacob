@@ -6,7 +6,8 @@ CANopen protocol stack for embedded Rust. `no_std`, `no_alloc`, uses `embedded-c
 
 - `canopen-core/` — protocol implementation (NMT, SDO, PDO, heartbeat, EMCY, SYNC, LSS)
 - `canopen-derive/` — proc macros (`object_dictionary!`, `object_dictionary_from_eds!`, `sdo_client_from_eds!`, EDS export)
-- `canopen-linux/` — socketcan, SLCAN, and UDP multicast transports + SDO client helpers
+- `canopen-linux/` — socketcan, SLCAN, UDP multicast, and canwsd WebSocket transports + SDO client helpers
+- `canwsd-proto/` — shared canwsd interface definition (no_std): WS wire format, filter syntax, REST paths, JSON command types. Implemented by `tools/canwsd` (Linux server), consumed by `canopen-web`/`canopen-linux` clients and embedded servers
 - `hil-tests/` — hardware-in-the-loop test harness
 - `interop-tests/` — python-canopen interop tests over UDP multicast (no root needed)
 - `examples/stm32-node/` — Embassy firmware for Nucleo-G431KB (excluded from workspace, cross-compiled)
@@ -16,11 +17,11 @@ CANopen protocol stack for embedded Rust. `no_std`, `no_alloc`, uses `embedded-c
 
 ```sh
 cargo build                  # workspace (Linux side)
-cargo test                   # 168 unit + integration tests
+cargo test                   # unit + integration tests
 
 # Interop tests (python-canopen over UDP multicast, no root needed)
 cd interop-tests
-uv run pytest -v             # 27 tests
+uv run pytest -v
 
 # STM32 firmware (separate project)
 cd examples/stm32-node
@@ -49,7 +50,9 @@ CAN_IFACE=can0 cargo test -p hil-tests -- --test-threads=1 --ignored
 - `Node::request_reset(ResetType)` triggers a CANopen-layer reset from application code.
 - `Node::events_dropped()` tracks event queue overflow count for debugging.
 - `ObjectDictionary::validate_write()` pre-write hook called by SDO server before committing writes.
-- `CanDemux` owns a transport and routes frames to per-protocol buffers (SDO, PDO, heartbeat). `DemuxSdoPort` implements `AsyncCan` so `SdoDriver` works seamlessly while non-SDO traffic is buffered.
+- **Master application model (std)**: `bus::SharedCanBus` broadcasts every received frame to independent `Subscription`s (own bounded queue, optional publish-side `Fn(&CanFrame) -> bool` filter, per-subscription `OverflowPolicy` + overflow counter). `TxQueue` is a separate bounded non-lossy transmit queue; `run_pump` drives a `nb::Can` transport (RX → publish, TX queue → transmit) until stop or transport error — no lifecycle handling, tear down and restart on adapter loss. `SubscriptionPort` implements `AsyncCan` over `(TxQueue, Subscription)` so `SdoDriver`/EDS clients run on the bus; it is waker-backed (`recv_async`/`send_async` suspend until publish/`try_pop` wakes them — no spinning on idle, safe on tokio; multiple waiters supported, no fairness guarantee). Design + decisions: `_Tasks/master-application-model.md`.
+- `events::CanOpenEvent::decode(&CanFrame)` (no_std) — semantic decode layer (NMT/SYNC/EMCY/heartbeat/PDO/SDO); assumes the pre-defined connection set.
+- `CanDemux` owns a transport and routes frames to per-protocol buffers (SDO, PDO, heartbeat). `DemuxSdoPort` implements `AsyncCan` so `SdoDriver` works seamlessly while non-SDO traffic is buffered. **Legacy** for master-side code — superseded by the bus model; do not grow it.
 - `SdoPort` is a simpler single-consumer filter with overflow buffer.
 - SDO server supports expedited, segmented, and block transfers (upload + download) with CRC.
 - All types use static allocation (heapless).
@@ -78,6 +81,8 @@ object_dictionary! {
 }
 ```
 PDO parameters accept CiA 301 keywords (`event_driven`, `event_driven_manufacturer`, `sync_acyclic`, `sync_cyclic(N)`, `rtr_sync`, `rtr_event`) or raw spec values (`transmission_type = 255`). Time parameters accept raw integers in spec wire units (inhibit_time in 100µs, event_timer in ms) or unit-suffixed literals: `50ms`, `500us`, `0.1s` (floats need a suffix; values must be exactly representable in the wire unit).
+
+PDO numbers go up to 512 (CiA 301 limit) and may be sparse (e.g. only `tpdo[1]` and `tpdo[5]`). PDOs 1-4 get the pre-defined COB-IDs (`0x180/0x280/0x380/0x480 + node_id` for TPDO, `0x200..0x500 + node_id` for RPDO) unless overridden; PDOs 5+ have no predefined COB-ID and require an explicit one (compile error otherwise): `cob_id = 0x1B1` (fixed) or `cob_id = node_id + 0x1B0` (node-relative — resolved with the actual node ID, so multiple devices can share one OD; exported to EDS as `$NODEID+0x1B0`, and `$NODEID` expressions in imported EDS round-trip as node-relative). Comm/mapping params always live at `0x1800/0x1A00 + number - 1` (TPDO) and `0x1400/0x1600 + number - 1` (RPDO); the engine slot ↔ OD index link is the `od_number` field on `TpdoConfig`/`RpdoConfig`. `Node::new` mirrors resolved COB-IDs back into the OD, so SDO reads of sub 1 return real values (never the internal 0 = "default pending") and PDO config survives `request_reset`. EDS import (`object_dictionary_from_eds!`) scans the full 512-PDO ranges. Note: `CanOpenEvent::decode` classifies PDO frames by the pre-defined COB-ID ranges only — PDOs with custom COB-IDs outside those ranges decode as the range they land in.
 
 Generated besides the struct itself:
 - `MyOd::EDS: &'static str` (uncompressed) and `MyOd::EDS_COMPRESSED: &'static [u8]` (deflate). Auto-registers 0x1021 (Store EDS, compressed) and 0x1022 (Store Format = 1) for device self-description via SDO.

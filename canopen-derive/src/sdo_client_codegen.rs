@@ -12,27 +12,32 @@ pub fn generate(def: eds_parser::EdsDefinition) -> TokenStream {
     let vis = &od.vis;
     let name = &od.name;
 
-    // Generate typed read/write methods for each OD entry
-    let mut methods: Vec<TokenStream> = Vec::new();
+    // Generate typed read/write methods for each OD entry. Every generated
+    // method includes the OD address so callers can work directly from
+    // datasheets and duplicate EDS ParameterNames remain unambiguous.
+    let base_name = |entry: &OdEntry, sub_name: Option<&str>| -> String {
+        match sub_name {
+            // EDS record sub-entry names are already prefixed with the record
+            // name by the parser to avoid object-dictionary field collisions.
+            Some(s) => s.to_string(),
+            None => entry.name.to_string(),
+        }
+    };
 
+    let mut methods: Vec<TokenStream> = Vec::new();
     for entry in &od.entries {
         match &entry.kind {
             EntryKind::Var(var) => {
                 let ty_str = var.type_name.to_string();
-                gen_var_methods(
-                    &mut methods,
-                    entry.index,
-                    0,
-                    &entry.name.to_string(),
-                    &ty_str,
-                    var.access,
-                );
+                let base = base_name(entry, None);
+                let name = format!("i{:04x}_s00_{base}", entry.index);
+                gen_var_methods(&mut methods, entry.index, 0, &name, &ty_str, var.access);
             }
             EntryKind::Record(subs) => {
-                let record_name = entry.name.to_string();
                 for sub in subs {
                     let ty_str = sub.var.type_name.to_string();
-                    let method_name = format!("{}_{}", record_name, sub.name);
+                    let base = base_name(entry, Some(&sub.name.to_string()));
+                    let method_name = format!("i{:04x}_s{:02x}_{base}", entry.index, sub.subindex);
                     gen_var_methods(
                         &mut methods,
                         entry.index,
@@ -45,10 +50,12 @@ pub fn generate(def: eds_parser::EdsDefinition) -> TokenStream {
             }
             EntryKind::Array(arr) => {
                 let ty_str = arr.element_type.to_string();
+                let base = base_name(entry, None);
+                let name = format!("i{:04x}_{base}", entry.index);
                 gen_array_methods(
                     &mut methods,
                     entry.index,
-                    &entry.name.to_string(),
+                    &name,
                     &ty_str,
                     arr.access,
                     arr.count,
@@ -109,12 +116,14 @@ fn gen_var_methods(
     access: AccessKind,
 ) {
     let is_varlen = is_variable_length_type(ty_str);
+    let doc = format!("OD `0x{index:04X}:{subindex:02X}`");
 
     // Read method
     if !matches!(access, AccessKind::Wo) {
         if is_varlen {
             let read_name = format_ident!("read_{}", name);
             methods.push(quote! {
+                #[doc = #doc]
                 pub async fn #read_name<E: core::fmt::Debug>(
                     &self,
                     buf: &mut [u8],
@@ -127,6 +136,7 @@ fn gen_var_methods(
             let read_name = format_ident!("read_{}", name);
             let driver_fn = format_ident!("{}", driver_fn);
             methods.push(quote! {
+                #[doc = #doc]
                 pub async fn #read_name<E: core::fmt::Debug>(
                     &self,
                     can: &mut impl canopen_core::sdo::AsyncCan<Error = E>,
@@ -142,6 +152,7 @@ fn gen_var_methods(
         if is_varlen {
             let write_name = format_ident!("write_{}", name);
             methods.push(quote! {
+                #[doc = #doc]
                 pub async fn #write_name<E: core::fmt::Debug>(
                     &self,
                     data: &[u8],
@@ -154,6 +165,7 @@ fn gen_var_methods(
             let write_name = format_ident!("write_{}", name);
             let driver_fn = format_ident!("{}", driver_fn);
             methods.push(quote! {
+                #[doc = #doc]
                 pub async fn #write_name<E: core::fmt::Debug>(
                     &self,
                     val: #param_ty,
@@ -175,6 +187,7 @@ fn gen_array_methods(
     count: usize,
 ) {
     let count_u8 = count as u8;
+    let doc = format!("OD `0x{index:04X}` (array, sub 1..={count})");
 
     // Read element
     if !matches!(access, AccessKind::Wo) {
@@ -182,6 +195,7 @@ fn gen_array_methods(
             let read_name = format_ident!("read_{}", name);
             let driver_fn = format_ident!("{}", driver_fn);
             methods.push(quote! {
+                #[doc = #doc]
                 pub async fn #read_name<E: core::fmt::Debug>(
                     &self,
                     sub: u8,
@@ -200,6 +214,7 @@ fn gen_array_methods(
             let write_name = format_ident!("write_{}", name);
             let driver_fn = format_ident!("{}", driver_fn);
             methods.push(quote! {
+                #[doc = #doc]
                 pub async fn #write_name<E: core::fmt::Debug>(
                     &self,
                     sub: u8,

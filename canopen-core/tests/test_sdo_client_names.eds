@@ -1,0 +1,48 @@
+[FileInfo]
+FileName=test_sdo_client_names.eds
+FileVersion=1
+CreatedBy=canopen-rs test
+
+[DeviceInfo]
+VendorName=Test
+ProductName=SdoClientNames
+BaudRate_500=1
+SimpleBootUpSlave=1
+
+[MandatoryObjects]
+SupportedObjects=2
+1=0x1000
+2=0x1001
+
+[ManufacturerObjects]
+SupportedObjects=2
+1=0x2032
+2=0x6080
+
+[1000]
+ParameterName=Device Type
+ObjectType=0x7
+DataType=0x0007
+AccessType=ro
+DefaultValue=0x191
+
+[1001]
+ParameterName=Error Register
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=0
+
+[2032]
+ParameterName=Max motor speed
+ObjectType=0x7
+DataType=0x0007
+AccessType=rwr
+DefaultValue=0
+
+[6080]
+ParameterName=Max motor speed
+ObjectType=0x7
+DataType=0x0007
+AccessType=rww
+DefaultValue=0

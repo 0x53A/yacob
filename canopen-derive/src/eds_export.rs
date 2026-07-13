@@ -300,18 +300,21 @@ fn write_pdo_sub(
     writeln!(out).unwrap();
 }
 
-fn predefined_pdo_cob_id(direction: PdoDirection, number: u8) -> String {
+fn predefined_pdo_cob_id(direction: PdoDirection, number: u16) -> String {
+    debug_assert!(number <= 4, "PDOs >4 have no predefined COB-ID");
     let base = match direction {
-        PdoDirection::Tpdo => 0x180 + 0x100 * (number as u16 - 1),
-        PdoDirection::Rpdo => 0x200 + 0x100 * (number as u16 - 1),
+        PdoDirection::Tpdo => 0x180 + 0x100 * (number - 1),
+        PdoDirection::Rpdo => 0x200 + 0x100 * (number - 1),
     };
     format!("$NODEID+0x{base:X}")
 }
 
 fn pdo_cob_id_default(pdo: &PdoDef) -> String {
-    pdo.cob_id
-        .map(|cob_id| format!("0x{cob_id:X}"))
-        .unwrap_or_else(|| predefined_pdo_cob_id(pdo.direction, pdo.number))
+    match pdo.cob_id {
+        Some(CobIdSpec::Absolute(cob_id)) => format!("0x{cob_id:X}"),
+        Some(CobIdSpec::NodeRelative(base)) => format!("$NODEID+0x{base:X}"),
+        None => predefined_pdo_cob_id(pdo.direction, pdo.number),
+    }
 }
 
 fn write_pdo_eds(out: &mut String, pdo: &PdoDef, mappings: &[crate::codegen::ResolvedMapping]) {

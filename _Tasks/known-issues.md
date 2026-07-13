@@ -2,6 +2,37 @@
 
 ## Open
 
+### `SharedCanBus::publish` runs subscriber filters under the subscriber-list lock
+
+(2026-07-07 code review.) `publish()` holds the global subscriber-list `Mutex`
+while invoking every subscription's `FrameFilter` closure and pushing into the
+per-subscription queues. Two consequences:
+
+1. A **panicking filter** (e.g. out-of-bounds index into `frame.data()`)
+   unwinds inside the pump thread with the list mutex poisoned. `run_pump`
+   never returns `Err`, so the application's designed teardown path
+   (`PumpError` → supervisor restart) is skipped; every later bus access
+   panics on the poisoned lock in whatever thread touches it first.
+2. Subscribe/unsubscribe (frequent in the fresh-subscription-per-SDO-op
+   pattern) contends with the RX hot path for the same lock.
+
+**Fix:** snapshot the live `Arc<SubscriptionShared>`s under the lock, run
+filters and pushes on the snapshot outside it (prune on the next pass), and
+either `catch_unwind` around filters or document the panic-free contract on
+`FrameFilter`.
+
+### `TxQueue::send` blocks forever once the pump is gone
+
+(2026-07-07 code review.) If the pump thread has exited (transport error —
+the exact no-lifecycle teardown scenario the bus design prescribes) and the
+queue is full, `send()` waits on the `space` condvar forever: `try_pop` is
+never called again. `Subscription::recv` documents its equivalent hazard;
+`send` does not, and there is no non-polling escape.
+
+**Fix:** give `TxQueue` a `close()` (set by the pump on exit, `notify_all`)
+and make `send` return `Result<(), Closed>`; or at minimum add a
+`send_timeout` and a doc warning matching `recv`'s.
+
 ### Sync-type RPDOs are applied immediately instead of buffered until SYNC
 
 `RpdoEngine::process()` writes mapped values to the OD at frame reception

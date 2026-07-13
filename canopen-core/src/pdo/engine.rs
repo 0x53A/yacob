@@ -121,6 +121,10 @@ pub trait PdoConfigSource<const TPDO: usize, const RPDO: usize> {
 /// Configuration for one TPDO (transmit PDO).
 #[derive(Clone, Debug)]
 pub struct TpdoConfig<const MAX_MAPPINGS: usize = 8> {
+    /// 1-based CANopen PDO number (TPDO1 = 1). Determines the OD index of the
+    /// communication/mapping parameter records (0x1800/0x1A00 + number - 1).
+    /// 0 = derive from the engine slot (slot n is PDO n+1).
+    pub od_number: u16,
     /// COB-ID for this PDO
     pub cob_id: u16,
     /// Transmission type: 0=sync acyclic, 1-240=sync cyclic, 254/255=event-driven
@@ -138,6 +142,7 @@ pub struct TpdoConfig<const MAX_MAPPINGS: usize = 8> {
 impl<const N: usize> Default for TpdoConfig<N> {
     fn default() -> Self {
         Self {
+            od_number: 0,
             cob_id: 0,
             transmission_type: 255,
             inhibit_time_100us: 0,
@@ -151,6 +156,10 @@ impl<const N: usize> Default for TpdoConfig<N> {
 /// Configuration for one RPDO (receive PDO).
 #[derive(Clone, Debug)]
 pub struct RpdoConfig<const MAX_MAPPINGS: usize = 8> {
+    /// 1-based CANopen PDO number (RPDO1 = 1). Determines the OD index of the
+    /// communication/mapping parameter records (0x1400/0x1600 + number - 1).
+    /// 0 = derive from the engine slot (slot n is PDO n+1).
+    pub od_number: u16,
     /// COB-ID for this PDO
     pub cob_id: u16,
     /// Transmission type
@@ -164,6 +173,7 @@ pub struct RpdoConfig<const MAX_MAPPINGS: usize = 8> {
 impl<const N: usize> Default for RpdoConfig<N> {
     fn default() -> Self {
         Self {
+            od_number: 0,
             cob_id: 0,
             transmission_type: 255,
             mappings: Vec::new(),
@@ -473,6 +483,7 @@ mod tests {
             .unwrap();
 
         let config = TpdoConfig {
+            od_number: 0,
             cob_id: 0x181,
             transmission_type: 1, // every SYNC
             inhibit_time_100us: 0,
@@ -509,6 +520,7 @@ mod tests {
             .unwrap();
 
         let config = RpdoConfig {
+            od_number: 0,
             cob_id: 0x201,
             transmission_type: 255,
             mappings,
@@ -551,6 +563,7 @@ mod tests {
             .unwrap();
 
         let config = TpdoConfig {
+            od_number: 0,
             cob_id: 0x181,
             transmission_type: 255, // event-driven
             inhibit_time_100us: 0,

@@ -26,6 +26,10 @@ sdo_client_from_eds! {
     };
 }
 
+sdo_client_from_eds! {
+    pub struct NamesClient = "tests/test_sdo_client_names.eds";
+}
+
 // Mock async CAN that connects client to server
 struct MockCan {
     server: SdoServer,
@@ -109,7 +113,7 @@ fn typed_client_read_u32() {
     let mut can = MockCan::new();
 
     block_on(async {
-        let val = client.read_device_type(&mut can).await.unwrap();
+        let val = client.read_i1000_s00_device_type(&mut can).await.unwrap();
         assert_eq!(val, 0x191);
     });
 }
@@ -120,7 +124,7 @@ fn typed_client_read_u16() {
     let mut can = MockCan::new();
 
     block_on(async {
-        let val = client.read_statusword(&mut can).await.unwrap();
+        let val = client.read_i6041_s00_statusword(&mut can).await.unwrap();
         assert_eq!(val, 0x1234);
     });
 }
@@ -131,7 +135,10 @@ fn typed_client_write_u16() {
     let mut can = MockCan::new();
 
     block_on(async {
-        client.write_controlword(0xBEEF, &mut can).await.unwrap();
+        client
+            .write_i6040_s00_controlword(0xBEEF, &mut can)
+            .await
+            .unwrap();
     });
     assert_eq!(can.od.controlword, 0xBEEF);
 }
@@ -143,7 +150,10 @@ fn typed_client_read_string() {
 
     block_on(async {
         let mut buf = [0u8; 64];
-        let len = client.read_device_name(&mut buf, &mut can).await.unwrap();
+        let len = client
+            .read_i1008_s00_device_name(&mut buf, &mut can)
+            .await
+            .unwrap();
         assert_eq!(&buf[..len], b"TestDev");
     });
 }
@@ -156,14 +166,30 @@ fn typed_client_read_write_roundtrip() {
     block_on(async {
         // Write heartbeat time
         client
-            .write_producer_heartbeat_time(1000, &mut can)
+            .write_i1017_s00_producer_heartbeat_time(1000, &mut can)
             .await
             .unwrap();
 
         // Read it back
-        let val = client.read_producer_heartbeat_time(&mut can).await.unwrap();
+        let val = client
+            .read_i1017_s00_producer_heartbeat_time(&mut can)
+            .await
+            .unwrap();
         assert_eq!(val, 1000);
     });
+}
+
+#[allow(dead_code)]
+async fn generated_address_prefixed_methods_exist(client: &TestClient, can: &mut MockCan) {
+    let _ = client.read_i1003_pre_defined_error_field(1, can).await;
+}
+
+#[allow(dead_code)]
+async fn generated_duplicate_name_methods_exist(client: &NamesClient, can: &mut MockCan) {
+    let _ = client.read_i2032_s00_max_motor_speed(can).await;
+    let _ = client.write_i2032_s00_max_motor_speed(0, can).await;
+    let _ = client.read_i6080_s00_max_motor_speed(can).await;
+    let _ = client.write_i6080_s00_max_motor_speed(0, can).await;
 }
 
 #[test]

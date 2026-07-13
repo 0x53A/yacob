@@ -41,6 +41,44 @@ pub fn build_emcy_frame(
     CanFrame::new(cob.raw(), &data).unwrap()
 }
 
+/// A received EMCY message (consumer side).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmcyMessage {
+    pub node: NodeId,
+    pub error_code: u16,
+    pub error_register: u8,
+    /// Manufacturer-specific bytes (frame bytes 3..8).
+    pub vendor_data: [u8; 5],
+}
+
+impl EmcyMessage {
+    /// `true` for the "error reset / no error" message (code 0x0000).
+    pub const fn is_error_reset(&self) -> bool {
+        self.error_code == 0x0000
+    }
+
+    /// Parse a received EMCY frame. Returns `None` if the COB-ID is not an
+    /// EMCY id or the frame is shorter than the mandatory 8 bytes.
+    pub fn parse(frame: &CanFrame) -> Option<Self> {
+        let node = match CobId::new(frame.raw_id())?.parse() {
+            crate::cobid::ParsedCobId::Emergency(n) => n,
+            _ => return None,
+        };
+        let data = frame.data();
+        if data.len() < 8 {
+            return None;
+        }
+        let mut vendor_data = [0u8; 5];
+        vendor_data.copy_from_slice(&data[3..8]);
+        Some(Self {
+            node,
+            error_code: u16::from_le_bytes([data[0], data[1]]),
+            error_register: data[2],
+            vendor_data,
+        })
+    }
+}
+
 /// Error register bits (CiA 301, object 0x1001).
 pub mod error_register {
     pub const GENERIC: u8 = 1 << 0;
@@ -145,6 +183,22 @@ mod tests {
         assert_eq!(frame.data()[2], 0x01); // error register
         assert_eq!(frame.data()[3], 0xAA);
         assert_eq!(frame.data()[4], 0xBB);
+    }
+
+    #[test]
+    fn emcy_parse_roundtrip() {
+        let node = NodeId::new(0x21).unwrap();
+        let frame = build_emcy_frame(node, 0x2310, error_register::CURRENT, &[0x01, 0x02]);
+        let msg = EmcyMessage::parse(&frame).unwrap();
+        assert_eq!(msg.node, node);
+        assert_eq!(msg.error_code, 0x2310);
+        assert_eq!(msg.error_register, error_register::CURRENT);
+        assert_eq!(msg.vendor_data, [0x01, 0x02, 0x00, 0x00, 0x00]);
+        assert!(!msg.is_error_reset());
+
+        // Not an EMCY COB-ID
+        let hb = CanFrame::new(0x721, &[0x05]).unwrap();
+        assert!(EmcyMessage::parse(&hb).is_none());
     }
 
     #[test]

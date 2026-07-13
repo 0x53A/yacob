@@ -901,3 +901,186 @@ fn const_access_behaves_like_ro() {
     // Generated EDS declares const access
     assert!(ConstAccessOd::EDS.contains("AccessType=const"));
 }
+
+// ---- PDOs beyond the pre-defined connection set (numbers > 4) ----
+
+object_dictionary! {
+    pub struct ExtPdoOd {
+        [0x1000] device_type: u32 = 0x0000_0191, ro;
+        [0x6000] inputs: record {
+            [1] in1: u16 = 0, ro, pdo;
+            [2] in2: u16 = 0, ro, pdo;
+        };
+        [0x6200] outputs: record {
+            [1] out1: u16 = 0, rw, pdo;
+        };
+
+        tpdo[1](transmission_type = event_driven) {
+            in1,
+        };
+        // Sparse numbering is allowed; >4 requires an explicit COB-ID.
+        tpdo[5](cob_id = 0x1B1, transmission_type = event_driven) {
+            in2,
+        };
+        // Node-relative COB-ID: resolved as base + node_id, so multiple
+        // devices sharing this OD get distinct COB-IDs.
+        tpdo[6](cob_id = node_id + 0x1C0, transmission_type = event_driven) {
+            in1,
+        };
+        rpdo[5](cob_id = 0x231, transmission_type = event_driven) {
+            out1,
+        };
+    }
+}
+
+#[test]
+fn ext_pdo_configs_resolve_numbers_and_cob_ids() {
+    let od = ExtPdoOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+
+    let tpdo = od.tpdo_configs(node_id);
+    assert_eq!(tpdo.len(), 3);
+    assert_eq!(tpdo[0].od_number, 1);
+    assert_eq!(tpdo[0].cob_id, 0x185); // predefined default
+    assert!(tpdo[0].enabled);
+    assert_eq!(tpdo[1].od_number, 5);
+    assert_eq!(tpdo[1].cob_id, 0x1B1); // explicit absolute
+    assert!(tpdo[1].enabled);
+    assert_eq!(tpdo[2].od_number, 6);
+    assert_eq!(tpdo[2].cob_id, 0x1C5); // node-relative: 0x1C0 + node 5
+    assert!(tpdo[2].enabled);
+
+    // Node-relative COB-IDs differ per node — same OD, different device
+    let other = od.tpdo_configs(canopen_core::cobid::NodeId::new(9).unwrap());
+    assert_eq!(other[2].cob_id, 0x1C9);
+    assert_eq!(other[1].cob_id, 0x1B1); // absolute stays fixed
+
+    let rpdo = od.rpdo_configs(node_id);
+    assert_eq!(rpdo.len(), 1);
+    assert_eq!(rpdo[0].od_number, 5);
+    assert_eq!(rpdo[0].cob_id, 0x231);
+    assert!(rpdo[0].enabled);
+}
+
+#[test]
+fn ext_pdo_comm_params_at_shifted_od_index() {
+    let od = ExtPdoOd::new();
+    let mut buf = [0u8; 4];
+
+    // TPDO5 comm params live at 0x1804, mapping at 0x1A04
+    od.read(0x1804, 1, &mut buf).unwrap();
+    assert_eq!(u32::from_le_bytes(buf), 0x1B1);
+    od.read(0x1A04, 0, &mut buf[..1]).unwrap();
+    assert_eq!(buf[0], 1);
+
+    // RPDO5 comm params live at 0x1404, mapping at 0x1604
+    od.read(0x1404, 1, &mut buf).unwrap();
+    assert_eq!(u32::from_le_bytes(buf), 0x231);
+
+    // There is no TPDO2-4 / RPDO1-4, so those indices must not exist
+    assert!(od.read(0x1801, 1, &mut buf).is_err());
+    assert!(od.read(0x1400, 1, &mut buf).is_err());
+}
+
+#[test]
+fn ext_pdo_eds_contains_shifted_sections() {
+    assert!(ExtPdoOd::EDS.contains("[1804]"));
+    assert!(ExtPdoOd::EDS.contains("[1A04]"));
+    assert!(ExtPdoOd::EDS.contains("[1404]"));
+    assert!(ExtPdoOd::EDS.contains("[1604]"));
+    // Absolute COB-IDs appear verbatim; predefined defaults and
+    // node-relative ones as $NODEID expressions
+    assert!(ExtPdoOd::EDS.contains("0x1B1"));
+    assert!(ExtPdoOd::EDS.contains("$NODEID+0x180"));
+    assert!(ExtPdoOd::EDS.contains("$NODEID+0x1C0"));
+}
+
+struct FixedClock(u64);
+impl canopen_core::time::Clock for FixedClock {
+    fn now_us(&self) -> u64 {
+        self.0
+    }
+}
+
+fn drain(transport: &mut canopen_core::transport::MailboxTransport<32, 32>) -> Vec<canopen_core::transport::CanFrame> {
+    let mut out = Vec::new();
+    while let Some(f) = transport.next_to_transmit() {
+        out.push(f);
+    }
+    out
+}
+
+#[test]
+fn ext_pdo_node_resolves_and_exchanges_frames() {
+    use canopen_core::node::{Node, NodeConfig};
+    use canopen_core::transport::{CanFrame, MailboxTransport};
+
+    let od = ExtPdoOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+    let config = NodeConfig {
+        auto_start: true,
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let mut node: Node<ExtPdoOd, 3, 1> = Node::new(config, od);
+    let mut transport = MailboxTransport::<32, 32>::new();
+
+    // Node::new mirrors resolved COB-IDs into the OD: the defaulted TPDO1
+    // and node-relative TPDO6 now read back as real values instead of 0.
+    let mut buf = [0u8; 4];
+    node.od().read(0x1800, 1, &mut buf).unwrap();
+    assert_eq!(u32::from_le_bytes(buf), 0x185);
+    node.od().read(0x1804, 1, &mut buf).unwrap();
+    assert_eq!(u32::from_le_bytes(buf), 0x1B1);
+    node.od().read(0x1805, 1, &mut buf).unwrap();
+    assert_eq!(u32::from_le_bytes(buf), 0x1C5);
+
+    // Boot (heartbeat frame), then the node is Operational (auto_start)
+    node.process(&mut transport, &FixedClock(0));
+    drain(&mut transport);
+
+    // TPDO5: change in2, expect an event-driven frame on the explicit COB-ID
+    node.od_mut().in2 = 0xBEEF;
+    node.process(&mut transport, &FixedClock(1_000));
+    let frames = drain(&mut transport);
+    assert!(
+        frames.iter().any(|f| f.raw_id() == 0x1B1 && f.data() == 0xBEEFu16.to_le_bytes()),
+        "expected TPDO5 frame on 0x1B1, got {frames:?}"
+    );
+
+    // RPDO5: frame on 0x231 writes out1
+    transport
+        .store_received(CanFrame::new(0x231, &0x1234u16.to_le_bytes()).unwrap())
+        .unwrap();
+    node.process(&mut transport, &FixedClock(2_000));
+    assert_eq!(node.od().out1, 0x1234);
+}
+
+#[test]
+fn ext_pdo_survives_reset() {
+    use canopen_core::node::{Node, NodeConfig, ResetType};
+    use canopen_core::transport::MailboxTransport;
+
+    let od = ExtPdoOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+    let config = NodeConfig {
+        auto_start: true,
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let mut node: Node<ExtPdoOd, 3, 1> = Node::new(config, od);
+    let mut transport = MailboxTransport::<32, 32>::new();
+    node.process(&mut transport, &FixedClock(0));
+
+    // request_reset re-syncs PDO config from the OD; resolved COB-IDs must survive
+    node.request_reset(ResetType::Communication);
+    node.process(&mut transport, &FixedClock(1_000));
+
+    assert_eq!(node.tpdo_cob_id(0), Some(0x185));
+    assert_eq!(node.tpdo_cob_id(1), Some(0x1B1));
+    assert_eq!(node.tpdo_cob_id(2), Some(0x1C5));
+    assert_eq!(node.rpdo_cob_id(0), Some(0x231));
+    assert!(node.tpdo_engine().config(0).unwrap().enabled);
+    assert!(node.tpdo_engine().config(1).unwrap().enabled);
+    assert!(node.tpdo_engine().config(2).unwrap().enabled);
+}

@@ -42,6 +42,12 @@ object_dictionary! {
             [1] output1: u8 = 0, rw, pdo;
             [2] output2: u16 = 0, rw, pdo;
         };
+        [0x6001] inputs2: record {
+            [1] input3: u16 = 0, ro, pdo;
+        };
+        [0x6201] outputs2: record {
+            [1] output3: u16 = 0, rw, pdo;
+        };
 
         // TPDO1: send input1 + input2 on event (0x181 for node 1)
         tpdo[1](transmission_type = 255, inhibit_time = 0, event_timer = 500) {
@@ -53,6 +59,17 @@ object_dictionary! {
         rpdo[1](transmission_type = 255) {
             output1,
             output2,
+        };
+
+        // PDO 5 is beyond the pre-defined connection set: it has no default
+        // COB-ID, so one must be assigned explicitly. Node-relative keeps the
+        // OD reusable across node IDs ($NODEID+base in the EDS); this node
+        // runs as node 1, so these resolve to 0x1B1 / 0x231.
+        tpdo[5](cob_id = node_id + 0x1B0, transmission_type = 255, event_timer = 500) {
+            input3,
+        };
+        rpdo[5](cob_id = node_id + 0x230, transmission_type = 255) {
+            output3,
         };
     }
 }
@@ -79,7 +96,7 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
     let node_id = NodeId::new(1).unwrap();
     let od = DemoOd::new();
 
-    let config = NodeConfig::<1, 1> {
+    let config = NodeConfig::<2, 2> {
         node_id,
         heartbeat_interval_ms: 500,
         auto_start: false,
@@ -93,19 +110,21 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
         },
     };
 
-    let mut node: Node<DemoOd, 1, 1> = Node::new(config, od);
+    let mut node: Node<DemoOd, 2, 2> = Node::new(config, od);
     let clock = StdClock::new();
 
     loop {
         node.process(transport, &clock);
 
-        // Mirror output1 -> input1 for RPDO→TPDO echo test
+        // Mirror outputs -> inputs for RPDO→TPDO echo tests
         let out1 = node.od().output1;
         let out2 = node.od().output2;
-        if node.od().input1 != out1 || node.od().input2 != out2 {
+        let out3 = node.od().output3;
+        if node.od().input1 != out1 || node.od().input2 != out2 || node.od().input3 != out3 {
             let mut od = node.od_mut();
             od.input1 = out1;
             od.input2 = out2;
+            od.input3 = out3;
         }
 
         // EMCY test: writing 0xEE to output1 triggers an error,

@@ -48,7 +48,12 @@ impl<E: core::fmt::Debug> From<AsyncSdoError<E>> for SdoError {
 }
 
 /// Minimal block_on executor with timeout for running async SDO operations.
-fn block_on_with_timeout<F: core::future::Future>(
+///
+/// Polls the future in a 100µs sleep loop; returns `SdoError::Timeout` if it
+/// doesn't complete within `timeout`. Public so applications can drive
+/// `SdoDriver`/generated EDS clients over their own `AsyncCan` ports (e.g. a
+/// `CanDemux` sdo_port) with a hard deadline even on a silent bus.
+pub fn block_on_with_timeout<F: core::future::Future>(
     f: F,
     timeout: Duration,
 ) -> Result<F::Output, SdoError> {

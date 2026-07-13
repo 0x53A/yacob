@@ -8,12 +8,15 @@ extern crate std;
 
 pub use heapless;
 
+#[cfg(feature = "std")]
+pub mod bus;
 pub mod can_router;
 pub mod cobid;
 pub mod datatypes;
 #[cfg(feature = "alloc")]
 pub mod dcf;
 pub mod emcy;
+pub mod events;
 pub mod heartbeat;
 pub mod lss;
 pub mod nmt;
@@ -26,9 +29,12 @@ pub mod sync;
 pub mod time;
 pub mod transport;
 
+#[cfg(feature = "std")]
+pub use bus::{OverflowPolicy, SharedCanBus, Subscription, SubscriptionPort, TxQueue};
 pub use cobid::{CobId, NodeId, ParsedCobId};
 pub use datatypes::DataType;
-pub use emcy::{build_emcy_frame, error_register, EmcyErrorCode, EmcyProducer};
+pub use emcy::{build_emcy_frame, error_register, EmcyErrorCode, EmcyMessage, EmcyProducer};
+pub use events::CanOpenEvent;
 pub use lss::{LssEvent, LssIdentity, LssMode, LssSlave};
 pub use nmt::{NmtCommand, NmtHandler, NmtState, NmtTransition};
 #[cfg(feature = "embassy")]

@@ -6,12 +6,13 @@ Uses UDP multicast on loopback by default — no kernel modules, no root, works 
 
 ## What's tested
 
-- **Heartbeat** (3): reception, PreOp state, ~500ms interval
-- **NMT** (5): Start, Stop, PreOperational, Reset Node, Reset Communication
-- **SDO expedited** (8): read device type/error reg/identity, write+readback u8/u16, read-only rejection, object-not-found
-- **SDO identity record** (1): all 4 subindices of 0x1018
-- **PDO config protection** (1): write to 0x1800 rejected in Operational
-- **PDO data exchange** (2): RPDO→OD via SDO readback, RPDO→mirror→TPDO echo
+- **Heartbeat**: reception, PreOp state, ~500ms interval
+- **NMT**: Start, Stop, PreOperational, Reset Node, Reset Communication
+- **SDO expedited**: read device type/error reg/identity, write+readback u8/u16, read-only rejection, object-not-found
+- **SDO identity record**: all 4 subindices of 0x1018
+- **PDO config protection**: write to 0x1800 rejected in Operational
+- **PDO data exchange**: RPDO→OD via SDO readback, RPDO→mirror→TPDO echo
+- **Extended PDOs >4**: comm params at 0x1804/0x1404 via SDO (incl. resolved default COB-IDs), RPDO5→OD, RPDO5→mirror→TPDO5 echo on explicit COB-IDs, python-canopen PDO map parsing from EDS
 
 ## Run
 

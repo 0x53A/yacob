@@ -1,0 +1,49 @@
+[package]
+name = "canopen-egui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Generic CANopen monitor UI for SLCAN, SocketCAN, and canwsd"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["native"]
+native = ["dep:canopen-linux", "dep:embedded-can", "dep:nb", "eframe/wayland", "eframe/x11"]
+
+[dependencies]
+canopen-core = { path = "../../canopen-core", features = ["std"] }
+canwsd-proto = { path = "../../canwsd-proto", features = ["serde"] }
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow"] }
+egui_extras = "0.34"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+web-time = "1.1.0"
+log = "0.4"
+
+canopen-linux = { path = "../../canopen-linux", optional = true }
+embedded-can = { version = "0.4", optional = true }
+nb = { version = "1.1.0", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+canopen-web = { path = "../../canopen-web" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "console",
+    "CssStyleDeclaration",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "Location",
+    "ShadowRoot",
+    "ShadowRootInit",
+    "ShadowRootMode",
+    "Window",
+] }

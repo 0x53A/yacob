@@ -15,20 +15,26 @@ SupportedObjects=4
 4=0x1018
 
 [OptionalObjects]
-SupportedObjects=4
+SupportedObjects=8
 1=0x1400
-2=0x1600
-3=0x1800
-4=0x1A00
+2=0x1404
+3=0x1600
+4=0x1604
+5=0x1800
+6=0x1804
+7=0x1A00
+8=0x1A04
 
 [ManufacturerObjects]
 SupportedObjects=1
 1=0x2001
 
 [StandardizedObjects]
-SupportedObjects=2
+SupportedObjects=4
 1=0x6000
-2=0x6200
+2=0x6001
+3=0x6200
+4=0x6201
 
 [1000]
 ParameterName=device_type
@@ -159,6 +165,48 @@ PDOMapping=1
 
 [6200sub2]
 ParameterName=output2
+ObjectType=0x7
+DataType=0x0006
+AccessType=rw
+DefaultValue=0
+PDOMapping=1
+
+[6001]
+ParameterName=inputs2
+ObjectType=0x9
+SubNumber=2
+
+[6001sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=1
+PDOMapping=0
+
+[6001sub1]
+ParameterName=input3
+ObjectType=0x7
+DataType=0x0006
+AccessType=ro
+DefaultValue=0
+PDOMapping=1
+
+[6201]
+ParameterName=outputs2
+ObjectType=0x9
+SubNumber=2
+
+[6201sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=1
+PDOMapping=0
+
+[6201sub1]
+ParameterName=output3
 ObjectType=0x7
 DataType=0x0006
 AccessType=rw
@@ -386,6 +434,234 @@ DefaultValue=0x00000000
 PDOMapping=0
 
 [1600sub8]
+ParameterName=Mapping Entry 8
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1804]
+ParameterName=TPDO5 Communication
+ObjectType=0x9
+SubNumber=5
+
+[1804sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=5
+PDOMapping=0
+
+[1804sub1]
+ParameterName=COB-ID
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=$NODEID+0x1B0
+PDOMapping=0
+
+[1804sub2]
+ParameterName=Transmission Type
+ObjectType=0x7
+DataType=0x0005
+AccessType=rw
+DefaultValue=0xFF
+PDOMapping=0
+
+[1804sub3]
+ParameterName=Inhibit Time
+ObjectType=0x7
+DataType=0x0006
+AccessType=rw
+DefaultValue=0x0
+PDOMapping=0
+
+[1804sub5]
+ParameterName=Event Timer
+ObjectType=0x7
+DataType=0x0006
+AccessType=rw
+DefaultValue=0x1F4
+PDOMapping=0
+
+[1A04]
+ParameterName=TPDO5 Mapping
+ObjectType=0x9
+SubNumber=9
+
+[1A04sub0]
+ParameterName=Number of Mapped Objects
+ObjectType=0x7
+DataType=0x0005
+AccessType=rw
+DefaultValue=0x1
+PDOMapping=0
+
+[1A04sub1]
+ParameterName=Mapping Entry 1
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x60010110
+PDOMapping=0
+
+[1A04sub2]
+ParameterName=Mapping Entry 2
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub3]
+ParameterName=Mapping Entry 3
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub4]
+ParameterName=Mapping Entry 4
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub5]
+ParameterName=Mapping Entry 5
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub6]
+ParameterName=Mapping Entry 6
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub7]
+ParameterName=Mapping Entry 7
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub8]
+ParameterName=Mapping Entry 8
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1404]
+ParameterName=RPDO5 Communication
+ObjectType=0x9
+SubNumber=3
+
+[1404sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=2
+PDOMapping=0
+
+[1404sub1]
+ParameterName=COB-ID
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=$NODEID+0x230
+PDOMapping=0
+
+[1404sub2]
+ParameterName=Transmission Type
+ObjectType=0x7
+DataType=0x0005
+AccessType=rw
+DefaultValue=0xFF
+PDOMapping=0
+
+[1604]
+ParameterName=RPDO5 Mapping
+ObjectType=0x9
+SubNumber=9
+
+[1604sub0]
+ParameterName=Number of Mapped Objects
+ObjectType=0x7
+DataType=0x0005
+AccessType=rw
+DefaultValue=0x1
+PDOMapping=0
+
+[1604sub1]
+ParameterName=Mapping Entry 1
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x62010110
+PDOMapping=0
+
+[1604sub2]
+ParameterName=Mapping Entry 2
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub3]
+ParameterName=Mapping Entry 3
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub4]
+ParameterName=Mapping Entry 4
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub5]
+ParameterName=Mapping Entry 5
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub6]
+ParameterName=Mapping Entry 6
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub7]
+ParameterName=Mapping Entry 7
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub8]
 ParameterName=Mapping Entry 8
 ObjectType=0x7
 DataType=0x0007

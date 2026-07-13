@@ -1,27 +1,6 @@
-//! SLCAN (Serial Line CAN) protocol driver.
-//!
-//! Talks to an SLCAN adapter over any byte stream via the [`SerialPort`]
-//! trait — a unix serial port (`canopen-linux`), a `serialport` crate port
-//! on Windows/macOS (via [`IoPort`], `std` feature), or a bare MCU UART.
-//! No `slcand` or kernel socketcan needed.
-//!
-//! SLCAN protocol (Lawicel):
-//! - `S6\r`         — set 500 kbps
-//! - `O\r`          — open CAN channel
-//! - `C\r`          — close CAN channel
-//! - `tIIILDD..\r`  — transmit standard frame (III=3 hex digits ID, L=DLC, DD=data hex)
-//! - Received frames arrive as `tIIILDD..\r`
-//!
-//! Opening the port, configuring baud rate/raw mode, and the adapter init
-//! sequence (which needs delays) are platform concerns and live with the
-//! `SerialPort` implementation. The command helpers [`send_close`],
-//! [`send_bitrate`], and [`send_open`] emit the init commands; the caller
-//! sequences them with appropriate delays.
-//!
-//! [`send_close`]: SlcanTransport::send_close
-//! [`send_bitrate`]: SlcanTransport::send_bitrate
-//! [`send_open`]: SlcanTransport::send_open
+//! SerialPort-backed SLCAN transport.
 
+use super::logic::{encode_slcan_frame, parse_slcan_frame, SlcanBitrate};
 use crate::transport::{CanError, CanFrame};
 
 /// Byte-stream access to an SLCAN adapter.
@@ -37,20 +16,6 @@ pub trait SerialPort {
 
     /// Write all bytes.
     fn write_all(&mut self, data: &[u8]) -> Result<(), Self::Error>;
-}
-
-/// SLCAN bitrate codes.
-#[derive(Clone, Copy, Debug)]
-pub enum SlcanBitrate {
-    S0 = 0, // 10 kbps
-    S1 = 1, // 20 kbps
-    S2 = 2, // 50 kbps
-    S3 = 3, // 100 kbps
-    S4 = 4, // 125 kbps
-    S5 = 5, // 250 kbps
-    S6 = 6, // 500 kbps
-    S7 = 7, // 800 kbps
-    S8 = 8, // 1000 kbps
 }
 
 /// SLCAN protocol driver over a [`SerialPort`].
@@ -143,28 +108,8 @@ impl<P: SerialPort> embedded_can::nb::Can for SlcanTransport<P> {
 
     fn transmit(&mut self, frame: &Self::Frame) -> nb::Result<Option<Self::Frame>, Self::Error> {
         let mut cmd = [0u8; 32];
-        let id = frame.raw_id();
-        let data = frame.data();
-
-        let mut pos = 0;
-        cmd[pos] = b't';
-        pos += 1;
-        cmd[pos] = hex_digit((id >> 8) as u8 & 0x0F);
-        pos += 1;
-        cmd[pos] = hex_digit((id >> 4) as u8 & 0x0F);
-        pos += 1;
-        cmd[pos] = hex_digit(id as u8 & 0x0F);
-        pos += 1;
-        cmd[pos] = b'0' + frame.raw_dlc();
-        pos += 1;
-        for &b in data {
-            cmd[pos] = hex_digit(b >> 4);
-            pos += 1;
-            cmd[pos] = hex_digit(b & 0x0F);
-            pos += 1;
-        }
-        cmd[pos] = b'\r';
-        pos += 1;
+        let pos =
+            encode_slcan_frame(frame, &mut cmd).ok_or(nb::Error::Other(CanError::BusError))?;
 
         self.port
             .write_all(&cmd[..pos])
@@ -174,67 +119,6 @@ impl<P: SerialPort> embedded_can::nb::Can for SlcanTransport<P> {
 
     fn receive(&mut self) -> nb::Result<Self::Frame, Self::Error> {
         self.try_recv().ok_or(nb::Error::WouldBlock)
-    }
-}
-
-/// Check if a byte buffer contains what looks like a valid SLCAN frame.
-///
-/// Useful for probing whether an adapter is already streaming.
-pub fn has_slcan_frame(buf: &[u8]) -> bool {
-    for window in buf.windows(5) {
-        if window[0] == b't'
-            && parse_hex(window[1]).is_some()
-            && parse_hex(window[2]).is_some()
-            && parse_hex(window[3]).is_some()
-            && window[4] >= b'0'
-            && window[4] <= b'8'
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn parse_slcan_frame(line: &[u8]) -> Option<CanFrame> {
-    if line.is_empty() {
-        return None;
-    }
-    match line[0] {
-        b't' => {
-            if line.len() < 5 {
-                return None;
-            }
-            let id = (parse_hex(line[1])? as u16) << 8
-                | (parse_hex(line[2])? as u16) << 4
-                | parse_hex(line[3])? as u16;
-            let dlc = (line[4] - b'0') as usize;
-            if line.len() < 5 + dlc * 2 {
-                return None;
-            }
-            let mut data = [0u8; 8];
-            for i in 0..dlc {
-                data[i] = (parse_hex(line[5 + i * 2])? << 4) | parse_hex(line[6 + i * 2])?;
-            }
-            CanFrame::new(id, &data[..dlc])
-        }
-        _ => None,
-    }
-}
-
-fn hex_digit(val: u8) -> u8 {
-    match val & 0x0F {
-        0..=9 => b'0' + val,
-        10..=15 => b'A' + (val - 10),
-        _ => b'0',
-    }
-}
-
-fn parse_hex(ch: u8) -> Option<u8> {
-    match ch {
-        b'0'..=b'9' => Some(ch - b'0'),
-        b'a'..=b'f' => Some(ch - b'a' + 10),
-        b'A'..=b'F' => Some(ch - b'A' + 10),
-        _ => None,
     }
 }
 
@@ -277,33 +161,6 @@ impl<T: std::io::Read + std::io::Write> SerialPort for IoPort<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_standard_frame() {
-        let line = b"t1FF8DEADBEEFCAFEBABE";
-        let frame = parse_slcan_frame(line).unwrap();
-        assert_eq!(frame.raw_id(), 0x1FF);
-        assert_eq!(frame.raw_dlc(), 8);
-        assert_eq!(
-            frame.data(),
-            &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]
-        );
-    }
-
-    #[test]
-    fn parse_heartbeat_frame() {
-        let line = b"t701105";
-        let frame = parse_slcan_frame(line).unwrap();
-        assert_eq!(frame.raw_id(), 0x701);
-        assert_eq!(frame.raw_dlc(), 1);
-        assert_eq!(frame.data(), &[0x05]);
-    }
-
-    #[test]
-    fn parse_empty() {
-        assert!(parse_slcan_frame(b"").is_none());
-        assert!(parse_slcan_frame(b"\x07").is_none());
-    }
 
     /// In-memory SerialPort for driver tests.
     struct FakePort {

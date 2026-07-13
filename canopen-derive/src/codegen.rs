@@ -159,6 +159,16 @@ pub fn generate(od: OdDefinition) -> TokenStream {
     let rpdo_count = rpdo_defs.len();
     let has_pdos = tpdo_count > 0 || rpdo_count > 0;
 
+    // Reject duplicate PDO numbers (they would collide on OD comm/mapping indices)
+    for (label, defs) in [("tpdo", &tpdo_defs), ("rpdo", &rpdo_defs)] {
+        let mut numbers: Vec<u16> = defs.iter().map(|p| p.number).collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        if numbers.len() != defs.len() {
+            panic!("duplicate {label}[N] definition: each PDO number may only be declared once");
+        }
+    }
+
     // Resolve PDO mappings (field names → index/subindex/bit_length)
     let tpdo_resolved: Vec<Vec<ResolvedMapping>> = tpdo_defs
         .iter()
@@ -443,9 +453,10 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                 .iter()
                 .map(|p| {
                     match p.cob_id {
-                        Some(id) => quote! { #id },
-                        // 0 = use predefined default, resolved at runtime with node_id
-                        None => quote! { 0 },
+                        Some(CobIdSpec::Absolute(id)) => quote! { #id },
+                        // 0 = resolved at runtime with node_id (predefined
+                        // default or node-relative base)
+                        Some(CobIdSpec::NodeRelative(_)) | None => quote! { 0 },
                     }
                 })
                 .collect();
@@ -476,8 +487,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             let cob_ids: Vec<TokenStream> = rpdo_defs
                 .iter()
                 .map(|p| match p.cob_id {
-                    Some(id) => quote! { #id },
-                    None => quote! { 0 },
+                    Some(CobIdSpec::Absolute(id)) => quote! { #id },
+                    Some(CobIdSpec::NodeRelative(_)) | None => quote! { 0 },
                 })
                 .collect();
             let tt: Vec<u8> = rpdo_defs.iter().map(|p| p.transmission_type).collect();
@@ -960,18 +971,31 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         // Generate tpdo_configs() method body
         let tpdo_config_items: Vec<TokenStream> = tpdo_defs.iter().enumerate().map(|(i, pdo)| {
             let n = pdo.number;
-            // Predefined default COB-ID: 0x180 + (n-1)*0x100 + node_id
-            let base: u16 = 0x180 + (n as u16 - 1) * 0x100;
+            // A stored COB-ID of 0 means "resolve at runtime with node_id":
+            // node-relative base if declared, else the predefined default
+            // (PDO 1-4 only). PDOs >4 without a node-relative base always
+            // have an absolute cob_id (enforced by the DSL), so 0 can only
+            // mean "disabled" there.
+            let default_cob = match pdo.cob_id {
+                Some(CobIdSpec::NodeRelative(base)) => {
+                    let base = base as u16;
+                    quote! { #base + node_id.raw() as u16 }
+                }
+                _ if n <= 4 => {
+                    let base: u16 = 0x180 + (n - 1) * 0x100;
+                    quote! { #base + node_id.raw() as u16 }
+                }
+                _ => quote! { 0u16 },
+            };
             quote! {
                 {
                     let raw = self.tpdo_cob_id[#i];
-                    let enabled = (raw & 0x8000_0000) == 0;
                     let cob_id = if raw == 0 {
-                        // Predefined default
-                        #base + node_id.raw() as u16
+                        #default_cob
                     } else {
                         (raw & 0x7FF) as u16
                     };
+                    let enabled = (raw & 0x8000_0000) == 0 && cob_id != 0;
 
                     let mut mappings = canopen_core::pdo::heapless_vec_new();
                     let count = self.tpdo_mapping_count[#i] as usize;
@@ -983,6 +1007,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     }
 
                     canopen_core::pdo::TpdoConfig {
+                        od_number: #n,
                         cob_id,
                         transmission_type: self.tpdo_transmission_type[#i],
                         inhibit_time_100us: self.tpdo_inhibit_time[#i],
@@ -996,16 +1021,26 @@ pub fn generate(od: OdDefinition) -> TokenStream {
 
         let rpdo_config_items: Vec<TokenStream> = rpdo_defs.iter().enumerate().map(|(i, pdo)| {
             let n = pdo.number;
-            let base: u16 = 0x200 + (n as u16 - 1) * 0x100;
+            let default_cob = match pdo.cob_id {
+                Some(CobIdSpec::NodeRelative(base)) => {
+                    let base = base as u16;
+                    quote! { #base + node_id.raw() as u16 }
+                }
+                _ if n <= 4 => {
+                    let base: u16 = 0x200 + (n - 1) * 0x100;
+                    quote! { #base + node_id.raw() as u16 }
+                }
+                _ => quote! { 0u16 },
+            };
             quote! {
                 {
                     let raw = self.rpdo_cob_id[#i];
-                    let enabled = (raw & 0x8000_0000) == 0;
                     let cob_id = if raw == 0 {
-                        #base + node_id.raw() as u16
+                        #default_cob
                     } else {
                         (raw & 0x7FF) as u16
                     };
+                    let enabled = (raw & 0x8000_0000) == 0 && cob_id != 0;
 
                     let mut mappings = canopen_core::pdo::heapless_vec_new();
                     let count = self.rpdo_mapping_count[#i] as usize;
@@ -1017,6 +1052,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     }
 
                     canopen_core::pdo::RpdoConfig {
+                        od_number: #n,
                         cob_id,
                         transmission_type: self.rpdo_transmission_type[#i],
                         mappings,

@@ -1,0 +1,16 @@
+[package]
+name = "canwsd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+canwsd-proto = { path = "../../canwsd-proto", features = ["serde"] }
+clap = { version = "4.6.1", features = ["derive"] }
+env_logger = "0.11.10"
+futures-util = { version = "0.3.32", features = ["sink"] }
+log = "0.4.32"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+socketcan = { version = "3.5.0", features = ["tokio"] }
+tokio = { version = "1.52.3", features = ["full"] }

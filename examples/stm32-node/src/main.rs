@@ -13,7 +13,6 @@ use canopen_core::cobid::NodeId;
 use canopen_core::node::{Node, NodeConfig, SharedNode};
 use canopen_core::time::Clock;
 use canopen_core::transport::{CanError, CanFrame};
-use canopen_core::OdEventSignal;
 use canopen_derive::object_dictionary;
 
 use defmt::*;
@@ -80,7 +79,7 @@ object_dictionary! {
         //   (useful for coordinated updates).
         // - Fields are unpacked from the CAN frame: [led (1 byte) | echo_in (2 bytes)]
         // - Writing to these emits a typed NodeOdChange, which wakes main via
-        //   EVENT_SIGNAL.
+        //   NODE.wait_for_change().
         rpdo[1](transmission_type = event_driven) {
             led,
             echo_in,
@@ -92,7 +91,6 @@ object_dictionary! {
 
 static TX_CHANNEL: Channel<CriticalSectionRawMutex, CanFrame, 16> = Channel::new();
 static RX_CHANNEL: Channel<CriticalSectionRawMutex, CanFrame, 16> = Channel::new();
-static EVENT_SIGNAL: OdEventSignal = OdEventSignal::new();
 
 /// The CANopen node, shared between the protocol task and main.
 static NODE: SharedNode<NodeOd, 1, 1> = SharedNode::new();
@@ -245,7 +243,7 @@ async fn main(spawner: Spawner) {
     // CANopen node — PDO config comes from the OD (declared in the macro above)
     let node_id = NodeId::new(1).unwrap();
     let od = NodeOd::new();
-    let mut node: NodeOdNode = Node::new(
+    let node: NodeOdNode = Node::new(
         NodeConfig {
             heartbeat_interval_ms: 500,
             auto_start: true,
@@ -253,7 +251,6 @@ async fn main(spawner: Spawner) {
         },
         od,
     );
-    node.set_event_signal(&EVENT_SIGNAL);
 
     info!(
         "node {} running — TPDO1 {:#05X}, RPDO1 {:#05X}",
@@ -273,7 +270,7 @@ async fn main(spawner: Spawner) {
     // or a button edge (local GPIO interrupt). No polling.
 
     loop {
-        match select(EVENT_SIGNAL.wait(), button.wait_for_any_edge()).await {
+        match select(NODE.wait_for_change(), button.wait_for_any_edge()).await {
             // Protocol stack changed the OD (SDO download or RPDO write).
             // next_change() decodes events into NodeOdChange — one variant per
             // writable OD entry, carrying the current value. The match is

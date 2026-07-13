@@ -1,5 +1,5 @@
 use crate::dsl::{
-    AccessKind, EntryKind, OdDefinition, OdEntry, PdoDef, PdoDirection, SubEntry, VarDef,
+    AccessKind, CobIdSpec, EntryKind, OdDefinition, OdEntry, PdoDef, PdoDirection, SubEntry, VarDef,
 };
 use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
@@ -125,6 +125,8 @@ fn parse_eds_content_with_overrides(
     if !current_section.is_empty() {
         sections.push((current_section, section_props));
     }
+
+    validate_unique_object_sections(&sections)?;
 
     // Parse object sections (hex indices like "1000", "1018sub1", etc.)
     // First pass: collect top-level objects and track their ObjectType
@@ -272,6 +274,30 @@ fn parse_eds_content_with_overrides(
     Ok((entries, pdos))
 }
 
+fn validate_unique_object_sections(
+    sections: &[(String, Vec<(String, String)>)],
+) -> std::result::Result<(), String> {
+    let mut seen: std::collections::HashMap<(u16, Option<u8>), &str> =
+        std::collections::HashMap::new();
+
+    for (section_name, _) in sections {
+        if let Some(address) = parse_section_index(section_name) {
+            if let Some(previous) = seen.insert(address, section_name.as_str()) {
+                let (index, subindex) = address;
+                let address = match subindex {
+                    Some(sub) => format!("0x{index:04X}:{sub:02X}"),
+                    None => format!("0x{index:04X}"),
+                };
+                return Err(format!(
+                    "duplicate EDS object section for OD address {address}: [{previous}] and [{section_name}]"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Check if an index is a PDO communication or mapping parameter.
 fn is_pdo_index(index: u16) -> bool {
     matches!(index, 0x1400..=0x15FF | 0x1600..=0x17FF | 0x1800..=0x19FF | 0x1A00..=0x1BFF)
@@ -295,10 +321,10 @@ fn extract_pdos(
 
     // (resolve_mapping is a free function below)
 
-    // Parse TPDOs (comm: 0x1800+N, mapping: 0x1A00+N)
-    for n in 0u8..=3 {
-        let comm_idx = 0x1800 + n as u16;
-        let map_idx = 0x1A00 + n as u16;
+    // Parse TPDOs (comm: 0x1800+N, mapping: 0x1A00+N); CiA 301 allows up to 512
+    for n in 0u16..512 {
+        let comm_idx = 0x1800 + n;
+        let map_idx = 0x1A00 + n;
 
         // Check if this TPDO exists (has a comm param section)
         let comm_key = format!("{:04X}", comm_idx);
@@ -351,23 +377,23 @@ fn extract_pdos(
             }
         }
 
-        if !mappings.is_empty() {
-            pdos.push(PdoDef {
-                direction: PdoDirection::Tpdo,
-                number: n + 1,
-                cob_id,
-                transmission_type,
-                inhibit_time,
-                event_timer,
-                mappings,
-            });
-        }
+        // Push even with no mappings: a comm-only PDO (disabled placeholder,
+        // or intended for runtime remapping) must keep its comm params.
+        pdos.push(PdoDef {
+            direction: PdoDirection::Tpdo,
+            number: n + 1,
+            cob_id,
+            transmission_type,
+            inhibit_time,
+            event_timer,
+            mappings,
+        });
     }
 
-    // Parse RPDOs (comm: 0x1400+N, mapping: 0x1600+N)
-    for n in 0u8..=3 {
-        let comm_idx = 0x1400 + n as u16;
-        let map_idx = 0x1600 + n as u16;
+    // Parse RPDOs (comm: 0x1400+N, mapping: 0x1600+N); CiA 301 allows up to 512
+    for n in 0u16..512 {
+        let comm_idx = 0x1400 + n;
+        let map_idx = 0x1600 + n;
 
         let comm_key = format!("{:04X}", comm_idx);
         if get_section_props(&comm_key).is_none() {
@@ -403,17 +429,15 @@ fn extract_pdos(
             }
         }
 
-        if !mappings.is_empty() {
-            pdos.push(PdoDef {
-                direction: PdoDirection::Rpdo,
-                number: n + 1,
-                cob_id,
-                transmission_type,
-                inhibit_time: 0,
-                event_timer: 0,
-                mappings,
-            });
-        }
+        pdos.push(PdoDef {
+            direction: PdoDirection::Rpdo,
+            number: n + 1,
+            cob_id,
+            transmission_type,
+            inhibit_time: 0,
+            event_timer: 0,
+            mappings,
+        });
     }
 
     pdos
@@ -444,15 +468,20 @@ fn resolve_mapping(mapping_val: u32, entries: &mut [OdEntry]) -> Option<Ident> {
     None
 }
 
-/// Parse a PDO COB-ID value. Handles `$NODEID+0xNNN` (returns None = predefined default)
-/// and plain hex/decimal values (returns Some(value)).
-fn parse_pdo_cob_id(value: &str) -> Option<u32> {
+/// Parse a PDO COB-ID value. `$NODEID+0xNNN` (either operand order) becomes
+/// [`CobIdSpec::NodeRelative`] with the numeric base; plain hex/decimal values
+/// become [`CobIdSpec::Absolute`]. Returns None if the value is unparseable.
+fn parse_pdo_cob_id(value: &str) -> Option<CobIdSpec> {
     let v = value.trim();
-    if v.contains("$NODEID") || v.contains("$nodeid") {
-        // $NODEID+0x200 etc. — use predefined default (None = resolved at runtime)
-        None
+    if v.to_ascii_uppercase().contains("$NODEID") {
+        // e.g. "$NODEID+0x200" or "0x200+$NODEID"
+        let base_str = v
+            .split('+')
+            .map(str::trim)
+            .find(|part| !part.eq_ignore_ascii_case("$NODEID"))?;
+        parse_int(base_str).map(|n| CobIdSpec::NodeRelative(n as u32))
     } else {
-        parse_int(v).map(|n| n as u32)
+        parse_int(v).map(|n| CobIdSpec::Absolute(n as u32))
     }
 }
 
@@ -494,7 +523,8 @@ fn parse_var_entry(
     let is_varlen = crate::dsl::is_variable_length_type(rust_type);
     let access = match access_str.to_lowercase().as_str() {
         "ro" | "const" => AccessKind::Ro,
-        "rw" => AccessKind::Rw,
+        // CiA 306: rwr/rww are read-write; the suffix only marks TPDO/RPDO mappability
+        "rw" | "rwr" | "rww" => AccessKind::Rw,
         "wo" => AccessKind::Wo,
         _ => AccessKind::Ro,
     };
@@ -651,4 +681,78 @@ fn normalize_default(value: &str, data_type: u16) -> String {
         return format!("0x{hex}");
     }
     v.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_top_level_object_section_is_error() {
+        let err = parse_eds_content(
+            r#"
+[1000]
+ParameterName=Device Type
+ObjectType=0x7
+DataType=0x0007
+
+[1000]
+ParameterName=Different Name
+ObjectType=0x7
+DataType=0x0007
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("duplicate EDS object section"));
+        assert!(err.contains("0x1000"));
+    }
+
+    #[test]
+    fn duplicate_subindex_section_is_error_even_with_different_spelling() {
+        let err = parse_eds_content(
+            r#"
+[1018]
+ParameterName=Identity
+ObjectType=0x9
+
+[1018sub1]
+ParameterName=Vendor ID
+ObjectType=0x7
+DataType=0x0007
+
+[1018sub01]
+ParameterName=Different Name
+ObjectType=0x7
+DataType=0x0007
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("duplicate EDS object section"));
+        assert!(err.contains("0x1018:01"));
+    }
+
+    #[test]
+    fn record_top_level_and_subzero_are_distinct_sections() {
+        parse_eds_content(
+            r#"
+[1018]
+ParameterName=Identity
+ObjectType=0x9
+
+[1018sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+DefaultValue=1
+
+[1018sub1]
+ParameterName=Vendor ID
+ObjectType=0x7
+DataType=0x0007
+"#,
+        )
+        .unwrap();
+    }
 }

@@ -15,14 +15,17 @@ SupportedObjects=2
 2=0x1001
 
 [OptionalObjects]
-SupportedObjects=7
+SupportedObjects=10
 1=0x1008
 2=0x1400
-3=0x1600
-4=0x1800
-5=0x1A00
-6=0x1017
-7=0x1003
+3=0x1401
+4=0x1600
+5=0x1800
+6=0x1A00
+7=0x1806
+8=0x1A06
+9=0x1017
+10=0x1003
 
 [ManufacturerObjects]
 SupportedObjects=2
@@ -117,6 +120,32 @@ AccessType=rw
 DefaultValue=$NODEID+0x200
 
 [1400sub2]
+ParameterName=Transmission Type
+ObjectType=0x7
+DataType=0x0005
+AccessType=rw
+DefaultValue=0xFF
+
+[1401]
+ParameterName=RPDO2 Communication
+ObjectType=0x9
+SubNumber=3
+
+[1401sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=2
+
+[1401sub1]
+ParameterName=COB-ID
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=$NODEID+0x300
+
+[1401sub2]
 ParameterName=Transmission Type
 ObjectType=0x7
 DataType=0x0005
@@ -221,6 +250,51 @@ ObjectType=0x7
 DataType=0x0007
 AccessType=rw
 DefaultValue=0x00
+
+[1806]
+ParameterName=TPDO7 Communication
+ObjectType=0x9
+SubNumber=3
+
+[1806sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=2
+
+[1806sub1]
+ParameterName=COB-ID
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=$NODEID+0x1C2
+
+[1806sub2]
+ParameterName=Transmission Type
+ObjectType=0x7
+DataType=0x0005
+AccessType=rw
+DefaultValue=0xFF
+
+[1A06]
+ParameterName=TPDO7 Mapping
+ObjectType=0x9
+SubNumber=2
+
+[1A06sub0]
+ParameterName=Number of Mapped Objects
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=0x01
+
+[1A06sub1]
+ParameterName=Mapping Entry 1
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x60400010
 
 [6040]
 ParameterName=Controlword

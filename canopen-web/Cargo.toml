@@ -1,0 +1,34 @@
+[package]
+name = "canopen-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Browser transports for canopen-rs using Web Serial and WebSocket"
+
+[dependencies]
+canopen-core = { path = "../canopen-core", features = ["std"] }
+canwsd-proto = { path = "../canwsd-proto", features = ["serde"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "ErrorEvent",
+    "Event",
+    "MessageEvent",
+    "Navigator",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "Response",
+    "Serial",
+    "SerialOptions",
+    "SerialPort",
+    "WebSocket",
+    "Window",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+] }

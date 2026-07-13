@@ -311,6 +311,71 @@ class TestPdo:
 
 
 # ---------------------------------------------------------------------------
+# PDO — Beyond the pre-defined connection set (PDO number > 4)
+# ---------------------------------------------------------------------------
+
+
+class TestExtendedPdo:
+    """vcan_node declares TPDO5 (COB-ID 0x1B1) and RPDO5 (COB-ID 0x231) with
+    explicit COB-IDs, since PDOs >4 have no predefined ones."""
+
+    def test_comm_params_readable_via_sdo(self, network, node):
+        """The comm params of PDO 5 live at 0x1804/0x1404 and must report the
+        explicit COB-IDs (and the resolved default for PDO 1)."""
+        assert node.sdo[0x1804][1].raw & 0x7FF == 0x1B1
+        assert node.sdo[0x1404][1].raw & 0x7FF == 0x231
+        # Defaulted PDO-1 COB-IDs must read back resolved, not 0
+        assert node.sdo[0x1800][1].raw & 0x7FF == 0x181
+        assert node.sdo[0x1400][1].raw & 0x7FF == 0x201
+
+    def test_rpdo5_writes_to_od(self, network, node):
+        node.nmt.state = "OPERATIONAL"
+        time.sleep(0.2)
+
+        msg = can.Message(
+            arbitration_id=0x231,
+            data=struct.pack("<H", 0xC0DE),
+            is_extended_id=False,
+        )
+        network.bus.send(msg)
+        time.sleep(0.1)
+
+        assert node.sdo[0x6201][1].raw == 0xC0DE
+
+    def test_tpdo5_received_after_change(self, network, node):
+        """RPDO5 write is mirrored to input3, which TPDO5 sends on 0x1B1."""
+        node.nmt.state = "OPERATIONAL"
+        time.sleep(0.2)
+
+        msg = can.Message(
+            arbitration_id=0x231,
+            data=struct.pack("<H", 0xF00D),
+            is_extended_id=False,
+        )
+        network.bus.send(msg)
+
+        deadline = time.time() + 3.0
+        received = False
+        while time.time() < deadline:
+            rx = network.bus.recv(timeout=0.5)
+            if rx and rx.arbitration_id == 0x1B1 and len(rx.data) >= 2:
+                if struct.unpack_from("<H", rx.data)[0] == 0xF00D:
+                    received = True
+                    break
+
+        assert received, "Did not receive expected TPDO5 on COB-ID 0x1B1"
+
+    def test_python_canopen_parses_extended_pdos_from_eds(self, network, node):
+        """python-canopen builds its PDO maps from the EDS; TPDO5/RPDO5 must
+        be present with the explicit COB-IDs."""
+        node.tpdo.read()
+        node.rpdo.read()
+        assert node.tpdo[5].cob_id == 0x1B1
+        assert node.rpdo[5].cob_id == 0x231
+        assert node.tpdo[1].cob_id == 0x181
+
+
+# ---------------------------------------------------------------------------
 # EMCY
 # ---------------------------------------------------------------------------
 

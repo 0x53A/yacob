@@ -75,10 +75,12 @@ pub enum AccessKind {
 #[derive(Debug, Clone)]
 pub struct PdoDef {
     pub direction: PdoDirection,
-    /// 1-indexed PDO number (1..=4), matching CANopen naming (TPDO1, RPDO1, etc.)
-    pub number: u8,
+    /// 1-indexed PDO number (1..=512), matching CANopen naming (TPDO1, RPDO1, etc.).
+    /// Numbers 1-4 have predefined COB-IDs (CiA 301 pre-defined connection set);
+    /// numbers above 4 require an explicit `cob_id`.
+    pub number: u16,
     /// COB-ID override. None = use predefined default (resolved at Node init with node_id).
-    pub cob_id: Option<u32>,
+    pub cob_id: Option<CobIdSpec>,
     pub transmission_type: u8,
     /// Inhibit time in 100μs units (TPDO only).
     pub inhibit_time: u16,
@@ -86,6 +88,19 @@ pub struct PdoDef {
     pub event_timer: u16,
     /// Field names referencing previously defined OD entries.
     pub mappings: Vec<Ident>,
+}
+
+/// How a PDO's COB-ID is specified in the DSL (or an imported EDS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CobIdSpec {
+    /// Fixed 11-bit COB-ID, used as-is on every node.
+    /// DSL: `cob_id = 0x1B1`.
+    Absolute(u32),
+    /// Base + node ID, resolved when the node ID is known — lets multiple
+    /// devices share one OD on the same network, like the predefined
+    /// connection set does for PDOs 1-4.
+    /// DSL: `cob_id = node_id + 0x1B0`. EDS: `$NODEID+0x1B0`.
+    NodeRelative(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,11 +340,11 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
     let num_content;
     bracketed!(num_content in input);
     let num_lit: LitInt = num_content.parse()?;
-    let number: u8 = num_lit
+    let number: u16 = num_lit
         .base10_parse()
-        .map_err(|_| syn::Error::new(num_lit.span(), "expected PDO number 1-4"))?;
-    if number < 1 || number > 4 {
-        return Err(syn::Error::new(num_lit.span(), "PDO number must be 1-4"));
+        .map_err(|_| syn::Error::new(num_lit.span(), "expected PDO number 1-512"))?;
+    if number < 1 || number > 512 {
+        return Err(syn::Error::new(num_lit.span(), "PDO number must be 1-512"));
     }
 
     // Parse optional (key = value, ...) parameters
@@ -346,8 +361,38 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
             params.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "cob_id" => {
-                    let val: LitInt = params.parse()?;
-                    cob_id = Some(val.base10_parse()?);
+                    if params.peek(Ident) {
+                        // node-relative: `cob_id = node_id + 0x1B0`
+                        let ident: Ident = params.parse()?;
+                        if ident != "node_id" {
+                            return Err(syn::Error::new(
+                                ident.span(),
+                                "expected `node_id + <base>` or a literal COB-ID",
+                            ));
+                        }
+                        params.parse::<Token![+]>()?;
+                        let val: LitInt = params.parse()?;
+                        let base: u32 = val.base10_parse()?;
+                        // Node IDs go up to 127; base + node_id must stay 11-bit
+                        if base == 0 || base + 127 > 0x7FF {
+                            return Err(syn::Error::new(
+                                val.span(),
+                                "node-relative cob_id base must be 0x001-0x780 \
+                                 (base + node_id must fit an 11-bit CAN ID)",
+                            ));
+                        }
+                        cob_id = Some(CobIdSpec::NodeRelative(base));
+                    } else {
+                        let val: LitInt = params.parse()?;
+                        let raw: u32 = val.base10_parse()?;
+                        if raw == 0 || raw > 0x7FF {
+                            return Err(syn::Error::new(
+                                val.span(),
+                                "cob_id must be an 11-bit CAN ID (0x001-0x7FF)",
+                            ));
+                        }
+                        cob_id = Some(CobIdSpec::Absolute(raw));
+                    }
                 }
                 "transmission_type" => transmission_type = parse_transmission_type(&params)?,
                 "inhibit_time" => inhibit_time = parse_time_value(&params, &INHIBIT_TIME_SPEC)?,
@@ -384,6 +429,17 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
     }
 
     input.parse::<Token![;]>()?;
+
+    if number > 4 && cob_id.is_none() {
+        return Err(syn::Error::new(
+            num_lit.span(),
+            format!(
+                "{dir_ident}[{number}] is beyond the pre-defined connection set (PDO 1-4) and \
+                 has no default COB-ID; specify one explicitly: \
+                 `cob_id = 0x...` (fixed) or `cob_id = node_id + 0x...` (per-node)"
+            ),
+        ));
+    }
 
     Ok(PdoDef {
         direction,

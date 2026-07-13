@@ -8,6 +8,7 @@ description = "Linux transports (socketcan, SLCAN, UDP multicast) and utilities 
 [dependencies]
 canopen-core = { path = "../canopen-core", features = ["std"] }
 canopen-derive = { path = "../canopen-derive" }
+canwsd-proto = { path = "../canwsd-proto" }
 socketcan = "3.5"
 embedded-can = "0.4"
 libc = "0.2"
@@ -15,5 +16,8 @@ nb = "1.1.0"
 rmp-serde = "1.3.1"
 serde = { version = "1.0.228", features = ["derive"] }
 socket2 = "0.6.3"
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio-tungstenite = "0.28.0"
+futures-util = "0.3.32"
 
 [dev-dependencies]
