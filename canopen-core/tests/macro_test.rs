@@ -1200,3 +1200,87 @@ fn rpdo_deadline_configured_at_runtime_via_sdo() {
     // Last received values are retained while the deadline is expired.
     assert_eq!(node.od().led, 0x01);
 }
+
+// ---- INTEGER24 / UNSIGNED24 ----
+
+object_dictionary! {
+    pub struct I24Od {
+        [0x1000] device_type: u32 = 0x0000_0000, ro;
+        [0x2000] sensor: record {
+            [1] raw24: i24 = 0, ro, pdo;
+            [2] setpoint24: i24 = 0, rw, pdo;
+            [3] counter24: u24 = 0, rw;
+        };
+        [0x2001] history24: array<i24, 2>, rw;
+
+        tpdo[1](transmission_type = event_driven) {
+            raw24,
+        };
+    }
+}
+
+#[test]
+fn i24_repr_and_roundtrip() {
+    let mut od = I24Od::new();
+
+    // Rust repr is i32/u32.
+    od.raw24 = -1_234_567;
+    let _: i32 = od.raw24;
+    let _: u32 = od.counter24;
+
+    // Read: 3 bytes LE, two's complement.
+    let mut buf = [0u8; 8];
+    assert_eq!(od.read(0x2000, 1, &mut buf), Ok(3));
+    let ext = if (buf[2] & 0x80) != 0 { 0xFF } else { 0 };
+    assert_eq!(
+        i32::from_le_bytes([buf[0], buf[1], buf[2], ext]),
+        -1_234_567
+    );
+
+    // Write: negative value sign-extends into the i32 repr.
+    let neg = (-42_i32).to_le_bytes();
+    assert_eq!(od.write(0x2000, 2, &neg[..3]), Ok(()));
+    assert_eq!(od.setpoint24, -42);
+
+    // Write: positive value stays positive.
+    let pos = 0x7FFFFF_i32.to_le_bytes();
+    assert_eq!(od.write(0x2000, 2, &pos[..3]), Ok(()));
+    assert_eq!(od.setpoint24, 0x7FFFFF);
+
+    // u24 zero-extends.
+    assert_eq!(od.write(0x2000, 3, &[0xFF, 0xFF, 0xFF]), Ok(()));
+    assert_eq!(od.counter24, 0xFF_FFFF);
+
+    // Wrong size is rejected.
+    assert_eq!(
+        od.write(0x2000, 2, &pos[..4]),
+        Err(canopen_core::od::OdError::DataTypeMismatch)
+    );
+
+    // Array elements behave the same.
+    assert_eq!(od.write(0x2001, 1, &neg[..3]), Ok(()));
+    assert_eq!(od.history24[0], -42);
+    assert_eq!(od.read(0x2001, 1, &mut buf), Ok(3));
+}
+
+#[test]
+fn i24_metadata_and_mapping() {
+    use canopen_core::datatypes::DataType;
+    let od = I24Od::new();
+
+    let meta = od.lookup(0x2000, 1).unwrap();
+    assert_eq!(meta.data_type, DataType::I24);
+    assert_eq!(meta.data_type.size(), Some(3));
+    let meta = od.lookup(0x2000, 3).unwrap();
+    assert_eq!(meta.data_type, DataType::U24);
+
+    // PDO mapping entry: 24-bit length.
+    let mut buf = [0u8; 8];
+    assert_eq!(od.read(0x1A00, 1, &mut buf), Ok(4));
+    let mapping = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    assert_eq!(mapping, 0x2000_0118);
+
+    // EDS export carries the CiA codes.
+    assert!(I24Od::EDS.contains("DataType=0x0010"));
+    assert!(I24Od::EDS.contains("DataType=0x0016"));
+}

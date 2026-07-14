@@ -285,6 +285,8 @@ fn serialize_value(value: &str, data_type: u16) -> Option<Vec<u8>> {
         0x0002 | 0x0005 => parse_int_val(v).map(|n| alloc::vec![n as u8]),
         // Integer16 / Unsigned16
         0x0003 | 0x0006 => parse_int_val(v).map(|n| (n as u16).to_le_bytes().to_vec()),
+        // Integer24 / Unsigned24 (3 bytes on the wire)
+        0x0010 | 0x0016 => parse_int_val(v).map(|n| (n as u32).to_le_bytes()[..3].to_vec()),
         // Integer32 / Unsigned32
         0x0004 | 0x0007 => parse_int_val(v).map(|n| (n as u32).to_le_bytes().to_vec()),
         // Real32

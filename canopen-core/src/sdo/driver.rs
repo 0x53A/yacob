@@ -205,6 +205,31 @@ impl SdoDriver {
         Ok(f32::from_le_bytes(buf))
     }
 
+    /// Read an INTEGER24 (3 bytes on the wire), sign-extended to `i32`.
+    pub async fn read_i24<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<i32, SdoError<E>> {
+        let mut buf = [0u8; 3];
+        self.upload(index, subindex, &mut buf, can).await?;
+        let ext = if (buf[2] & 0x80) != 0 { 0xFF } else { 0x00 };
+        Ok(i32::from_le_bytes([buf[0], buf[1], buf[2], ext]))
+    }
+
+    /// Read an UNSIGNED24 (3 bytes on the wire), zero-extended to `u32`.
+    pub async fn read_u24<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<u32, SdoError<E>> {
+        let mut buf = [0u8; 3];
+        self.upload(index, subindex, &mut buf, can).await?;
+        Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], 0]))
+    }
+
     /// Typed write helpers.
     pub async fn write_u8<E: core::fmt::Debug>(
         &self,
@@ -246,6 +271,32 @@ impl SdoDriver {
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<(), SdoError<E>> {
         self.download(index, subindex, &val.to_le_bytes(), can)
+            .await
+    }
+
+    /// Write an INTEGER24 (3 bytes on the wire). The upper 8 bits of `val`
+    /// are truncated.
+    pub async fn write_i24<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        val: i32,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<(), SdoError<E>> {
+        self.download(index, subindex, &val.to_le_bytes()[..3], can)
+            .await
+    }
+
+    /// Write an UNSIGNED24 (3 bytes on the wire). The upper 8 bits of `val`
+    /// are truncated.
+    pub async fn write_u24<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        val: u32,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<(), SdoError<E>> {
+        self.download(index, subindex, &val.to_le_bytes()[..3], can)
             .await
     }
 

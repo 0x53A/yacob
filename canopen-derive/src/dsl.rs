@@ -772,6 +772,8 @@ pub fn type_to_datatype(ty: &str) -> Option<&'static str> {
         "u64" => Some("U64"),
         "i8" => Some("I8"),
         "i16" => Some("I16"),
+        "i24" => Some("I24"),
+        "u24" => Some("U24"),
         "i32" => Some("I32"),
         "i64" => Some("I64"),
         "f32" => Some("Real32"),
@@ -788,9 +790,21 @@ pub fn type_size(ty: &str) -> Option<usize> {
     match ty {
         "bool" | "u8" | "i8" => Some(1),
         "u16" | "i16" => Some(2),
+        "i24" | "u24" => Some(3),
         "u32" | "i32" | "f32" => Some(4),
         "u64" | "i64" | "f64" => Some(8),
         _ => None,
+    }
+}
+
+/// Rust representation type for a DSL scalar type. Differs from the DSL name
+/// only for the 24-bit CANopen types, which have no native Rust equivalent:
+/// `i24` is stored as `i32`, `u24` as `u32` (3 bytes on the wire).
+pub fn rust_repr_type(ty: &proc_macro2::Ident) -> proc_macro2::TokenStream {
+    match ty.to_string().as_str() {
+        "i24" => quote::quote!(i32),
+        "u24" => quote::quote!(u32),
+        _ => quote::quote!(#ty),
     }
 }
 

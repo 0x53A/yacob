@@ -13,6 +13,10 @@ pub enum DataType {
     VisibleString = 0x0009,
     OctetString = 0x000A,
     Domain = 0x000F,
+    /// 24-bit signed integer; 3 bytes on the wire, `i32` in Rust.
+    I24 = 0x0010,
+    /// 24-bit unsigned integer; 3 bytes on the wire, `u32` in Rust.
+    U24 = 0x0016,
     Real64 = 0x0011,
     I64 = 0x0015,
     U64 = 0x001B,
@@ -24,6 +28,7 @@ impl DataType {
         match self {
             Self::Boolean | Self::U8 | Self::I8 => Some(1),
             Self::U16 | Self::I16 => Some(2),
+            Self::I24 | Self::U24 => Some(3),
             Self::U32 | Self::I32 | Self::Real32 => Some(4),
             Self::U64 | Self::I64 | Self::Real64 => Some(8),
             Self::VisibleString | Self::OctetString | Self::Domain => None,
@@ -44,6 +49,8 @@ impl DataType {
             0x0009 => Some(Self::VisibleString),
             0x000A => Some(Self::OctetString),
             0x000F => Some(Self::Domain),
+            0x0010 => Some(Self::I24),
+            0x0016 => Some(Self::U24),
             0x0011 => Some(Self::Real64),
             0x0015 => Some(Self::I64),
             0x001B => Some(Self::U64),

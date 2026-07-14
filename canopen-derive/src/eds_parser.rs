@@ -635,6 +635,8 @@ fn datatype_to_rust(code: u16) -> Option<(&'static str, usize)> {
         0x0006 => Some(("u16", 2)),
         0x0007 => Some(("u32", 4)),
         0x0008 => Some(("f32", 4)),
+        0x0010 => Some(("i24", 3)),
+        0x0016 => Some(("u24", 3)),
         0x0009 => Some(("visible_string", 0)),
         0x000A => Some(("octet_string", 0)),
         0x000F => Some(("domain", 0)),

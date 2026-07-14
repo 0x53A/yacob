@@ -119,7 +119,7 @@ pub(crate) fn resolve_pdo_mappings(pdo: &PdoDef, flat: &[FlatEntry]) -> Vec<Reso
         if is_variable_length_type(&ty_str) {
             panic!(
                 "{pdo_label} maps field `{field_name}` which has variable-length type `{ty_str}`. \
-                 Only fixed-size types (u8, u16, u32, i8, i16, i32, f32, f64) can be PDO-mapped.",
+                 Only fixed-size types (u8, u16, u24, u32, i8, i16, i24, i32, f32, f64) can be PDO-mapped.",
             );
         }
         let bit_length = type_size(&ty_str).expect("unsupported type") as u8 * 8;
@@ -204,7 +204,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     }
                 }
             } else {
-                let ty = &e.var.type_name;
+                let ty = rust_repr_type(&e.var.type_name);
                 quote! { pub #fname: #ty }
             }
         })
@@ -254,7 +254,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                 quote! { #fname: #default_expr }
             } else {
                 // No default provided — use zero/default
-                let ty = &e.var.type_name;
+                let ty = rust_repr_type(&e.var.type_name);
                 if ty_str == "bool" {
                     quote! { #fname: false }
                 } else if ty_str == "f32" {
@@ -273,7 +273,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         .iter()
         .map(|a| {
             let fname = &a.field_name;
-            let ty = &a.def.element_type;
+            let ty = rust_repr_type(&a.def.element_type);
             let count = a.def.count;
             quote! { pub #fname: [#ty; #count] }
         })
@@ -283,8 +283,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         .iter()
         .map(|a| {
             let fname = &a.field_name;
-            let ty = &a.def.element_type;
-            let ty_str = ty.to_string();
+            let ty_str = a.def.element_type.to_string();
+            let ty = rust_repr_type(&a.def.element_type);
             let count = a.def.count;
             if ty_str == "bool" {
                 quote! { #fname: [false; #count] }
@@ -306,8 +306,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
     for a in &arrays {
         let index = a.index;
         let fname = &a.field_name;
-        let ty = &a.def.element_type;
-        let ty_str = ty.to_string();
+        let ty_str = a.def.element_type.to_string();
+        let ty = rust_repr_type(&a.def.element_type);
         let count = a.def.count as u8;
 
         let access_ident = match a.def.access {
@@ -381,7 +381,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             array_read_arms.push(quote! {
                 (#index, sub @ 1..=#count) => {
                     let bytes = self.#fname[(sub as usize) - 1].to_le_bytes();
-                    buf[..#size].copy_from_slice(&bytes);
+                    buf[..#size].copy_from_slice(&bytes[..#size]);
                     Ok(#size)
                 }
             });
@@ -405,6 +405,21 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                 (#index, sub @ 1..=#count) => {
                     if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                     self.#fname[(sub as usize) - 1] = data[0] as #ty;
+                    Ok(())
+                }
+            });
+        } else if size == 3 {
+            // i24/u24: 3 wire bytes into a 4-byte Rust repr, sign/zero-extended.
+            let ext = if ty_str == "i24" {
+                quote! { if (data[2] & 0x80) != 0 { 0xFF } else { 0x00 } }
+            } else {
+                quote! { 0x00 }
+            };
+            array_write_arms.push(quote! {
+                (#index, sub @ 1..=#count) => {
+                    if data.len() != 3 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                    let ext: u8 = #ext;
+                    self.#fname[(sub as usize) - 1] = <#ty>::from_le_bytes([data[0], data[1], data[2], ext]);
                     Ok(())
                 }
             });
@@ -887,7 +902,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                 quote! {
                     (#index, #subindex) => {
                         let bytes = self.#fname.to_le_bytes();
-                        buf[..#size].copy_from_slice(&bytes);
+                        buf[..#size].copy_from_slice(&bytes[..#size]);
                         Ok(#size)
                     }
                 }
@@ -901,7 +916,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             let index = e.index;
             let subindex = e.subindex;
             let fname = &e.field_name;
-            let ty = &e.var.type_name;
+            let ty = rust_repr_type(&e.var.type_name);
             let ty_str = e.var.type_name.to_string();
 
             if matches!(e.var.access, AccessKind::Ro | AccessKind::Const) {
@@ -970,6 +985,21 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     (#index, #subindex) => {
                         if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                         self.#fname = data[0] as #ty;
+                        Ok(())
+                    }
+                }
+            } else if size == 3 {
+                // i24/u24: 3 wire bytes into a 4-byte Rust repr, sign/zero-extended.
+                let ext = if ty_str == "i24" {
+                    quote! { if (data[2] & 0x80) != 0 { 0xFF } else { 0x00 } }
+                } else {
+                    quote! { 0x00 }
+                };
+                quote! {
+                    (#index, #subindex) => {
+                        if data.len() != 3 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                        let ext: u8 = #ext;
+                        self.#fname = <#ty>::from_le_bytes([data[0], data[1], data[2], ext]);
                         Ok(())
                     }
                 }
@@ -1243,7 +1273,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                 (#index, #sub) => Some(#change_name::#variant),
             });
         } else {
-            let ty = &e.var.type_name;
+            let ty = rust_repr_type(&e.var.type_name);
             let doc = format!(
                 "`{}` (0x{:04X}:{}) was written; carries the current value.",
                 fname, index, sub
@@ -1262,7 +1292,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         let fname = &a.field_name;
         let index = a.index;
         let count_u8 = a.def.count as u8;
-        let ty = &a.def.element_type;
+        let ty = rust_repr_type(&a.def.element_type);
         let doc = format!(
             "`{}[subindex]` (0x{:04X}) was written; carries (subindex, current value).",
             fname, index

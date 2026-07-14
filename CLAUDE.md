@@ -101,6 +101,8 @@ Generated besides the struct itself:
 
 Variable-length types: `visible_string<N>`, `octet_string<N>`, `domain<N>` backed by heapless. Use `#[use_alloc]` attribute for `String`/`Vec<u8>` instead (no capacity needed).
 
+24-bit types: `i24` (INTEGER24, 0x0010) and `u24` (UNSIGNED24, 0x0016) are 3 bytes on the wire (SDO and PDO — mapping bit length 24) but represented as `i32`/`u32` in Rust (sign-/zero-extended on write). Values outside the 24-bit range are silently truncated on read — the application must keep the field in range. `SdoDriver` has `read_i24`/`write_i24`/`read_u24`/`write_u24`; the EDS client codegen uses them.
+
 Write validation via `#[validate_write(fn_name)]` — the SDO server calls the named method before committing writes:
 ```rust
 object_dictionary! {

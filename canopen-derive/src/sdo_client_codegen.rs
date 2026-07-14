@@ -236,6 +236,8 @@ fn typed_read_info(ty: &str) -> Option<(&'static str, TokenStream)> {
         "u16" => Some(("read_u16", quote! { u16 })),
         "u32" => Some(("read_u32", quote! { u32 })),
         "i32" => Some(("read_i32", quote! { i32 })),
+        "i24" => Some(("read_i24", quote! { i32 })),
+        "u24" => Some(("read_u24", quote! { u32 })),
         "f32" => Some(("read_f32", quote! { f32 })),
         // i8/i16 use unsigned reads — caller casts if needed
         "i8" => Some(("read_u8", quote! { u8 })),
@@ -254,6 +256,8 @@ fn typed_write_info(ty: &str) -> Option<(&'static str, TokenStream)> {
         "i8" => Some(("write_u8", quote! { u8 })),
         "i16" => Some(("write_u16", quote! { u16 })),
         "i32" => Some(("write_u32", quote! { u32 })),
+        "i24" => Some(("write_i24", quote! { i32 })),
+        "u24" => Some(("write_u24", quote! { u32 })),
         _ => None,
     }
 }
