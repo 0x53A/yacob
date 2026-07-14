@@ -45,6 +45,22 @@ not implementation; `on_sync()` exists only on the TPDO side.
 handling. Planned as part of the application-models work — see
 `application-models.md` ("SYNC-based RPDOs across the models").
 
+### `EmcyProducer` latches the GENERIC bit forever
+
+(2026-07-14, noticed during RPDO deadline design.) `set_error()` unconditionally
+ORs in `error_register::GENERIC`, but `clear_error(bits)` only clears the bits
+it is given — so after any error, GENERIC stays set unless the app explicitly
+clears it (or calls `clear_all()`). Consequence: the register never returns to
+0 through per-bit clears, and the "error reset" EMCY (0x0000) is never emitted
+on recovery. CiA 301 intends GENERIC as "set while any error condition is
+present", i.e. derived, not latched.
+
+**Fix (later):** derive GENERIC (set while any other bit is set, or when an
+error with no specific bit is reported; cleared when the last one clears) so
+`clear_error(COMMUNICATION)` after e.g. an RPDO-timeout recovery can reach
+register 0 and emit the standard error-reset frame. Touches
+`emcy_producer_set_clear` test semantics.
+
 ### Low-level SdoClient has no transfer timeout
 
 The raw `SdoClient` state machine has no built-in timeout. This is largely mitigated by `SdoDriver` (the async high-level driver) which delegates timeout to the caller via `embassy_time::with_timeout` or similar, and `sdo_helpers` on Linux uses `block_on_with_timeout`. But embedded users calling `SdoClient` directly have no protection.

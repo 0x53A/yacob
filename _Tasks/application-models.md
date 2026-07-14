@@ -253,6 +253,19 @@ address consts stay aligned by construction. Decide: one bit per array
 *entry* vs per element (lean per entry — subindex granularity rarely matters
 for wakeups, and it keeps the mask word-sized for typical ODs).
 
+### RPDO deadline monitoring rides the queue transitionally (added 2026-07-14)
+
+RPDO deadline expiry (CiA 301 event timer, `rpdo[N](deadline = ...)`) pushes
+an `OdEventSource::RpdoDeadline` event (index = comm param index, sub 0) —
+deliberately the *secondary* surface. The durable primitive is the per-slot
+level flag (`Node::rpdo_deadline_expired(n)` / `RpdoEngine::deadline_expired`),
+which maps onto all three models: model 1 — `next_frame()`'s time-driven part
+synthesizes a deadline message; model 2 — expiry signals the wake source, the
+closure checks a flags word (a deadline is not a write, so it is not a mask
+bit); model 3 — poll the flag. When the queue is removed, delete the event
+push and wire those three surfaces instead; nothing else about the feature
+changes (engine state, OD sub 5, EDS round-trip are queue-independent).
+
 ### Consumers to migrate when the queue APIs go
 
 - `examples/stm32-node/src/main.rs` — `EVENT_SIGNAL` static,

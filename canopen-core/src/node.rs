@@ -7,7 +7,7 @@ use crate::od::ObjectDictionary;
 use crate::od::OdEvent;
 #[cfg(feature = "embassy")]
 use crate::od::OdEventSignal;
-use crate::pdo::{PdoMapping, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine};
+use crate::pdo::{PdoMapping, PdoNumber, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine};
 use crate::sdo::SdoServer;
 use crate::time::Clock;
 use crate::transport::CanFrame;
@@ -140,14 +140,14 @@ impl<
     /// COB-ID and makes `sync_pdo_from_od` idempotent across resets.
     fn write_pdo_cob_ids_to_od(&mut self) {
         for n in 0..TPDO {
-            if let Some(config) = self.tpdo.config(n) {
+            if let Some(config) = self.tpdo.config_slot(n) {
                 let off = pdo_od_offset(config.od_number, n);
                 let raw = config.cob_id as u32 | if config.enabled { 0 } else { 0x8000_0000 };
                 let _ = self.od.write(0x1800 + off, 1, &raw.to_le_bytes());
             }
         }
         for n in 0..RPDO {
-            if let Some(config) = self.rpdo.config(n) {
+            if let Some(config) = self.rpdo.config_slot(n) {
                 let off = pdo_od_offset(config.od_number, n);
                 let raw = config.cob_id as u32 | if config.enabled { 0 } else { 0x8000_0000 };
                 let _ = self.od.write(0x1400 + off, 1, &raw.to_le_bytes());
@@ -259,14 +259,49 @@ impl<
         None
     }
 
-    /// Resolved COB-ID of TPDO `n` (0-indexed: 0 = TPDO1), if configured.
-    pub fn tpdo_cob_id(&self, n: usize) -> Option<u16> {
-        self.tpdo.config(n).map(|c| c.cob_id)
+    /// Resolved COB-ID of the TPDO with the given CANopen number
+    /// (`PdoNumber::of::<1>()` = TPDO1), if declared.
+    pub fn tpdo_cob_id(&self, number: PdoNumber) -> Option<CobId> {
+        // cob_id 0 = predefined default not yet resolved — never a valid PDO
+        // COB-ID (it is the NMT id), so report it as absent.
+        self.tpdo
+            .config(number)
+            .filter(|c| c.cob_id != 0)
+            .and_then(|c| CobId::new(c.cob_id))
     }
 
-    /// Resolved COB-ID of RPDO `n` (0-indexed: 0 = RPDO1), if configured.
-    pub fn rpdo_cob_id(&self, n: usize) -> Option<u16> {
-        self.rpdo.config(n).map(|c| c.cob_id)
+    /// Resolved COB-ID of the RPDO with the given CANopen number
+    /// (`PdoNumber::of::<1>()` = RPDO1), if declared.
+    pub fn rpdo_cob_id(&self, number: PdoNumber) -> Option<CobId> {
+        self.rpdo
+            .config(number)
+            .filter(|c| c.cob_id != 0)
+            .and_then(|c| CobId::new(c.cob_id))
+    }
+
+    /// Does the RPDO with the given CANopen number lack an in-deadline
+    /// reception? (`PdoNumber::of::<79>()` = RPDO79, sparse or not.)
+    ///
+    /// Deadline monitoring (CiA 301 RPDO event timer, comm param sub 5) is
+    /// enabled per RPDO via `deadline = ...` in the DSL or an SDO write to
+    /// 0x1400 + N - 1 sub 5 (in Pre-Operational). For a monitored RPDO this
+    /// level query reads `true` whenever the data is not fresh: **initially,
+    /// before the first frame ever arrives** (including right after entering
+    /// Operational), and again once the gap since the last frame exceeds the
+    /// deadline — until the next reception clears it. Unmonitored or
+    /// undeclared RPDOs always read `false`. The mapped OD entries keep
+    /// their last received values throughout.
+    ///
+    /// The `OdEventSource::RpdoDeadline` event channel is narrower: it arms
+    /// on first reception and fires once per silence period, so no event (and
+    /// no app-level EMCY built on it) occurs before the counterpart has ever
+    /// spoken.
+    ///
+    /// Detection latency equals the `process()` call period. The stack never
+    /// sends EMCY automatically — report `EmcyErrorCode::RpdoTimeout`
+    /// (0x8250) via [`set_error`](Self::set_error) if the bus should know.
+    pub fn rpdo_deadline_expired(&self, number: PdoNumber) -> bool {
+        self.rpdo.deadline_expired(number)
     }
 
     /// Number of events dropped due to event queue overflow.
@@ -408,6 +443,28 @@ impl<
             }
         }
 
+        // RPDO deadline monitoring (CiA 301 event timer, comm param sub 5).
+        // Only meaningful in Operational — outside it, PDO traffic
+        // legitimately stops, so the monitoring state is discarded and
+        // re-arms on the first reception after returning to Operational.
+        if self.nmt.state() == NmtState::Operational {
+            let mut expired = Vec::<PdoNumber, RPDO>::new();
+            self.rpdo.check_deadlines(now, &mut expired);
+            for &number in &expired {
+                if self.event_queue.is_full() {
+                    let _ = self.event_queue.pop_front();
+                    self.event_overflow_count = self.event_overflow_count.saturating_add(1);
+                }
+                let _ = self.event_queue.push_back(OdEvent {
+                    index: 0x1400 + number.od_offset(),
+                    subindex: 0,
+                    source: crate::od::OdEventSource::RpdoDeadline,
+                });
+            }
+        } else {
+            self.rpdo.reset_deadline_monitoring();
+        }
+
         // Heartbeat
         if let Some(hb) = self.heartbeat.poll(now, self.nmt.state()) {
             let _ = transport.transmit(&hb);
@@ -445,7 +502,7 @@ impl<
         let mut buf2 = [0u8; 2];
 
         for n in 0..TPDO {
-            if let Some(config) = self.tpdo.config_mut(n) {
+            if let Some(config) = self.tpdo.config_slot_mut(n) {
                 let off = pdo_od_offset(config.od_number, n);
                 let comm_idx = 0x1800 + off;
                 let map_idx = 0x1A00 + off;
@@ -483,7 +540,7 @@ impl<
         }
 
         for n in 0..RPDO {
-            if let Some(config) = self.rpdo.config_mut(n) {
+            if let Some(config) = self.rpdo.config_slot_mut(n) {
                 let off = pdo_od_offset(config.od_number, n);
                 let comm_idx = 0x1400 + off;
                 let map_idx = 0x1600 + off;
@@ -495,6 +552,9 @@ impl<
                 }
                 if self.od.read(comm_idx, 2, &mut buf4).is_ok() {
                     config.transmission_type = buf4[0];
+                }
+                if self.od.read(comm_idx, 5, &mut buf2).is_ok() {
+                    config.deadline_ms = u16::from_le_bytes(buf2);
                 }
 
                 config.mappings.clear();
@@ -597,6 +657,7 @@ impl<
                         frame,
                         &mut self.od,
                         &mut self.event_queue,
+                        now,
                     );
                     self.event_overflow_count = self.event_overflow_count.saturating_add(dropped);
                 }
@@ -673,7 +734,7 @@ impl<
         let mut count = 0usize;
 
         for n in 0..TPDO {
-            if let Some(config) = self.node.tpdo.config(n) {
+            if let Some(config) = self.node.tpdo.config_slot(n) {
                 for mapping in config.mappings.iter() {
                     let mut old = [0u8; 8];
                     let mut new = [0u8; 8];
@@ -1084,6 +1145,7 @@ mod tests {
                 od_number: 0,
                 cob_id: 0x201,
                 transmission_type: 255,
+                deadline_ms: 0,
                 mappings: rpdo_mappings,
                 enabled: true,
             }],
@@ -1148,6 +1210,263 @@ mod tests {
         assert_eq!(node.od().output2, 0xBB);
     }
 
+    fn make_deadline_node() -> (Node<EventTestOd, 1, 1>, MailboxTransport<32, 32>) {
+        let mut rpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        rpdo_mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+
+        let config = NodeConfig::<1, 1> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            auto_start: true,
+            tpdo: [TpdoConfig::default()],
+            rpdo: [RpdoConfig {
+                od_number: 0,
+                cob_id: 0x201,
+                transmission_type: 255,
+                deadline_ms: 100,
+                mappings: rpdo_mappings,
+                enabled: true,
+            }],
+            identity: LssIdentity::default(),
+        };
+        let od = EventTestOd {
+            device_type: 0x191,
+            output1: 0,
+            output2: 0,
+            input1: 0,
+        };
+        let mut node: Node<EventTestOd, 1, 1> = Node::new(config, od);
+        let mut transport = MailboxTransport::<32, 32>::new();
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+        assert_eq!(node.state(), NmtState::Operational);
+        (node, transport)
+    }
+
+    #[test]
+    fn placeholder_pdos_not_addressable_and_unresolved_cob_id_is_none() {
+        let mut rpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        rpdo_mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+
+        let config = NodeConfig::<1, 2> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            auto_start: false,
+            // TPDO slot is a pure placeholder; RPDO slot 1 too.
+            tpdo: [TpdoConfig::default()],
+            rpdo: [
+                RpdoConfig {
+                    od_number: 0,
+                    cob_id: 0x201,
+                    transmission_type: 255,
+                    deadline_ms: 0,
+                    mappings: rpdo_mappings,
+                    enabled: true,
+                },
+                RpdoConfig::default(),
+            ],
+            identity: LssIdentity::default(),
+        };
+        let od = EventTestOd {
+            device_type: 0x191,
+            output1: 0,
+            output2: 0,
+            input1: 0,
+        };
+        let node: Node<EventTestOd, 1, 2> = Node::new(config, od);
+
+        // Declared RPDO1 is addressable; the padding slot is not "RPDO2".
+        assert_eq!(node.rpdo_cob_id(PdoNumber::of::<1>()).unwrap().raw(), 0x201);
+        assert!(node.rpdo_cob_id(PdoNumber::of::<2>()).is_none());
+        assert!(!node.rpdo_deadline_expired(PdoNumber::of::<2>()));
+        // Placeholder TPDO slot is not "TPDO1" either.
+        assert!(node.tpdo_cob_id(PdoNumber::of::<1>()).is_none());
+    }
+
+    #[test]
+    fn rpdo_deadline_initially_expired_without_events() {
+        let (mut node, mut transport) = make_deadline_node();
+
+        // Immediately after going Operational, before any reception: the
+        // level flag reads true (no in-deadline data exists), but no event
+        // is queued — the edge channel arms on first reception.
+        assert!(node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+        assert!(node.next_event().is_none());
+
+        // Still true and still event-free after arbitrary silence.
+        node.process(&mut transport, &TestClock(60_000_000));
+        assert!(node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+        assert!(node.next_event().is_none());
+
+        // First reception clears the flag.
+        transport
+            .store_received(CanFrame::new(0x201, &[0x01]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(60_010_000));
+        assert!(!node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+    }
+
+    #[test]
+    fn rpdo_deadline_fires_event_and_flag_after_silence() {
+        let (mut node, mut transport) = make_deadline_node();
+
+        // Silence before the first reception: level flag up, no events.
+        node.process(&mut transport, &TestClock(10_000_000));
+        assert!(node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+        assert!(node.next_event().is_none());
+
+        // First reception arms monitoring and clears the flag.
+        transport
+            .store_received(CanFrame::new(0x201, &[0x55]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(10_000_000));
+        assert!(!node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+        let evt = node.next_event().unwrap();
+        assert_eq!(evt.source, OdEventSource::Rpdo);
+
+        // 150 ms of silence > 100 ms deadline: flag + one event, value kept.
+        node.process(&mut transport, &TestClock(10_150_000));
+        assert!(node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+        assert_eq!(node.od().output1, 0x55);
+        let evt = node.next_event().unwrap();
+        assert_eq!(evt.index, 0x1400);
+        assert_eq!(evt.subindex, 0);
+        assert_eq!(evt.source, OdEventSource::RpdoDeadline);
+
+        // Edge-triggered: continued silence produces no further events.
+        node.process(&mut transport, &TestClock(10_300_000));
+        assert!(node.next_event().is_none());
+        assert!(node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+
+        // Reception clears the flag and re-arms; a second silence fires again.
+        transport
+            .store_received(CanFrame::new(0x201, &[0x66]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(10_400_000));
+        assert!(!node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+        assert_eq!(node.next_event().unwrap().source, OdEventSource::Rpdo);
+
+        node.process(&mut transport, &TestClock(10_600_000));
+        assert!(node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+        assert_eq!(
+            node.next_event().unwrap().source,
+            OdEventSource::RpdoDeadline
+        );
+    }
+
+    #[test]
+    fn rpdo_deadline_cleared_when_leaving_operational() {
+        let (mut node, mut transport) = make_deadline_node();
+
+        // Arm monitoring.
+        transport
+            .store_received(CanFrame::new(0x201, &[0x77]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(0));
+        while node.next_event().is_some() {}
+
+        // NMT Enter Pre-Operational: PDO traffic legitimately stops. The
+        // edge state is discarded; the level flag returns to "no fresh data".
+        transport
+            .store_received(CanFrame::new(0x000, &[0x80, 0x01]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(50_000));
+        assert_eq!(node.state(), NmtState::PreOperational);
+
+        // Long silence outside Operational: flag up, but no expiry events.
+        node.process(&mut transport, &TestClock(10_000_000));
+        assert!(node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+        assert!(node.next_event().is_none());
+
+        // Back to Operational: edge channel stays disarmed (no events) until
+        // the next frame; the level flag stays up meanwhile.
+        transport
+            .store_received(CanFrame::new(0x000, &[0x01, 0x01]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(10_050_000));
+        assert_eq!(node.state(), NmtState::Operational);
+        node.process(&mut transport, &TestClock(20_000_000));
+        assert!(node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+        assert!(node.next_event().is_none());
+
+        // A frame restores freshness.
+        transport
+            .store_received(CanFrame::new(0x201, &[0x78]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(20_010_000));
+        assert!(!node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+    }
+
+    #[test]
+    fn rpdo_deadline_event_index_does_not_truncate_slots_above_255() {
+        let mut rpdo: [RpdoConfig; 257] = core::array::from_fn(|_| RpdoConfig::default());
+
+        let mut mappings = heapless::Vec::<PdoMapping, 8>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+
+        // Slot 256 is RPDO257, whose comm parameter index is 0x1500.
+        rpdo[256] = RpdoConfig {
+            od_number: 257,
+            cob_id: 0x201,
+            transmission_type: 255,
+            deadline_ms: 100,
+            mappings,
+            enabled: true,
+        };
+
+        let config = NodeConfig::<0, 257> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            auto_start: true,
+            tpdo: [],
+            rpdo,
+            identity: LssIdentity::default(),
+        };
+
+        let od = EventTestOd {
+            device_type: 0x191,
+            output1: 0,
+            output2: 0,
+            input1: 0,
+        };
+        let mut node: Node<EventTestOd, 0, 257> = Node::new(config, od);
+        let mut transport = MailboxTransport::<32, 32>::new();
+
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+
+        transport
+            .store_received(CanFrame::new(0x201, &[0x55]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(1_000));
+        while node.next_event().is_some() {}
+
+        node.process(&mut transport, &TestClock(102_000));
+
+        let evt = node.next_event().unwrap();
+        assert_eq!(evt.source, OdEventSource::RpdoDeadline);
+        assert_eq!(evt.index, 0x1500);
+        assert!(node.rpdo_deadline_expired(PdoNumber::of::<257>()));
+    }
+
     #[test]
     fn event_queue_overflow_drops_oldest() {
         // Use a tiny queue of size 2
@@ -1176,6 +1495,7 @@ mod tests {
                 od_number: 0,
                 cob_id: 0x201,
                 transmission_type: 255,
+                deadline_ms: 0,
                 mappings: rpdo_mappings,
                 enabled: true,
             }],
@@ -1244,6 +1564,7 @@ mod tests {
                 od_number: 0,
                 cob_id: 0x201,
                 transmission_type: 255,
+                deadline_ms: 0,
                 mappings: rpdo_mappings,
                 enabled: true,
             }],

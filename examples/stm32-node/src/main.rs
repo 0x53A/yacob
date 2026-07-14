@@ -255,8 +255,8 @@ async fn main(spawner: Spawner) {
     info!(
         "node {} running — TPDO1 {:#05X}, RPDO1 {:#05X}",
         node_id.raw(),
-        node.tpdo_cob_id(0).unwrap(),
-        node.rpdo_cob_id(0).unwrap()
+        node.tpdo_cob_id(canopen_core::PdoNumber::of::<1>()).unwrap().raw(),
+        node.rpdo_cob_id(canopen_core::PdoNumber::of::<1>()).unwrap().raw()
     );
 
     NODE.init(node);

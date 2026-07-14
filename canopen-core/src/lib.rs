@@ -47,8 +47,8 @@ pub use od::{
     OdEventSource,
 };
 pub use pdo::engine::{
-    sync_cyclic, PdoConfigSource, TransmissionType, EVENT_DRIVEN, EVENT_DRIVEN_MANUFACTURER,
-    SYNC_ACYCLIC, SYNC_CYCLIC_1,
+    sync_cyclic, PdoConfigSource, PdoNumber, TransmissionType, EVENT_DRIVEN,
+    EVENT_DRIVEN_MANUFACTURER, SYNC_ACYCLIC, SYNC_CYCLIC_1,
 };
 pub use time::Clock;
 pub use transport::{CanError, CanFrame, MailboxTransport};

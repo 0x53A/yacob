@@ -439,6 +439,121 @@ class TestEmcy:
 
 
 # ---------------------------------------------------------------------------
+# RPDO deadline monitoring (CiA 301 event timer, comm param sub 5)
+# ---------------------------------------------------------------------------
+
+
+class TestRpdoDeadline:
+    """vcan_node reports EMCY 0x8250 (RPDO timeout) when a deadline-monitored
+    RPDO goes silent, and clears the error when reception resumes. The
+    deadline is configured at runtime via SDO (0x1400 sub 5), which must
+    happen in Pre-Operational (PDO comm params are locked while Operational).
+    """
+
+    RPDO1_DATA = struct.pack("<BH", 0x11, 0x2222)
+
+    def _send_rpdo1(self, bus):
+        bus.send(can.Message(arbitration_id=0x201, data=self.RPDO1_DATA, is_extended_id=False))
+
+    def _wait_for_emcy(self, bus, code, timeout=3.0, keepalive=None):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if keepalive:
+                keepalive()
+            msg = bus.recv(timeout=0.1)
+            if msg and msg.arbitration_id == 0x081 and len(msg.data) >= 8:
+                error_code = struct.unpack_from("<H", msg.data, 0)[0]
+                if error_code == code:
+                    return msg
+        return None
+
+    def test_deadline_timeout_emcy_and_recovery(self, raw_bus):
+        # Configure a 300 ms deadline on RPDO1 while Pre-Operational
+        raw_bus.send(can.Message(
+            arbitration_id=0x601,
+            data=bytes([0x2B, 0x00, 0x14, 0x05]) + struct.pack("<H", 300) + bytes(2),
+            is_extended_id=False,
+        ))
+        time.sleep(0.2)
+
+        # NMT Start, then arm monitoring with periodic RPDO1 frames
+        raw_bus.send(can.Message(arbitration_id=0x000, data=bytes([0x01, 0x01]), is_extended_id=False))
+        time.sleep(0.2)
+        for _ in range(5):
+            self._send_rpdo1(raw_bus)
+            # Drain while sending: no 0x8250 may appear during regular traffic
+            msg = raw_bus.recv(timeout=0.1)
+            if msg and msg.arbitration_id == 0x081:
+                code = struct.unpack_from("<H", msg.data, 0)[0]
+                assert code != 0x8250, "Deadline EMCY during regular traffic"
+
+        # Go silent: expect EMCY 0x8250 with PDO number 1 in the vendor bytes
+        msg = self._wait_for_emcy(raw_bus, 0x8250, timeout=3.0)
+        assert msg is not None, "No RPDO-timeout EMCY (0x8250) after silence"
+        assert msg.data[2] & 0x10, "Communication bit not set in error register"
+        assert struct.unpack_from("<H", msg.data, 3)[0] == 1, "Wrong PDO number in vendor bytes"
+
+        # Resume traffic: expect error-reset EMCY (0x0000)
+        msg = self._wait_for_emcy(
+            raw_bus, 0x0000, timeout=3.0, keepalive=lambda: self._send_rpdo1(raw_bus)
+        )
+        assert msg is not None, "No error-reset EMCY after reception resumed"
+
+    def test_no_emcy_before_first_reception(self, raw_bus):
+        """Silence before the first RPDO frame is not an error — monitoring
+        arms on first reception."""
+        raw_bus.send(can.Message(
+            arbitration_id=0x601,
+            data=bytes([0x2B, 0x00, 0x14, 0x05]) + struct.pack("<H", 200) + bytes(2),
+            is_extended_id=False,
+        ))
+        time.sleep(0.2)
+        raw_bus.send(can.Message(arbitration_id=0x000, data=bytes([0x01, 0x01]), is_extended_id=False))
+
+        msg = self._wait_for_emcy(raw_bus, 0x8250, timeout=1.5)
+        assert msg is None, "Deadline EMCY fired before any RPDO was received"
+
+
+# ---------------------------------------------------------------------------
+# PDO mapping mutability (immutable by default, CiA 301 dynamic mapping opt-in)
+# ---------------------------------------------------------------------------
+
+
+class TestPdoMapping:
+    """The PDO 1 pair has immutable mappings (SDO writes rejected, exported
+    as AccessType=const); the PDO 5 pair opts into dynamic mapping and can be
+    remapped in Pre-Operational via the CiA 301 unlock protocol."""
+
+    def test_immutable_mapping_rejects_writes(self, network, node):
+        # Node boots Pre-Operational, so this exercises the access type,
+        # not the Operational config lock.
+        with pytest.raises(canopen.SdoAbortedError):
+            node.sdo.download(0x1600, 0, bytes([0]))
+        with pytest.raises(canopen.SdoAbortedError):
+            node.sdo.download(0x1600, 1, struct.pack("<I", 0x62000108))
+
+    def test_remap_mutable_rpdo(self, network, node):
+        # Remap RPDO5 (0x1604) from output3 (0x6201:1 u16) to output1
+        # (0x6200:1 u8) using the unlock protocol, then verify data lands
+        # in the newly mapped object.
+        node.sdo.download(0x1604, 0, bytes([0]))                      # unlock
+        node.sdo.download(0x1604, 1, struct.pack("<I", 0x62000108))   # output1
+        node.sdo.download(0x1604, 0, bytes([1]))                      # relock
+
+        node.nmt.state = "OPERATIONAL"
+        time.sleep(0.2)
+
+        network.bus.send(can.Message(
+            arbitration_id=0x231, data=bytes([0x77]), is_extended_id=False,
+        ))
+        time.sleep(0.2)
+
+        assert node.sdo[0x6200][1].raw == 0x77
+        # The previously mapped object was not written
+        assert node.sdo[0x6201][1].raw == 0
+
+
+# ---------------------------------------------------------------------------
 # SDO stress
 # ---------------------------------------------------------------------------
 

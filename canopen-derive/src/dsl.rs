@@ -84,10 +84,29 @@ pub struct PdoDef {
     pub transmission_type: u8,
     /// Inhibit time in 100μs units (TPDO only).
     pub inhibit_time: u16,
-    /// Event timer in ms (TPDO only).
+    /// CiA 301 event timer in ms (comm param sub 5). For TPDOs this is the
+    /// transmission period (DSL: `event_timer = ...`); for RPDOs it is the
+    /// reception deadline for deadline monitoring (DSL: `deadline = ...`).
     pub event_timer: u16,
+    /// Whether the mapping record accepts SDO writes (CiA 301 "dynamic PDO
+    /// mapping"). Default is immutable: the PDO's meaning is a device
+    /// invariant.
+    pub mapping: MappingKind,
     /// Field names referencing previously defined OD entries.
     pub mappings: Vec<Ident>,
+}
+
+/// Mutability of a PDO's mapping record (DSL: `mapping = mutable|immutable`).
+///
+/// Immutable (the default) exposes the mapping entries as `const` — SDO
+/// writes are rejected, so what the PDO carries is a device invariant.
+/// Mutable is CiA 301 dynamic PDO mapping: the master may remap via the
+/// unlock protocol (write 0 to sub 0, rewrite entries, restore the count),
+/// outside Operational.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappingKind {
+    Immutable,
+    Mutable,
 }
 
 /// How a PDO's COB-ID is specified in the DSL (or an imported EDS).
@@ -352,6 +371,7 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
     let mut transmission_type: u8 = 255;
     let mut inhibit_time: u16 = 0;
     let mut event_timer: u16 = 0;
+    let mut mapping = MappingKind::Immutable;
 
     if input.peek(syn::token::Paren) {
         let params;
@@ -394,13 +414,76 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
                         cob_id = Some(CobIdSpec::Absolute(raw));
                     }
                 }
-                "transmission_type" => transmission_type = parse_transmission_type(&params)?,
-                "inhibit_time" => inhibit_time = parse_time_value(&params, &INHIBIT_TIME_SPEC)?,
-                "event_timer" => event_timer = parse_time_value(&params, &EVENT_TIMER_SPEC)?,
+                "transmission_type" => {
+                    transmission_type = parse_transmission_type(&params)?;
+                    if direction == PdoDirection::Rpdo
+                        && (transmission_type == 252 || transmission_type == 253)
+                    {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "RTR transmission types (252/253) are TPDO-only (CiA 301)",
+                        ));
+                    }
+                }
+                "inhibit_time" => {
+                    if direction == PdoDirection::Rpdo {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "inhibit_time applies to TPDOs only (CiA 301: RPDO comm param sub 3 is not used)",
+                        ));
+                    }
+                    inhibit_time = parse_time_value(&params, &INHIBIT_TIME_SPEC)?;
+                }
+                "event_timer" => {
+                    if direction == PdoDirection::Rpdo {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "for RPDOs use `deadline = ...`: CiA 301 defines the receive-side \
+                             event timer (comm param sub 5) as deadline monitoring — the maximum \
+                             allowed interval between receptions, not a transmission period",
+                        ));
+                    }
+                    event_timer = parse_time_value(&params, &EVENT_TIMER_SPEC)?;
+                }
+                "deadline" => {
+                    if direction == PdoDirection::Tpdo {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "for TPDOs use `event_timer = ...` (transmission period); \
+                             `deadline` is the RPDO-side reception monitoring parameter",
+                        ));
+                    }
+                    event_timer = parse_time_value(&params, &DEADLINE_SPEC)?;
+                }
+                "mapping" => {
+                    let kw: Ident = params.parse().map_err(|_| {
+                        params.error("expected `mapping = mutable` or `mapping = immutable`")
+                    })?;
+                    mapping = match kw.to_string().as_str() {
+                        "mutable" => MappingKind::Mutable,
+                        "immutable" => MappingKind::Immutable,
+                        other => {
+                            return Err(syn::Error::new(
+                                kw.span(),
+                                format!(
+                                    "unknown mapping kind `{other}`, expected `mutable` \
+                                     (CiA 301 dynamic PDO mapping, master may remap) or \
+                                     `immutable` (the default; mapping is a device invariant)"
+                                ),
+                            ));
+                        }
+                    };
+                }
                 other => {
+                    let expected = match direction {
+                        PdoDirection::Tpdo => {
+                            "cob_id, transmission_type, inhibit_time, event_timer, or mapping"
+                        }
+                        PdoDirection::Rpdo => "cob_id, transmission_type, deadline, or mapping",
+                    };
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("unknown PDO parameter `{other}`, expected cob_id, transmission_type, inhibit_time, or event_timer"),
+                        format!("unknown PDO parameter `{other}`, expected {expected}"),
                     ));
                 }
             }
@@ -448,6 +531,7 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
         transmission_type,
         inhibit_time,
         event_timer,
+        mapping,
         mappings,
     })
 }
@@ -515,6 +599,15 @@ static INHIBIT_TIME_SPEC: TimeSpec = TimeSpec {
 
 static EVENT_TIMER_SPEC: TimeSpec = TimeSpec {
     param: "event_timer",
+    unit_ns: 1_000_000, // 1 ms
+    unit_name: "1ms",
+};
+
+/// RPDO deadline monitoring — same wire field as the event timer (comm param
+/// sub 5, ms units), spec-named "event timer" but exposed as `deadline` in
+/// the DSL because that is its CiA 301-defined receive-side function.
+static DEADLINE_SPEC: TimeSpec = TimeSpec {
+    param: "deadline",
     unit_ns: 1_000_000, // 1 ms
     unit_name: "1ms",
 };

@@ -177,7 +177,11 @@ impl BridgeHub {
                         continue;
                     };
                     let (buf, len) = frame.encode();
-                    if ws_tx.send(ws::Message::binary(buf[..len].to_vec())).await.is_err() {
+                    if ws_tx
+                        .send(ws::Message::binary(buf[..len].to_vec()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -189,7 +193,9 @@ impl BridgeHub {
                 match msg {
                     ws::Message::Binary(data) => match WireFrame::decode(&data) {
                         Ok(frame) => {
-                            let _ = write_tx.send((frame.id_word(), frame.data().to_vec())).await;
+                            let _ = write_tx
+                                .send((frame.id_word(), frame.data().to_vec()))
+                                .await;
                         }
                         Err(e) => {
                             log::debug!("ignoring invalid binary frame: {e}");

@@ -91,7 +91,9 @@ fn parse_hex_or_dec(s: &str) -> Option<u32> {
 #[serde(tag = "cmd")]
 pub enum ClientCommand {
     #[serde(rename = "set_filter")]
-    SetFilter { filter: alloc::vec::Vec<FilterEntry> },
+    SetFilter {
+        filter: alloc::vec::Vec<FilterEntry>,
+    },
     #[serde(rename = "clear_filter")]
     ClearFilter,
 }

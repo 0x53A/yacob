@@ -267,7 +267,7 @@ SubNumber=9
 ParameterName=Number of Mapped Objects
 ObjectType=0x7
 DataType=0x0005
-AccessType=rw
+AccessType=const
 DefaultValue=0x2
 PDOMapping=0
 
@@ -275,7 +275,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 1
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x60000108
 PDOMapping=0
 
@@ -283,7 +283,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 2
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x60000210
 PDOMapping=0
 
@@ -291,7 +291,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 3
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -299,7 +299,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 4
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -307,7 +307,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 5
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -315,7 +315,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 6
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -323,7 +323,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 7
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -331,21 +331,21 @@ PDOMapping=0
 ParameterName=Mapping Entry 8
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
 [1400]
 ParameterName=RPDO1 Communication
 ObjectType=0x9
-SubNumber=3
+SubNumber=4
 
 [1400sub0]
 ParameterName=Number of Entries
 ObjectType=0x7
 DataType=0x0005
 AccessType=ro
-DefaultValue=2
+DefaultValue=5
 PDOMapping=0
 
 [1400sub1]
@@ -364,6 +364,14 @@ AccessType=rw
 DefaultValue=0xFF
 PDOMapping=0
 
+[1400sub5]
+ParameterName=Event Timer
+ObjectType=0x7
+DataType=0x0006
+AccessType=rw
+DefaultValue=0x0
+PDOMapping=0
+
 [1600]
 ParameterName=RPDO1 Mapping
 ObjectType=0x9
@@ -373,7 +381,7 @@ SubNumber=9
 ParameterName=Number of Mapped Objects
 ObjectType=0x7
 DataType=0x0005
-AccessType=rw
+AccessType=const
 DefaultValue=0x2
 PDOMapping=0
 
@@ -381,7 +389,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 1
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x62000108
 PDOMapping=0
 
@@ -389,7 +397,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 2
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x62000210
 PDOMapping=0
 
@@ -397,7 +405,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 3
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -405,7 +413,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 4
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -413,7 +421,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 5
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -421,7 +429,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 6
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -429,7 +437,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 7
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -437,7 +445,7 @@ PDOMapping=0
 ParameterName=Mapping Entry 8
 ObjectType=0x7
 DataType=0x0007
-AccessType=rw
+AccessType=const
 DefaultValue=0x00000000
 PDOMapping=0
 
@@ -566,14 +574,14 @@ PDOMapping=0
 [1404]
 ParameterName=RPDO5 Communication
 ObjectType=0x9
-SubNumber=3
+SubNumber=4
 
 [1404sub0]
 ParameterName=Number of Entries
 ObjectType=0x7
 DataType=0x0005
 AccessType=ro
-DefaultValue=2
+DefaultValue=5
 PDOMapping=0
 
 [1404sub1]
@@ -590,6 +598,14 @@ ObjectType=0x7
 DataType=0x0005
 AccessType=rw
 DefaultValue=0xFF
+PDOMapping=0
+
+[1404sub5]
+ParameterName=Event Timer
+ObjectType=0x7
+DataType=0x0006
+AccessType=rw
+DefaultValue=0x0
 PDOMapping=0
 
 [1604]

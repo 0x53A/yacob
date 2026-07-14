@@ -105,6 +105,70 @@ impl From<TransmissionType> for u8 {
     }
 }
 
+/// CANopen PDO number (1..=512) — the `N` in `tpdo[N]`/`rpdo[N]`, the number
+/// that determines the OD comm/mapping record addresses (`0x1400 + N - 1`,
+/// …), and the numbering used by every public API.
+///
+/// Not to be confused with the dense engine slot: with sparse declarations
+/// (`rpdo[1]` and `rpdo[79]`), RPDO79 sits in engine slot 1 but is always
+/// addressed as PDO number 79. Slots are an internal storage detail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PdoNumber(u16);
+
+impl PdoNumber {
+    pub const fn new(n: u16) -> Option<Self> {
+        if n >= 1 && n <= 512 {
+            Some(Self(n))
+        } else {
+            None
+        }
+    }
+
+    /// Compile-time-checked constructor for literals: `PdoNumber::of::<79>()`.
+    /// An out-of-range `N` fails the build, so no unwrap is needed.
+    pub const fn of<const N: u16>() -> Self {
+        const {
+            assert!(N >= 1 && N <= 512, "PDO number must be 1..=512");
+        }
+        Self(N)
+    }
+
+    /// The raw 1-based CANopen PDO number.
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+
+    /// 0-based offset from the comm/mapping record range base
+    /// (0x1400/0x1600/0x1800/0x1A00).
+    pub const fn od_offset(self) -> u16 {
+        self.0 - 1
+    }
+}
+
+impl TryFrom<u16> for PdoNumber {
+    type Error = ();
+    fn try_from(n: u16) -> Result<Self, ()> {
+        Self::new(n).ok_or(())
+    }
+}
+
+impl From<PdoNumber> for u16 {
+    fn from(n: PdoNumber) -> u16 {
+        n.0
+    }
+}
+
+/// CANopen number of the PDO stored in `slot`: the explicit `od_number` if
+/// set, else slot + 1 (dense default).
+pub(crate) fn pdo_number_for_slot(od_number: u16, slot: usize) -> u16 {
+    if od_number == 0 {
+        slot as u16 + 1
+    } else {
+        od_number
+    }
+}
+
 /// Source of PDO configuration — implemented by `object_dictionary!`-generated
 /// ODs, whose PDO declarations carry everything needed to build the configs.
 ///
@@ -153,6 +217,16 @@ impl<const N: usize> Default for TpdoConfig<N> {
     }
 }
 
+impl<const N: usize> TpdoConfig<N> {
+    /// A pure padding slot (`TpdoConfig::default()` in a hand-built array):
+    /// nothing about it was declared, so it is not addressable by PDO number.
+    /// Explicitly declared-but-disabled PDOs (nonzero `od_number` or COB-ID,
+    /// or mappings) are not placeholders.
+    pub(crate) fn is_placeholder(&self) -> bool {
+        self.od_number == 0 && self.cob_id == 0 && !self.enabled && self.mappings.is_empty()
+    }
+}
+
 /// Configuration for one RPDO (receive PDO).
 #[derive(Clone, Debug)]
 pub struct RpdoConfig<const MAX_MAPPINGS: usize = 8> {
@@ -164,6 +238,20 @@ pub struct RpdoConfig<const MAX_MAPPINGS: usize = 8> {
     pub cob_id: u16,
     /// Transmission type
     pub transmission_type: u8,
+    /// Deadline monitoring timeout in ms (the CiA 301 "event timer", comm
+    /// param sub 5 — the spec defines its RPDO function as deadline
+    /// monitoring). 0 = disabled.
+    ///
+    /// Monitoring arms on first reception; if no frame arrives within the
+    /// timeout, the slot's deadline-expired flag is set until the next
+    /// reception re-arms it. The mapped OD entries are never touched — they
+    /// keep the last received values.
+    ///
+    /// Configure with margin: the deadline must exceed the sender's period
+    /// enough to absorb bus jitter and the receiver's `process()` tick
+    /// (typically 1.5–2× the expected period, mirroring the heartbeat
+    /// producer/consumer convention).
+    pub deadline_ms: u16,
     /// PDO mappings
     pub mappings: Vec<PdoMapping, MAX_MAPPINGS>,
     /// Whether this PDO is enabled
@@ -176,9 +264,18 @@ impl<const N: usize> Default for RpdoConfig<N> {
             od_number: 0,
             cob_id: 0,
             transmission_type: 255,
+            deadline_ms: 0,
             mappings: Vec::new(),
             enabled: false,
         }
+    }
+}
+
+impl<const N: usize> RpdoConfig<N> {
+    /// A pure padding slot (`RpdoConfig::default()` in a hand-built array) —
+    /// see [`TpdoConfig::is_placeholder`].
+    pub(crate) fn is_placeholder(&self) -> bool {
+        self.od_number == 0 && self.cob_id == 0 && !self.enabled && self.mappings.is_empty()
     }
 }
 
@@ -198,12 +295,29 @@ impl<const N: usize> TpdoEngine<N> {
         }
     }
 
-    pub fn config(&self, index: usize) -> Option<&TpdoConfig> {
-        self.pdos.get(index)
+    /// Config of the TPDO with the given CANopen number (TPDO1 = 1), if declared.
+    pub fn config(&self, number: PdoNumber) -> Option<&TpdoConfig> {
+        self.slot_for_number(number).map(|s| &self.pdos[s])
     }
 
-    pub fn config_mut(&mut self, index: usize) -> Option<&mut TpdoConfig> {
-        self.pdos.get_mut(index)
+    /// Mutable config of the TPDO with the given CANopen number, if declared.
+    pub fn config_mut(&mut self, number: PdoNumber) -> Option<&mut TpdoConfig> {
+        self.slot_for_number(number).map(|s| &mut self.pdos[s])
+    }
+
+    pub(crate) fn config_slot(&self, slot: usize) -> Option<&TpdoConfig> {
+        self.pdos.get(slot)
+    }
+
+    pub(crate) fn config_slot_mut(&mut self, slot: usize) -> Option<&mut TpdoConfig> {
+        self.pdos.get_mut(slot)
+    }
+
+    fn slot_for_number(&self, number: PdoNumber) -> Option<usize> {
+        self.pdos.iter().enumerate().find_map(|(slot, c)| {
+            (!c.is_placeholder() && pdo_number_for_slot(c.od_number, slot) == number.raw())
+                .then_some(slot)
+        })
     }
 
     /// Called on SYNC reception. Returns frames to transmit for sync-triggered PDOs.
@@ -308,46 +422,90 @@ impl<const N: usize> TpdoEngine<N> {
 }
 
 /// RPDO engine. Manages up to N receive PDOs.
+///
+/// Optionally performs deadline monitoring per slot (CiA 301 RPDO event
+/// timer): when [`RpdoConfig::deadline_ms`] is nonzero, monitoring arms on
+/// the first received frame and [`check_deadlines`](Self::check_deadlines)
+/// flags slots whose silence exceeds the deadline. Detection latency equals
+/// the caller's polling period.
 pub struct RpdoEngine<const N: usize = 4> {
     pdos: [RpdoConfig; N],
+    /// Timestamp of the last received frame per slot (valid when `armed`).
+    last_rx_us: [u64; N],
+    /// Deadline monitoring armed: at least one frame received since
+    /// (re)entering Operational.
+    armed: [bool; N],
+    /// Deadline currently expired (set by `check_deadlines`, cleared by the
+    /// next reception). Mapped OD entries keep their last received values.
+    expired: [bool; N],
 }
 
 impl<const N: usize> RpdoEngine<N> {
     pub fn new(pdos: [RpdoConfig; N]) -> Self {
-        Self { pdos }
+        Self {
+            pdos,
+            last_rx_us: [0; N],
+            armed: [false; N],
+            expired: [false; N],
+        }
     }
 
-    pub fn config(&self, index: usize) -> Option<&RpdoConfig> {
-        self.pdos.get(index)
+    /// Config of the RPDO with the given CANopen number (RPDO1 = 1), if declared.
+    pub fn config(&self, number: PdoNumber) -> Option<&RpdoConfig> {
+        self.slot_for_number(number).map(|s| &self.pdos[s])
     }
 
-    pub fn config_mut(&mut self, index: usize) -> Option<&mut RpdoConfig> {
-        self.pdos.get_mut(index)
+    /// Mutable config of the RPDO with the given CANopen number, if declared.
+    pub fn config_mut(&mut self, number: PdoNumber) -> Option<&mut RpdoConfig> {
+        self.slot_for_number(number).map(|s| &mut self.pdos[s])
+    }
+
+    pub(crate) fn config_slot(&self, slot: usize) -> Option<&RpdoConfig> {
+        self.pdos.get(slot)
+    }
+
+    pub(crate) fn config_slot_mut(&mut self, slot: usize) -> Option<&mut RpdoConfig> {
+        self.pdos.get_mut(slot)
+    }
+
+    fn slot_for_number(&self, number: PdoNumber) -> Option<usize> {
+        self.pdos.iter().enumerate().find_map(|(slot, c)| {
+            (!c.is_placeholder() && pdo_number_for_slot(c.od_number, slot) == number.raw())
+                .then_some(slot)
+        })
     }
 
     /// Process an incoming CAN frame. If it matches an RPDO, write mapped values to OD.
     /// Returns true if the frame was consumed by an RPDO.
     ///
     /// Pushes one `OdEvent` per successfully written mapped entry.
+    /// `now_us` stamps the reception time for deadline monitoring; reception
+    /// re-arms an expired deadline.
     pub fn process<OD: ObjectDictionary, const EVT_QUEUE: usize>(
-        &self,
+        &mut self,
         frame: &CanFrame,
         od: &mut OD,
         events: &mut Deque<OdEvent, EVT_QUEUE>,
+        now_us: u64,
     ) -> bool {
-        self.process_with_drop_count(frame, od, events).0
+        self.process_with_drop_count(frame, od, events, now_us).0
     }
 
     pub fn process_with_drop_count<OD: ObjectDictionary, const EVT_QUEUE: usize>(
-        &self,
+        &mut self,
         frame: &CanFrame,
         od: &mut OD,
         events: &mut Deque<OdEvent, EVT_QUEUE>,
+        now_us: u64,
     ) -> (bool, u32) {
-        for pdo in &self.pdos {
+        for (slot, pdo) in self.pdos.iter().enumerate() {
             if !pdo.enabled || frame.raw_id() != pdo.cob_id {
                 continue;
             }
+
+            self.last_rx_us[slot] = now_us;
+            self.armed[slot] = true;
+            self.expired[slot] = false;
 
             let data = frame.data();
             let mut bit_offset: usize = 0;
@@ -382,6 +540,68 @@ impl<const N: usize> RpdoEngine<N> {
             return (true, dropped);
         }
         (false, 0)
+    }
+
+    /// Check all RPDOs for expired deadlines. Pushes the CANopen PDO number
+    /// of each *newly* expired RPDO into `out` (edge-triggered: fires once
+    /// per silence period and re-arms on the next reception).
+    ///
+    /// An RPDO is monitored when it is enabled, has a nonzero `deadline_ms`,
+    /// and has received at least one frame (monitoring starts on first
+    /// reception — before the counterpart ever spoke, its silence is not an
+    /// error). The comparison is strictly `elapsed > deadline`.
+    pub fn check_deadlines(&mut self, now_us: u64, out: &mut Vec<PdoNumber, N>) {
+        for slot in 0..N {
+            let pdo = &self.pdos[slot];
+            if !pdo.enabled || pdo.deadline_ms == 0 || !self.armed[slot] || self.expired[slot] {
+                continue;
+            }
+            let deadline_us = pdo.deadline_ms as u64 * 1000;
+            if now_us.wrapping_sub(self.last_rx_us[slot]) > deadline_us {
+                self.expired[slot] = true;
+                // Out-of-range od_number (>512 in a hand-built config) still
+                // sets the level flag but cannot be reported as a number.
+                if let Some(number) = PdoNumber::new(pdo_number_for_slot(pdo.od_number, slot)) {
+                    let _ = out.push(number);
+                }
+            }
+        }
+    }
+
+    /// Level query: does the RPDO with the given CANopen number lack an
+    /// in-deadline reception?
+    ///
+    /// `true` whenever a monitored RPDO (enabled, nonzero `deadline_ms`) has
+    /// no fresh data: **initially, before the first frame ever arrives**, and
+    /// again from expiry until the next reception. Unmonitored or undeclared
+    /// RPDOs always read `false`. The mapped OD entries keep their last
+    /// received values throughout.
+    ///
+    /// This is deliberately broader than the edge-triggered
+    /// [`check_deadlines`](Self::check_deadlines) channel, which only fires
+    /// after a counterpart that *has* spoken goes silent.
+    pub fn deadline_expired(&self, number: PdoNumber) -> bool {
+        match self.slot_for_number(number) {
+            Some(slot) => self.deadline_expired_slot(slot),
+            None => false,
+        }
+    }
+
+    pub(crate) fn deadline_expired_slot(&self, slot: usize) -> bool {
+        let Some(pdo) = self.pdos.get(slot) else {
+            return false;
+        };
+        pdo.enabled && pdo.deadline_ms > 0 && (!self.armed[slot] || self.expired[slot])
+    }
+
+    /// Forget all deadline monitoring state (arm flags, expiry flags).
+    ///
+    /// Called when leaving Operational: PDO traffic legitimately stops there,
+    /// so silence must not count against the deadline. Monitoring re-arms per
+    /// slot on the first reception after returning to Operational.
+    pub fn reset_deadline_monitoring(&mut self) {
+        self.armed = [false; N];
+        self.expired = [false; N];
     }
 }
 
@@ -523,11 +743,12 @@ mod tests {
             od_number: 0,
             cob_id: 0x201,
             transmission_type: 255,
+            deadline_ms: 0,
             mappings,
             enabled: true,
         };
 
-        let engine = RpdoEngine::new([config]);
+        let mut engine = RpdoEngine::new([config]);
         let mut od = PdoTestOd {
             input1: 0,
             input2: 0,
@@ -536,7 +757,7 @@ mod tests {
         let mut events: Deque<OdEvent, 16> = Deque::new();
 
         let frame = CanFrame::new(0x201, &[0xFF]).unwrap();
-        assert!(engine.process(&frame, &mut od, &mut events));
+        assert!(engine.process(&frame, &mut od, &mut events, 0));
         assert_eq!(od.output1, 0xFF);
 
         // Should have generated an RPDO event
@@ -547,8 +768,190 @@ mod tests {
 
         // Non-matching frame
         let frame2 = CanFrame::new(0x301, &[0x00]).unwrap();
-        assert!(!engine.process(&frame2, &mut od, &mut events));
+        assert!(!engine.process(&frame2, &mut od, &mut events, 0));
         assert_eq!(od.output1, 0xFF); // unchanged
+    }
+
+    fn deadline_test_engine(deadline_ms: u16) -> RpdoEngine<1> {
+        let mut mappings = Vec::<PdoMapping, 8>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        RpdoEngine::new([RpdoConfig {
+            od_number: 0,
+            cob_id: 0x201,
+            transmission_type: 255,
+            deadline_ms,
+            mappings,
+            enabled: true,
+        }])
+    }
+
+    fn deadline_test_od() -> PdoTestOd {
+        PdoTestOd {
+            input1: 0,
+            input2: 0,
+            output1: 0,
+        }
+    }
+
+    #[test]
+    fn pdo_number_bounds_and_offset() {
+        assert!(PdoNumber::new(0).is_none());
+        assert!(PdoNumber::new(513).is_none());
+        assert_eq!(PdoNumber::new(1).unwrap().raw(), 1);
+        assert_eq!(PdoNumber::of::<512>().od_offset(), 511);
+        assert_eq!(PdoNumber::try_from(79u16).unwrap(), PdoNumber::of::<79>());
+        assert_eq!(u16::from(PdoNumber::of::<79>()), 79);
+    }
+
+    #[test]
+    fn sparse_rpdo_addressed_by_number_not_slot() {
+        // Slot 0 = RPDO1, slot 1 = RPDO79 (sparse). Number-based lookups must
+        // hit the right config; undeclared numbers answer None.
+        let mut cfg1 = RpdoConfig {
+            od_number: 1,
+            cob_id: 0x201,
+            enabled: true,
+            ..RpdoConfig::default()
+        };
+        cfg1.deadline_ms = 0;
+        let cfg79 = RpdoConfig {
+            od_number: 79,
+            cob_id: 0x351,
+            deadline_ms: 100,
+            enabled: true,
+            ..RpdoConfig::default()
+        };
+        let engine = RpdoEngine::new([cfg1, cfg79]);
+
+        assert_eq!(engine.config(PdoNumber::of::<1>()).unwrap().cob_id, 0x201);
+        assert_eq!(engine.config(PdoNumber::of::<79>()).unwrap().cob_id, 0x351);
+        assert!(engine.config(PdoNumber::of::<2>()).is_none());
+
+        // RPDO79 is monitored and unarmed -> flag up; RPDO1 unmonitored.
+        assert!(engine.deadline_expired(PdoNumber::of::<79>()));
+        assert!(!engine.deadline_expired(PdoNumber::of::<1>()));
+    }
+
+    #[test]
+    fn placeholder_configs_not_addressable_by_number() {
+        // Hand-built capacity array: one real RPDO + one default() padding
+        // slot. The placeholder must not be addressable as "RPDO2".
+        let real = RpdoConfig {
+            od_number: 0,
+            cob_id: 0x201,
+            enabled: true,
+            ..RpdoConfig::default()
+        };
+        let engine = RpdoEngine::new([real, RpdoConfig::default()]);
+        assert!(engine.config(PdoNumber::of::<1>()).is_some());
+        assert!(engine.config(PdoNumber::of::<2>()).is_none());
+        assert!(!engine.deadline_expired(PdoNumber::of::<2>()));
+
+        // Explicitly declared-but-disabled PDOs stay addressable.
+        let disabled = TpdoConfig {
+            od_number: 3,
+            cob_id: 0x183,
+            enabled: false,
+            ..TpdoConfig::default()
+        };
+        let tengine = TpdoEngine::new([disabled]);
+        assert!(tengine.config(PdoNumber::of::<3>()).is_some());
+    }
+
+    #[test]
+    fn rpdo_deadline_not_armed_before_first_reception() {
+        let mut engine = deadline_test_engine(100);
+        let mut expired = Vec::<PdoNumber, 1>::new();
+
+        // No frame ever received: the level flag reads true (no in-deadline
+        // data exists yet), but the edge channel stays silent, however long —
+        // a counterpart that never spoke cannot "go silent".
+        assert!(engine.deadline_expired(PdoNumber::of::<1>()));
+        engine.check_deadlines(10_000_000, &mut expired);
+        assert!(expired.is_empty());
+        assert!(engine.deadline_expired(PdoNumber::of::<1>()));
+    }
+
+    #[test]
+    fn rpdo_deadline_edge_triggers_once_and_rearms_on_reception() {
+        let mut engine = deadline_test_engine(100);
+        let mut od = deadline_test_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+        let frame = CanFrame::new(0x201, &[0x11]).unwrap();
+
+        // First reception at t=0 arms monitoring.
+        assert!(engine.process(&frame, &mut od, &mut events, 0));
+
+        // Exactly at the deadline: not expired (strictly greater than).
+        let mut expired = Vec::<PdoNumber, 1>::new();
+        engine.check_deadlines(100_000, &mut expired);
+        assert!(expired.is_empty());
+
+        // Past the deadline: fires once...
+        engine.check_deadlines(100_001, &mut expired);
+        assert_eq!(expired.as_slice(), &[PdoNumber::of::<1>()]);
+        assert!(engine.deadline_expired(PdoNumber::of::<1>()));
+
+        // ...and only once per silence period (edge-triggered).
+        expired.clear();
+        engine.check_deadlines(200_000, &mut expired);
+        assert!(expired.is_empty());
+        assert!(engine.deadline_expired(PdoNumber::of::<1>())); // level flag stays up
+
+        // OD keeps the last received value throughout the timeout.
+        assert_eq!(od.output1, 0x11);
+
+        // Reception clears the flag and re-arms monitoring.
+        assert!(engine.process(&frame, &mut od, &mut events, 300_000));
+        assert!(!engine.deadline_expired(PdoNumber::of::<1>()));
+        engine.check_deadlines(350_000, &mut expired);
+        assert!(expired.is_empty());
+
+        // A second silence period fires again.
+        engine.check_deadlines(400_001, &mut expired);
+        assert_eq!(expired.as_slice(), &[PdoNumber::of::<1>()]);
+    }
+
+    #[test]
+    fn rpdo_deadline_disabled_when_timer_zero() {
+        let mut engine = deadline_test_engine(0);
+        let mut od = deadline_test_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+        let frame = CanFrame::new(0x201, &[0x22]).unwrap();
+
+        assert!(engine.process(&frame, &mut od, &mut events, 0));
+        let mut expired = Vec::<PdoNumber, 1>::new();
+        engine.check_deadlines(10_000_000, &mut expired);
+        assert!(expired.is_empty());
+        assert!(!engine.deadline_expired(PdoNumber::of::<1>()));
+    }
+
+    #[test]
+    fn rpdo_deadline_reset_disarms_monitoring() {
+        let mut engine = deadline_test_engine(100);
+        let mut od = deadline_test_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+        let frame = CanFrame::new(0x201, &[0x33]).unwrap();
+
+        assert!(engine.process(&frame, &mut od, &mut events, 0));
+        let mut expired = Vec::<PdoNumber, 1>::new();
+        engine.check_deadlines(200_000, &mut expired);
+        assert!(engine.deadline_expired(PdoNumber::of::<1>()));
+
+        // Leaving Operational: edge state cleared, silence no longer counts.
+        // The level flag reads true again (back to "no in-deadline data"),
+        // but no new edge fires until a frame arrives and traffic stops again.
+        engine.reset_deadline_monitoring();
+        assert!(engine.deadline_expired(PdoNumber::of::<1>()));
+        expired.clear();
+        engine.check_deadlines(10_000_000, &mut expired);
+        assert!(expired.is_empty());
     }
 
     #[test]

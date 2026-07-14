@@ -58,7 +58,10 @@ impl core::fmt::Display for DecodeError {
             Self::TooShort { actual } => write!(f, "message too short: {actual} bytes"),
             Self::BadDlc { dlc } => write!(f, "invalid DLC: {dlc}"),
             Self::LengthMismatch { expected, actual } => {
-                write!(f, "length mismatch: expected {expected} bytes, got {actual}")
+                write!(
+                    f,
+                    "length mismatch: expected {expected} bytes, got {actual}"
+                )
             }
         }
     }

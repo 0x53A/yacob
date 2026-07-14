@@ -16,6 +16,12 @@ pub enum EmcyErrorCode {
     MonitoringGeneric = 0x8000,
     CommunicationGeneric = 0x8100,
     ProtocolError = 0x8200,
+    /// RPDO timeout — deadline monitoring (event timer) expired without
+    /// reception. The stack never sends this automatically; applications
+    /// that detect an expired deadline (`Node::rpdo_deadline_expired`) may
+    /// report it via `Node::set_error`, conventionally with
+    /// `error_register::COMMUNICATION` and the PDO number in the vendor bytes.
+    RpdoTimeout = 0x8250,
     ExternalError = 0x9000,
     ManufacturerSpecific = 0xFF00,
 }

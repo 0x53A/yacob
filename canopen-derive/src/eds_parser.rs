@@ -1,5 +1,6 @@
 use crate::dsl::{
-    AccessKind, CobIdSpec, EntryKind, OdDefinition, OdEntry, PdoDef, PdoDirection, SubEntry, VarDef,
+    AccessKind, CobIdSpec, EntryKind, MappingKind, OdDefinition, OdEntry, PdoDef, PdoDirection,
+    SubEntry, VarDef,
 };
 use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
@@ -361,6 +362,11 @@ fn extract_pdos(
             .and_then(|v| parse_int(&v))
             .unwrap_or(0) as u8;
 
+        let mapping = mapping_kind_from_access(
+            get_section_props(&format!("{:04X}sub0", map_idx))
+                .and_then(|props| get_prop(props, "AccessType")),
+        );
+
         // Read mappings
         let mut mappings = Vec::new();
         for sub in 1..=map_count {
@@ -386,6 +392,7 @@ fn extract_pdos(
             transmission_type,
             inhibit_time,
             event_timer,
+            mapping,
             mappings,
         });
     }
@@ -409,10 +416,21 @@ fn extract_pdos(
             .and_then(|v| parse_int(&v))
             .unwrap_or(255) as u8;
 
+        // Sub 5 event timer = reception deadline monitoring for RPDOs
+        let event_timer = get_section_props(&format!("{:04X}sub5", comm_idx))
+            .and_then(|props| get_prop(props, "DefaultValue"))
+            .and_then(|v| parse_int(&v))
+            .unwrap_or(0) as u16;
+
         let map_count = get_section_props(&format!("{:04X}sub0", map_idx))
             .and_then(|props| get_prop(props, "DefaultValue"))
             .and_then(|v| parse_int(&v))
             .unwrap_or(0) as u8;
+
+        let mapping = mapping_kind_from_access(
+            get_section_props(&format!("{:04X}sub0", map_idx))
+                .and_then(|props| get_prop(props, "AccessType")),
+        );
 
         let mut mappings = Vec::new();
         for sub in 1..=map_count {
@@ -435,12 +453,24 @@ fn extract_pdos(
             cob_id,
             transmission_type,
             inhibit_time: 0,
-            event_timer: 0,
+            event_timer,
+            mapping,
             mappings,
         });
     }
 
     pdos
+}
+
+/// Map an EDS mapping-record AccessType to mapping mutability. `ro` and
+/// `const` both mean immutable; `rw`/`rww`/`rwr` mean CiA 301 dynamic
+/// mapping. A missing mapping section or AccessType stays mutable so
+/// comm-only placeholder PDOs remain remappable at runtime.
+fn mapping_kind_from_access(access: Option<String>) -> MappingKind {
+    match access.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("ro") | Some("const") => MappingKind::Immutable,
+        _ => MappingKind::Mutable,
+    }
 }
 
 /// Resolve a PDO mapping value (e.g. 0x60400010) to a field name in the OD,

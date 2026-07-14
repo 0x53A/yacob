@@ -325,8 +325,9 @@ fn write_pdo_eds(out: &mut String, pdo: &PdoDef, mappings: &[crate::codegen::Res
     let comm_idx = comm_base + (pdo.number - 1) as u16;
     let map_idx = map_base + (pdo.number - 1) as u16;
     let is_tpdo = pdo.direction == PdoDirection::Tpdo;
-    // TPDO comm params: sub 0-3 + 5; RPDO: sub 0-2.
-    let (sub_number, highest_sub) = if is_tpdo { (5, "5") } else { (3, "2") };
+    // TPDO comm params: sub 0-3 + 5; RPDO: sub 0-2 + 5 (event timer = deadline
+    // monitoring; sub 3 inhibit time is not used for RPDOs per CiA 301).
+    let (sub_number, highest_sub) = if is_tpdo { (5, "5") } else { (4, "5") };
 
     write_record_header(
         out,
@@ -371,21 +372,24 @@ fn write_pdo_eds(out: &mut String, pdo: &PdoDef, mappings: &[crate::codegen::Res
             "rw",
             &format!("0x{:X}", pdo.inhibit_time),
         );
-        write_pdo_sub(
-            out,
-            comm_idx,
-            5,
-            "Event Timer",
-            0x0006,
-            "rw",
-            &format!("0x{:X}", pdo.event_timer),
-        );
     }
+    // Sub 5 keeps the spec/EDS-conventional name "Event Timer" for tool
+    // interop; on the RPDO side its function is deadline monitoring.
+    write_pdo_sub(
+        out,
+        comm_idx,
+        5,
+        "Event Timer",
+        0x0006,
+        "rw",
+        &format!("0x{:X}", pdo.event_timer),
+    );
 
     write_pdo_mapping_eds(
         out,
         map_idx,
         &format!("{prefix}{} Mapping", pdo.number),
+        pdo.mapping,
         mappings,
     );
 }
@@ -394,8 +398,16 @@ fn write_pdo_mapping_eds(
     out: &mut String,
     index: u16,
     name: &str,
+    mapping_kind: MappingKind,
     mappings: &[crate::codegen::ResolvedMapping],
 ) {
+    // Immutable mapping (default): the record is a device invariant, so the
+    // exact CiA 306 access type is `const` (read-only, value never changes).
+    // Mutable = CiA 301 dynamic mapping, rw behind the unlock protocol.
+    let access = match mapping_kind {
+        MappingKind::Mutable => "rw",
+        MappingKind::Immutable => "const",
+    };
     write_record_header(out, index, name, 9);
     write_pdo_sub(
         out,
@@ -403,7 +415,7 @@ fn write_pdo_mapping_eds(
         0,
         "Number of Mapped Objects",
         0x0005,
-        "rw",
+        access,
         &format!("0x{:X}", mappings.len()),
     );
 
@@ -418,7 +430,7 @@ fn write_pdo_mapping_eds(
             sub,
             &format!("Mapping Entry {sub}"),
             0x0007,
-            "rw",
+            access,
             &default_value,
         );
     }

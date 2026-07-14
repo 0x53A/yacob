@@ -152,9 +152,7 @@ mod tests {
         assert!(decode_frame(&[0; 4]).is_err());
 
         // extended-id frame: valid on the wire, not valid for CANopen
-        let (buf, len) = WireFrame::new(CAN_EFF_FLAG | 0x123, &[1])
-            .unwrap()
-            .encode();
+        let (buf, len) = WireFrame::new(CAN_EFF_FLAG | 0x123, &[1]).unwrap().encode();
         assert!(decode_frame(&buf[..len]).is_err());
     }
 }

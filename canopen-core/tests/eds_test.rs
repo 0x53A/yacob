@@ -155,6 +155,11 @@ fn eds_pdo_device_rpdo_mapping() {
     assert_eq!(len, 1);
     assert_eq!(buf[0], 0xFF);
 
+    // RPDO1 comm sub 5: event timer (deadline monitoring) = 300 ms
+    let len = od.read(0x1400, 5, &mut buf).unwrap();
+    assert_eq!(len, 2);
+    assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x12C);
+
     // RPDO1 mapping count = 1
     let len = od.read(0x1600, 0, &mut buf).unwrap();
     assert_eq!(len, 1);
@@ -191,11 +196,35 @@ fn eds_pdo_device_configs() {
     assert_eq!(rpdo_cfgs[0].od_number, 1);
     assert_eq!(rpdo_cfgs[0].cob_id, 0x200 + 5);
     assert_eq!(rpdo_cfgs[0].transmission_type, 255);
+    assert_eq!(rpdo_cfgs[0].deadline_ms, 0x12C); // EDS sub 5 event timer
     assert_eq!(rpdo_cfgs[0].mappings.len(), 1);
 
     // RPDO2 is comm-only in the EDS (no mapping section): its comm params
     // must survive import so it can be remapped at runtime.
     assert_eq!(rpdo_cfgs[1].od_number, 2);
     assert_eq!(rpdo_cfgs[1].cob_id, 0x300 + 5);
+    assert_eq!(rpdo_cfgs[1].deadline_ms, 0); // no sub 5 in the EDS
     assert_eq!(rpdo_cfgs[1].mappings.len(), 0);
+}
+
+#[test]
+fn eds_import_mapping_mutability() {
+    let mut od = PdoDeviceOd::new();
+
+    // RPDO1/TPDO1 mapping records are AccessType=ro in the EDS -> immutable:
+    // neither the unlock (sub 0) nor the entries accept writes.
+    assert!(od.write(0x1600, 0, &[0]).is_err());
+    assert!(od.write(0x1600, 1, &0x6040_0010u32.to_le_bytes()).is_err());
+    assert!(od.write(0x1A00, 0, &[0]).is_err());
+
+    // TPDO7's mapping record is AccessType=rw -> CiA 301 dynamic mapping,
+    // remappable via the unlock protocol.
+    od.write(0x1A06, 0, &[0]).unwrap();
+    od.write(0x1A06, 1, &0x6041_0010u32.to_le_bytes()).unwrap();
+    od.write(0x1A06, 0, &[1]).unwrap();
+
+    // RPDO2 is comm-only (no mapping section in the EDS): it defaults to
+    // mutable, otherwise it could never be mapped at runtime.
+    od.write(0x1601, 1, &0x6040_0010u32.to_le_bytes()).unwrap();
+    od.write(0x1601, 0, &[1]).unwrap();
 }

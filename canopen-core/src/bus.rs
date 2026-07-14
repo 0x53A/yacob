@@ -53,7 +53,8 @@ impl WakerSet {
     fn wake_all(&self) {
         // Take the wakers out first — waking while holding the lock could
         // re-enter register() from an executor that polls inline.
-        let wakers: Vec<Waker> = std::mem::take(&mut *self.wakers.lock().expect("waker set poisoned"));
+        let wakers: Vec<Waker> =
+            std::mem::take(&mut *self.wakers.lock().expect("waker set poisoned"));
         for w in wakers {
             w.wake();
         }

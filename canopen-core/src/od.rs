@@ -57,6 +57,13 @@ pub enum OdEventSource {
     Sdo,
     /// Incoming RPDO mapped to this entry.
     Rpdo,
+    /// An RPDO deadline expired (CiA 301 event timer, comm param sub 5).
+    ///
+    /// Not an OD write: `index` is the RPDO's communication parameter index
+    /// (0x1400 + PDO number - 1), `subindex` is 0. The mapped OD entries keep
+    /// their last received values; query `Node::rpdo_deadline_expired` for
+    /// the level state. Fired once per silence period (edge-triggered).
+    RpdoDeadline,
 }
 
 /// Typed decoding of [`OdEvent`]s, implemented by `object_dictionary!`-generated ODs.

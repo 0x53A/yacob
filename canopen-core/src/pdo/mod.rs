@@ -1,7 +1,8 @@
 pub mod engine;
 
 pub use engine::{
-    PdoConfigSource, PdoMapping, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine, TransmissionType,
+    PdoConfigSource, PdoMapping, PdoNumber, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine,
+    TransmissionType,
 };
 
 /// Helper for generated code: create an empty Vec (avoids generated code importing heapless).

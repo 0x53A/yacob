@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use canopen_core::od::ObjectDictionary;
+use canopen_core::PdoNumber;
 use canopen_derive::object_dictionary;
 
 object_dictionary! {
@@ -302,11 +303,12 @@ object_dictionary! {
             [2] echo_out: u16 = 0, ro, pdo;
         };
 
-        tpdo[1](transmission_type = 255, inhibit_time = 500, event_timer = 1000) {
+        tpdo[1](transmission_type = 255, inhibit_time = 500, event_timer = 1000, mapping = mutable) {
             button,
             echo_out,
         };
-        rpdo[1](transmission_type = 255) {
+        // rpdo keeps the default: mapping = immutable
+        rpdo[1](transmission_type = 255, deadline = 250) {
             led,
             echo_in,
         };
@@ -370,11 +372,15 @@ fn pdo_od_has_rpdo_params() {
     let od = PdoTestOd::new();
     let mut buf = [0u8; 4];
 
-    // RPDO comm: 0x1400:0 = 2, 0x1400:2 = 255
+    // RPDO comm: 0x1400:0 = 5 (subs 3/4 absent), 0x1400:2 = 255
     assert_eq!(od.read(0x1400, 0, &mut buf).unwrap(), 1);
-    assert_eq!(buf[0], 2);
+    assert_eq!(buf[0], 5);
     assert_eq!(od.read(0x1400, 2, &mut buf).unwrap(), 1);
     assert_eq!(buf[0], 255);
+
+    // 0x1400:5 — deadline monitoring (event timer) = 250 ms
+    assert_eq!(od.read(0x1400, 5, &mut buf).unwrap(), 2);
+    assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 250);
 
     // RPDO mapping: 0x1600:0 = 2
     assert_eq!(od.read(0x1600, 0, &mut buf).unwrap(), 1);
@@ -413,6 +419,27 @@ fn pdo_od_mapping_lock_protocol() {
 
     // Locked again
     assert!(od.write(0x1A00, 1, &0u32.to_le_bytes()).is_err());
+}
+
+#[test]
+fn pdo_od_immutable_mapping_rejects_writes() {
+    let mut od = PdoTestOd::new();
+
+    // RPDO1 mapping is immutable (the default): neither the unlock (sub 0)
+    // nor the entries accept writes — the mapping is a device invariant.
+    assert!(od.write(0x1600, 0, &[0]).is_err());
+    assert!(od.write(0x1600, 1, &0x6200_0210u32.to_le_bytes()).is_err());
+
+    // Reads still work and metadata reports const access.
+    let mut buf = [0u8; 4];
+    assert_eq!(od.read(0x1600, 0, &mut buf).unwrap(), 1);
+    assert_eq!(buf[0], 2);
+    let meta = canopen_core::od::ObjectDictionary::lookup(&od, 0x1600, 1).unwrap();
+    assert_eq!(meta.access, canopen_core::od::AccessType::Const);
+
+    // The mutable TPDO mapping still reports rw.
+    let meta = canopen_core::od::ObjectDictionary::lookup(&od, 0x1A00, 1).unwrap();
+    assert_eq!(meta.access, canopen_core::od::AccessType::Rw);
 }
 
 #[test]
@@ -752,7 +779,7 @@ object_dictionary! {
         tpdo[2](transmission_type = sync_cyclic(4), event_timer = 0.1s) {
             echo_out,
         };
-        rpdo[1](transmission_type = event_driven) {
+        rpdo[1](transmission_type = event_driven, deadline = 0.5s) {
             led,
             echo_in,
         };
@@ -774,6 +801,7 @@ fn dsl_transmission_type_keywords_and_time_suffixes() {
 
     let rpdo = od.rpdo_configs(node_id);
     assert_eq!(rpdo[0].transmission_type, 255);
+    assert_eq!(rpdo[0].deadline_ms, 500); // 0.5s
 }
 
 #[test]
@@ -850,8 +878,8 @@ fn node_next_change_drains_typed() {
     // the SDO server would enqueue an event; here we check the typed drain on
     // an empty queue plus the COB-ID accessors.
     assert_eq!(node.next_change(), None);
-    assert_eq!(node.tpdo_cob_id(0), Some(0x181));
-    assert_eq!(node.rpdo_cob_id(0), Some(0x201));
+    assert_eq!(node.tpdo_cob_id(PdoNumber::of::<1>()).unwrap().raw(), 0x181);
+    assert_eq!(node.rpdo_cob_id(PdoNumber::of::<1>()).unwrap().raw(), 0x201);
 }
 
 #[test]
@@ -1002,7 +1030,9 @@ impl canopen_core::time::Clock for FixedClock {
     }
 }
 
-fn drain(transport: &mut canopen_core::transport::MailboxTransport<32, 32>) -> Vec<canopen_core::transport::CanFrame> {
+fn drain(
+    transport: &mut canopen_core::transport::MailboxTransport<32, 32>,
+) -> Vec<canopen_core::transport::CanFrame> {
     let mut out = Vec::new();
     while let Some(f) = transport.next_to_transmit() {
         out.push(f);
@@ -1044,7 +1074,9 @@ fn ext_pdo_node_resolves_and_exchanges_frames() {
     node.process(&mut transport, &FixedClock(1_000));
     let frames = drain(&mut transport);
     assert!(
-        frames.iter().any(|f| f.raw_id() == 0x1B1 && f.data() == 0xBEEFu16.to_le_bytes()),
+        frames
+            .iter()
+            .any(|f| f.raw_id() == 0x1B1 && f.data() == 0xBEEFu16.to_le_bytes()),
         "expected TPDO5 frame on 0x1B1, got {frames:?}"
     );
 
@@ -1076,11 +1108,95 @@ fn ext_pdo_survives_reset() {
     node.request_reset(ResetType::Communication);
     node.process(&mut transport, &FixedClock(1_000));
 
-    assert_eq!(node.tpdo_cob_id(0), Some(0x185));
-    assert_eq!(node.tpdo_cob_id(1), Some(0x1B1));
-    assert_eq!(node.tpdo_cob_id(2), Some(0x1C5));
-    assert_eq!(node.rpdo_cob_id(0), Some(0x231));
-    assert!(node.tpdo_engine().config(0).unwrap().enabled);
-    assert!(node.tpdo_engine().config(1).unwrap().enabled);
-    assert!(node.tpdo_engine().config(2).unwrap().enabled);
+    assert_eq!(node.tpdo_cob_id(PdoNumber::of::<1>()).unwrap().raw(), 0x185);
+    assert_eq!(node.tpdo_cob_id(PdoNumber::of::<5>()).unwrap().raw(), 0x1B1);
+    assert_eq!(node.tpdo_cob_id(PdoNumber::of::<6>()).unwrap().raw(), 0x1C5);
+    assert_eq!(node.rpdo_cob_id(PdoNumber::of::<5>()).unwrap().raw(), 0x231);
+    assert!(
+        node.tpdo_engine()
+            .config(PdoNumber::of::<1>())
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        node.tpdo_engine()
+            .config(PdoNumber::of::<5>())
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        node.tpdo_engine()
+            .config(PdoNumber::of::<6>())
+            .unwrap()
+            .enabled
+    );
+
+    // Sparse numbering: undeclared numbers answer None/false — never an
+    // off-by-slot neighbor. (TPDO2 is not declared; slot 1 holds TPDO5.)
+    assert!(node.tpdo_cob_id(PdoNumber::of::<2>()).is_none());
+    assert!(node.rpdo_cob_id(PdoNumber::of::<1>()).is_none()); // only RPDO5 exists
+    assert!(!node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+}
+
+#[test]
+fn rpdo_deadline_configured_at_runtime_via_sdo() {
+    use canopen_core::node::{Node, NodeConfig};
+    use canopen_core::od::OdEventSource;
+    use canopen_core::transport::{CanFrame, MailboxTransport};
+
+    let od = PdoTestOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(1).unwrap();
+    let config = NodeConfig {
+        auto_start: true,
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    // The DSL declared deadline = 250 ms; it lands in the config via the OD.
+    assert_eq!(config.rpdo[0].deadline_ms, 250);
+    let mut node: PdoTestOdNode = Node::new(config, od);
+    let mut transport = MailboxTransport::<32, 32>::new();
+    node.process(&mut transport, &FixedClock(0));
+    drain(&mut transport);
+
+    // PDO comm params are locked while Operational (CiA 301): drop to
+    // Pre-Operational, tighten the deadline to 50 ms via SDO (expedited
+    // write to 0x1400:5), then restart. Node::process resyncs the PDO
+    // engines after writes to 0x1400-0x1BFF.
+    transport
+        .store_received(CanFrame::new(0x000, &[0x80, 0x01]).unwrap())
+        .unwrap();
+    let sdo = CanFrame::new(0x601, &[0x2B, 0x00, 0x14, 0x05, 50, 0, 0, 0]).unwrap();
+    transport.store_received(sdo).unwrap();
+    node.process(&mut transport, &FixedClock(1_000));
+    let resp = drain(&mut transport);
+    assert_eq!(resp.len(), 1, "expected SDO response, got {resp:?}");
+    assert_eq!(resp[0].data()[0], 0x60, "SDO write aborted: {resp:?}");
+    assert_eq!(
+        node.rpdo_engine()
+            .config(PdoNumber::of::<1>())
+            .unwrap()
+            .deadline_ms,
+        50
+    );
+    transport
+        .store_received(CanFrame::new(0x000, &[0x01, 0x01]).unwrap())
+        .unwrap();
+    node.process(&mut transport, &FixedClock(1_500));
+    while node.next_event().is_some() {}
+
+    // Arm with one RPDO frame (led + echo_in), then 60 ms of silence.
+    transport
+        .store_received(CanFrame::new(0x201, &[0x01, 0x02, 0x03]).unwrap())
+        .unwrap();
+    node.process(&mut transport, &FixedClock(2_000));
+    while node.next_event().is_some() {}
+    assert!(!node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+
+    node.process(&mut transport, &FixedClock(62_100));
+    assert!(node.rpdo_deadline_expired(PdoNumber::of::<1>()));
+    let evt = node.next_event().unwrap();
+    assert_eq!(evt.index, 0x1400);
+    assert_eq!(evt.source, OdEventSource::RpdoDeadline);
+    // Last received values are retained while the deadline is expired.
+    assert_eq!(node.od().led, 0x01);
 }

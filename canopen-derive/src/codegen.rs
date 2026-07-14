@@ -437,6 +437,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         if rc > 0 {
             fields.push(quote! { pub rpdo_cob_id: [u32; #rc] });
             fields.push(quote! { pub rpdo_transmission_type: [u8; #rc] });
+            // CiA 301 event timer (comm param sub 5): RPDO deadline monitoring, ms.
+            fields.push(quote! { pub rpdo_deadline: [u16; #rc] });
             fields.push(quote! { pub rpdo_mapping_count: [u8; #rc] });
             fields.push(quote! { pub rpdo_mappings: [[u32; 8]; #rc] });
         }
@@ -492,6 +494,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                 })
                 .collect();
             let tt: Vec<u8> = rpdo_defs.iter().map(|p| p.transmission_type).collect();
+            let deadline: Vec<u16> = rpdo_defs.iter().map(|p| p.event_timer).collect();
             let map_counts: Vec<u8> = rpdo_resolved.iter().map(|m| m.len() as u8).collect();
             let map_arrays: Vec<TokenStream> = rpdo_resolved
                 .iter()
@@ -507,6 +510,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
 
             defaults.push(quote! { rpdo_cob_id: [#(#cob_ids),*] });
             defaults.push(quote! { rpdo_transmission_type: [#(#tt),*] });
+            defaults.push(quote! { rpdo_deadline: [#(#deadline),*] });
             defaults.push(quote! { rpdo_mapping_count: [#(#map_counts),*] });
             defaults.push(quote! { rpdo_mappings: [#(#map_arrays),*] });
         }
@@ -641,27 +645,41 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             }
         });
 
-        // Mapping params: sub0=count(rw), sub1..8=mapping(rw, guarded by count==0)
+        // Mapping params. Mutable (CiA 301 dynamic mapping): sub0=count(rw),
+        // sub1..8=mapping(rw, guarded by count==0 — the unlock protocol).
+        // Immutable (default): whole record is const, SDO writes rejected.
+        let mutable = pdo.mapping == MappingKind::Mutable;
+        let map_access = if mutable { "Rw" } else { "Const" };
         let map_count = tpdo_resolved[i].len() as u8;
         let max_map_sub = if map_count > 0 { map_count } else { 8 };
         pdo_sub_counts.insert(map_idx, max_map_sub);
 
         // sub 0: mapping count
-        all_meta_entries.push(gen_pdo_meta(map_idx, 0, "U8", "Rw", "mapping_count"));
+        all_meta_entries.push(gen_pdo_meta(map_idx, 0, "U8", map_access, "mapping_count"));
         pdo_read_arms
             .push(quote! { (#map_idx, 0) => { buf[0] = self.tpdo_mapping_count[#n]; Ok(1) } });
-        pdo_write_arms.push(quote! {
-            (#map_idx, 0) => {
-                if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
-                self.tpdo_mapping_count[#n] = data[0];
-                Ok(())
+        pdo_write_arms.push(if mutable {
+            quote! {
+                (#map_idx, 0) => {
+                    if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                    self.tpdo_mapping_count[#n] = data[0];
+                    Ok(())
+                }
             }
+        } else {
+            quote! { (#map_idx, 0) => Err(canopen_core::od::OdError::ReadOnly), }
         });
 
         // sub 1..8: mapping entries
         for sub in 1u8..=8 {
             let arr_idx = (sub - 1) as usize;
-            all_meta_entries.push(gen_pdo_meta(map_idx, sub, "U32", "Rw", "mapping_entry"));
+            all_meta_entries.push(gen_pdo_meta(
+                map_idx,
+                sub,
+                "U32",
+                map_access,
+                "mapping_entry",
+            ));
             pdo_read_arms.push(quote! {
                 (#map_idx, #sub) => {
                     let bytes = self.tpdo_mappings[#n][#arr_idx].to_le_bytes();
@@ -669,32 +687,37 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     Ok(4)
                 }
             });
-            pdo_write_arms.push(quote! {
-                (#map_idx, #sub) => {
-                    if self.tpdo_mapping_count[#n] != 0 {
-                        return Err(canopen_core::od::OdError::ReadOnly);
+            pdo_write_arms.push(if mutable {
+                quote! {
+                    (#map_idx, #sub) => {
+                        if self.tpdo_mapping_count[#n] != 0 {
+                            return Err(canopen_core::od::OdError::ReadOnly);
+                        }
+                        if data.len() != 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                        let mut arr = [0u8; 4];
+                        arr.copy_from_slice(&data[..4]);
+                        self.tpdo_mappings[#n][#arr_idx] = u32::from_le_bytes(arr);
+                        Ok(())
                     }
-                    if data.len() != 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
-                    let mut arr = [0u8; 4];
-                    arr.copy_from_slice(&data[..4]);
-                    self.tpdo_mappings[#n][#arr_idx] = u32::from_le_bytes(arr);
-                    Ok(())
                 }
+            } else {
+                quote! { (#map_idx, #sub) => Err(canopen_core::od::OdError::ReadOnly), }
             });
         }
     }
 
-    // RPDO: same pattern, fewer params (no inhibit_time, no event_timer)
+    // RPDO: no inhibit_time (sub 3 unused per CiA 301); sub 5 is the event
+    // timer acting as reception deadline monitoring.
     for (i, pdo) in rpdo_defs.iter().enumerate() {
         let comm_idx = 0x1400u16 + (pdo.number - 1) as u16;
         let map_idx = 0x1600u16 + (pdo.number - 1) as u16;
         let n = i;
 
-        pdo_sub_counts.insert(comm_idx, 2);
+        pdo_sub_counts.insert(comm_idx, 5);
 
-        // sub 0: highest subindex = 2
+        // sub 0: highest subindex = 5 (subs 3/4 absent, like sub 4 on TPDOs)
         all_meta_entries.push(gen_pdo_meta(comm_idx, 0, "U8", "Ro", "highest_subindex"));
-        pdo_read_arms.push(quote! { (#comm_idx, 0) => { buf[0] = 2; Ok(1) } });
+        pdo_read_arms.push(quote! { (#comm_idx, 0) => { buf[0] = 5; Ok(1) } });
         pdo_write_arms.push(quote! { (#comm_idx, 0) => Err(canopen_core::od::OdError::ReadOnly), });
 
         // sub 1: cob_id (u32)
@@ -728,25 +751,56 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             }
         });
 
-        // Mapping params
-        let map_count = rpdo_resolved[i].len() as u8;
-        let max_map_sub = if map_count > 0 { map_count } else { 8 };
-        pdo_sub_counts.insert(map_idx, max_map_sub);
-
-        all_meta_entries.push(gen_pdo_meta(map_idx, 0, "U8", "Rw", "mapping_count"));
-        pdo_read_arms
-            .push(quote! { (#map_idx, 0) => { buf[0] = self.rpdo_mapping_count[#n]; Ok(1) } });
+        // sub 5: event timer (u16) = reception deadline monitoring, ms
+        all_meta_entries.push(gen_pdo_meta(comm_idx, 5, "U16", "Rw", "deadline"));
+        pdo_read_arms.push(quote! {
+            (#comm_idx, 5) => {
+                let bytes = self.rpdo_deadline[#n].to_le_bytes();
+                buf[..2].copy_from_slice(&bytes);
+                Ok(2)
+            }
+        });
         pdo_write_arms.push(quote! {
-            (#map_idx, 0) => {
-                if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
-                self.rpdo_mapping_count[#n] = data[0];
+            (#comm_idx, 5) => {
+                if data.len() != 2 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                let mut arr = [0u8; 2];
+                arr.copy_from_slice(&data[..2]);
+                self.rpdo_deadline[#n] = u16::from_le_bytes(arr);
                 Ok(())
             }
         });
 
+        // Mapping params — same mutable/immutable split as TPDOs above.
+        let mutable = pdo.mapping == MappingKind::Mutable;
+        let map_access = if mutable { "Rw" } else { "Const" };
+        let map_count = rpdo_resolved[i].len() as u8;
+        let max_map_sub = if map_count > 0 { map_count } else { 8 };
+        pdo_sub_counts.insert(map_idx, max_map_sub);
+
+        all_meta_entries.push(gen_pdo_meta(map_idx, 0, "U8", map_access, "mapping_count"));
+        pdo_read_arms
+            .push(quote! { (#map_idx, 0) => { buf[0] = self.rpdo_mapping_count[#n]; Ok(1) } });
+        pdo_write_arms.push(if mutable {
+            quote! {
+                (#map_idx, 0) => {
+                    if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                    self.rpdo_mapping_count[#n] = data[0];
+                    Ok(())
+                }
+            }
+        } else {
+            quote! { (#map_idx, 0) => Err(canopen_core::od::OdError::ReadOnly), }
+        });
+
         for sub in 1u8..=8 {
             let arr_idx = (sub - 1) as usize;
-            all_meta_entries.push(gen_pdo_meta(map_idx, sub, "U32", "Rw", "mapping_entry"));
+            all_meta_entries.push(gen_pdo_meta(
+                map_idx,
+                sub,
+                "U32",
+                map_access,
+                "mapping_entry",
+            ));
             pdo_read_arms.push(quote! {
                 (#map_idx, #sub) => {
                     let bytes = self.rpdo_mappings[#n][#arr_idx].to_le_bytes();
@@ -754,17 +808,21 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     Ok(4)
                 }
             });
-            pdo_write_arms.push(quote! {
-                (#map_idx, #sub) => {
-                    if self.rpdo_mapping_count[#n] != 0 {
-                        return Err(canopen_core::od::OdError::ReadOnly);
+            pdo_write_arms.push(if mutable {
+                quote! {
+                    (#map_idx, #sub) => {
+                        if self.rpdo_mapping_count[#n] != 0 {
+                            return Err(canopen_core::od::OdError::ReadOnly);
+                        }
+                        if data.len() != 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                        let mut arr = [0u8; 4];
+                        arr.copy_from_slice(&data[..4]);
+                        self.rpdo_mappings[#n][#arr_idx] = u32::from_le_bytes(arr);
+                        Ok(())
                     }
-                    if data.len() != 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
-                    let mut arr = [0u8; 4];
-                    arr.copy_from_slice(&data[..4]);
-                    self.rpdo_mappings[#n][#arr_idx] = u32::from_le_bytes(arr);
-                    Ok(())
                 }
+            } else {
+                quote! { (#map_idx, #sub) => Err(canopen_core::od::OdError::ReadOnly), }
             });
         }
     }
@@ -1055,6 +1113,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                         od_number: #n,
                         cob_id,
                         transmission_type: self.rpdo_transmission_type[#i],
+                        deadline_ms: self.rpdo_deadline[#i],
                         mappings,
                         enabled,
                     }

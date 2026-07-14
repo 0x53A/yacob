@@ -103,14 +103,14 @@ DefaultValue=0
 [1400]
 ParameterName=RPDO1 Communication
 ObjectType=0x9
-SubNumber=3
+SubNumber=4
 
 [1400sub0]
 ParameterName=Number of Entries
 ObjectType=0x7
 DataType=0x0005
 AccessType=ro
-DefaultValue=2
+DefaultValue=5
 
 [1400sub1]
 ParameterName=COB-ID
@@ -125,6 +125,13 @@ ObjectType=0x7
 DataType=0x0005
 AccessType=rw
 DefaultValue=0xFF
+
+[1400sub5]
+ParameterName=Event Timer
+ObjectType=0x7
+DataType=0x0006
+AccessType=rw
+DefaultValue=0x12C
 
 [1401]
 ParameterName=RPDO2 Communication
@@ -286,7 +293,7 @@ SubNumber=2
 ParameterName=Number of Mapped Objects
 ObjectType=0x7
 DataType=0x0005
-AccessType=ro
+AccessType=rw
 DefaultValue=0x01
 
 [1A06sub1]
