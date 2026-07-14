@@ -1,6 +1,8 @@
 use crate::cobid::{CobId, NodeId, ParsedCobId};
 use crate::emcy::EmcyProducer;
-use crate::heartbeat::HeartbeatProducer;
+use crate::heartbeat::{
+    HeartbeatEvent, HeartbeatEventBuf, HeartbeatMonitor, HeartbeatMonitorState, HeartbeatProducer,
+};
 use crate::lss::{LssIdentity, LssSlave};
 use crate::nmt::{NmtCommand, NmtHandler, NmtState, NmtTransition};
 use crate::od::ObjectDictionary;
@@ -26,6 +28,10 @@ pub enum ResetType {
 /// Configuration for creating a Node.
 pub struct NodeConfig<const TPDO: usize = 4, const RPDO: usize = 4> {
     pub node_id: NodeId,
+    /// Producer heartbeat interval in ms (0 = disabled). Fallback only: if
+    /// the OD declares 0x1017 (Producer heartbeat time), that entry is the
+    /// source of truth — its value wins at init, and SDO writes to it change
+    /// the runtime period.
     pub heartbeat_interval_ms: u16,
     /// If true, the node transitions directly to Operational after boot,
     /// without waiting for an NMT Start command from a master.
@@ -78,6 +84,8 @@ pub struct Node<
     tpdo: TpdoEngine<TPDO>,
     rpdo: RpdoEngine<RPDO>,
     heartbeat: HeartbeatProducer,
+    hb_monitors: [Option<HeartbeatMonitor>; MAX_HEARTBEAT_MONITORS],
+    hb_event_queue: Deque<HeartbeatEvent, HB_EVENT_QUEUE>,
     emcy: EmcyProducer,
     lss: LssSlave,
     booted: bool,
@@ -88,6 +96,16 @@ pub struct Node<
     #[cfg(feature = "embassy")]
     event_signal: Option<&'static OdEventSignal>,
 }
+
+/// Maximum number of 0x1016 consumer heartbeat entries a [`Node`] monitors.
+/// OD entries beyond this many subindices are readable/writable via SDO but
+/// not monitored.
+pub const MAX_HEARTBEAT_MONITORS: usize = 8;
+
+/// Size of the typed heartbeat-consumer event queue (drained via
+/// [`Node::next_heartbeat_event`]). On overflow the oldest event is evicted
+/// and [`Node::events_dropped`] is incremented.
+const HB_EVENT_QUEUE: usize = 8;
 
 /// 0-based offset of a PDO's comm/mapping records from the range base
 /// (0x1400/0x1600/0x1800/0x1A00): explicit CANopen number if set, else the
@@ -118,6 +136,8 @@ impl<
             tpdo: TpdoEngine::new(config.tpdo),
             rpdo: RpdoEngine::new(config.rpdo),
             heartbeat: HeartbeatProducer::new(config.node_id, config.heartbeat_interval_ms),
+            hb_monitors: [const { None }; MAX_HEARTBEAT_MONITORS],
+            hb_event_queue: Deque::new(),
             emcy: EmcyProducer::new(config.node_id),
             lss: LssSlave::new(config.identity, config.node_id.raw()),
             booted: false,
@@ -129,7 +149,59 @@ impl<
             event_signal: None,
         };
         node.write_pdo_cob_ids_to_od();
+        node.sync_heartbeat_from_od(false);
         node
+    }
+
+    /// Re-read heartbeat configuration from the OD: producer heartbeat time
+    /// (0x1017) and consumer heartbeat entries (0x1016). Called at init,
+    /// after SDO writes, and on reset. If the OD has no 0x1017 entry, the
+    /// `NodeConfig` interval stays in effect.
+    ///
+    /// With `preserve_monitor_state`, monitors whose 0x1016 entry is
+    /// unchanged keep their runtime state (used for SDO rewrites, so touching
+    /// one entry doesn't restart the others). Without it, every monitor
+    /// restarts in `Waiting` (used for local resets: after reinitialization,
+    /// monitoring starts with the first heartbeat again).
+    fn sync_heartbeat_from_od(&mut self, preserve_monitor_state: bool) {
+        let mut buf2 = [0u8; 2];
+        if self.od.read(0x1017, 0, &mut buf2).is_ok() {
+            self.heartbeat.set_interval_ms(u16::from_le_bytes(buf2));
+        }
+
+        // 0x1016 subindex N ↔ monitor slot N-1. Entry format:
+        // bits 0..16 consumer time in ms (0 = disabled), bits 16..24 node id.
+        let mut buf4 = [0u8; 4];
+        for slot in 0..MAX_HEARTBEAT_MONITORS {
+            let configured = self
+                .od
+                .read(0x1016, (slot + 1) as u8, &mut buf4)
+                .ok()
+                .and_then(|_| {
+                    let raw = u32::from_le_bytes(buf4);
+                    let time_ms = (raw & 0xFFFF) as u16;
+                    if time_ms == 0 {
+                        return None;
+                    }
+                    NodeId::new(((raw >> 16) & 0xFF) as u8).map(|node| (node, time_ms))
+                });
+            self.hb_monitors[slot] = match (configured, self.hb_monitors[slot].take()) {
+                (Some((node, time)), Some(existing))
+                    if preserve_monitor_state
+                        && existing.node_id() == node
+                        && existing.timeout_ms() == time =>
+                {
+                    Some(existing)
+                }
+                (Some((node, time)), _) => Some(HeartbeatMonitor::new(node, time)),
+                (None, _) => None,
+            };
+        }
+    }
+
+    /// Current producer heartbeat interval in ms (0 = disabled).
+    pub fn heartbeat_interval_ms(&self) -> u16 {
+        self.heartbeat.interval_ms()
     }
 
     /// Mirror the resolved PDO COB-IDs into the OD comm-param entries.
@@ -304,12 +376,37 @@ impl<
         self.rpdo.deadline_expired(number)
     }
 
-    /// Number of events dropped due to event queue overflow.
+    /// Drain the next heartbeat-consumer event (0x1016 monitoring).
     ///
-    /// When the event queue (size `EVT_QUEUE`) is full, the oldest event is
-    /// evicted to make room for the new one. This counter tracks how many
-    /// events were lost. If this grows, increase `EVT_QUEUE` or drain events
-    /// faster.
+    /// Emitted for monitored nodes: monitoring started, remote NMT state
+    /// change, remote reset (boot-up frame), timeout, and recovery. The stack
+    /// only reports — reacting (e.g. EMCY 0x8130, stopping outputs) is
+    /// application policy.
+    pub fn next_heartbeat_event(&mut self) -> Option<HeartbeatEvent> {
+        self.hb_event_queue.pop_front()
+    }
+
+    /// Level query for a monitored node's heartbeat (0x1016 consumer).
+    ///
+    /// `Disabled` if no 0x1016 entry monitors that node;
+    /// `Waiting` until its first heartbeat arrives; use
+    /// [`HeartbeatMonitorState::is_alive`] as the freshness ("valid") flag,
+    /// analogous to [`rpdo_deadline_expired`](Self::rpdo_deadline_expired).
+    pub fn heartbeat_status(&self, node: NodeId) -> HeartbeatMonitorState {
+        self.hb_monitors
+            .iter()
+            .flatten()
+            .find(|m| m.node_id() == node)
+            .map(|m| m.state())
+            .unwrap_or(HeartbeatMonitorState::Disabled)
+    }
+
+    /// Number of events dropped due to event queue overflow (OD events and
+    /// heartbeat-consumer events combined).
+    ///
+    /// When a queue is full, the oldest event is evicted to make room for the
+    /// new one. This counter tracks how many events were lost. If this grows,
+    /// increase `EVT_QUEUE` or drain events faster.
     pub fn events_dropped(&self) -> u32 {
         self.event_overflow_count
     }
@@ -328,6 +425,7 @@ impl<
         self.booted = false;
         self.sdo_server.abort_transfer();
         self.sync_pdo_from_od();
+        self.sync_heartbeat_from_od(false);
         match reset_type {
             ResetType::Application => {
                 self.nmt = NmtHandler::new();
@@ -399,7 +497,6 @@ impl<
         }
 
         // Drain incoming frames
-        let events_before = self.event_queue.len();
         loop {
             match transport.receive() {
                 Ok(frame) => self.dispatch_frame(&frame, transport, now),
@@ -421,25 +518,6 @@ impl<
             let resp_cob = CobId::sdo_tx(self.node_id);
             if let Some(frame) = CanFrame::new(resp_cob.raw(), &seg_data) {
                 let _ = transport.transmit(&frame);
-            }
-        }
-
-        // Check if any SDO write targeted PDO parameter entries → resync engines
-        if self.event_queue.len() > events_before {
-            let mut pdo_changed = false;
-            // Peek at new events (they're at the tail)
-            for i in events_before..self.event_queue.len() {
-                if let Some(evt) = self.event_queue.get(i) {
-                    if (evt.index >= 0x1400 && evt.index <= 0x1BFF)
-                        && evt.source == crate::od::OdEventSource::Sdo
-                    {
-                        pdo_changed = true;
-                        break;
-                    }
-                }
-            }
-            if pdo_changed {
-                self.sync_pdo_from_od();
             }
         }
 
@@ -465,9 +543,22 @@ impl<
             self.rpdo.reset_deadline_monitoring();
         }
 
-        // Heartbeat
+        // Heartbeat production
         if let Some(hb) = self.heartbeat.poll(now, self.nmt.state()) {
             let _ = transport.transmit(&hb);
+        }
+
+        // Heartbeat consumer timeouts (0x1016). Unlike RPDO deadlines this is
+        // not gated on Operational: error control stays active in every
+        // post-boot NMT state.
+        for monitor in self.hb_monitors.iter_mut().flatten() {
+            if let Some(evt) = monitor.check_timeout(now) {
+                if self.hb_event_queue.is_full() {
+                    let _ = self.hb_event_queue.pop_front();
+                    self.event_overflow_count = self.event_overflow_count.saturating_add(1);
+                }
+                let _ = self.hb_event_queue.push_back(evt);
+            }
         }
 
         // EMCY (drain all pending frames — burst errors queue several)
@@ -487,7 +578,7 @@ impl<
 
         // Wake async waiters if events are pending
         #[cfg(feature = "embassy")]
-        if !self.event_queue.is_empty() {
+        if !self.event_queue.is_empty() || !self.hb_event_queue.is_empty() {
             if let Some(signal) = self.event_signal {
                 signal.signal(());
             }
@@ -596,6 +687,7 @@ impl<
                                 self.booted = false;
                                 self.sdo_server.abort_transfer();
                                 self.sync_pdo_from_od();
+                                self.sync_heartbeat_from_od(false);
                             }
                             NmtTransition::ResetCommunication => {
                                 // Reset only communication parameters (PDO, heartbeat).
@@ -603,6 +695,7 @@ impl<
                                 self.booted = false;
                                 self.sdo_server.abort_transfer();
                                 self.sync_pdo_from_od();
+                                self.sync_heartbeat_from_od(false);
                             }
                             _ => {}
                         }
@@ -636,6 +729,18 @@ impl<
                         // Queue was full before and after — if an event was pushed, one was dropped
                         self.event_overflow_count = self.event_overflow_count.saturating_add(1);
                     }
+                    // Resync runtime services whose config lives in the OD.
+                    // Signalled directly by the SDO server rather than via the
+                    // event queue: an overflowing queue must not be able to
+                    // swallow a config change.
+                    if let Some((index, _)) = self.sdo_server.take_committed_write() {
+                        if (0x1400..=0x1BFF).contains(&index) {
+                            self.sync_pdo_from_od();
+                        }
+                        if index == 0x1016 || index == 0x1017 {
+                            self.sync_heartbeat_from_od(true);
+                        }
+                    }
                 }
             }
 
@@ -660,6 +765,26 @@ impl<
                         now,
                     );
                     self.event_overflow_count = self.event_overflow_count.saturating_add(dropped);
+                }
+            }
+
+            ParsedCobId::Heartbeat(remote) => {
+                if frame.raw_dlc() >= 1 {
+                    let mut events = HeartbeatEventBuf::new();
+                    for monitor in self.hb_monitors.iter_mut().flatten() {
+                        if monitor.process(remote, frame.data()[0], now, &mut events) {
+                            // 0x1016 validation rejects duplicate node ids,
+                            // so at most one monitor matches.
+                            break;
+                        }
+                    }
+                    for evt in events {
+                        if self.hb_event_queue.is_full() {
+                            let _ = self.hb_event_queue.pop_front();
+                            self.event_overflow_count = self.event_overflow_count.saturating_add(1);
+                        }
+                        let _ = self.hb_event_queue.push_back(evt);
+                    }
                 }
             }
 
@@ -1785,5 +1910,470 @@ mod tests {
         node.od_mut().input1 = 0; // already 0
         node.process(&mut transport, &TestClock(1000));
         assert!(transport.next_to_transmit().is_none());
+    }
+
+    // --- OD with 0x1017 producer + 0x1016 consumer entries ---
+
+    #[derive(Clone)]
+    struct HbOd {
+        producer_time: u16,
+        consumer: [u32; 3],
+    }
+
+    static HB_META: &[OdEntryMeta] = &[
+        OdEntryMeta {
+            index: 0x1016,
+            subindex: 0,
+            data_type: DataType::U8,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "consumer_heartbeat_count",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x1016,
+            subindex: 1,
+            data_type: DataType::U32,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "consumer_heartbeat_1",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x1016,
+            subindex: 2,
+            data_type: DataType::U32,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "consumer_heartbeat_2",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x1016,
+            subindex: 3,
+            data_type: DataType::U32,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "consumer_heartbeat_3",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x1017,
+            subindex: 0,
+            data_type: DataType::U16,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "producer_heartbeat_time",
+            max_size: None,
+        },
+    ];
+
+    impl ObjectDictionary for HbOd {
+        fn lookup(&self, index: u16, subindex: u8) -> Option<&'static OdEntryMeta> {
+            HB_META
+                .iter()
+                .find(|e| e.index == index && e.subindex == subindex)
+        }
+        fn read(&self, index: u16, subindex: u8, buf: &mut [u8]) -> Result<usize, OdError> {
+            match (index, subindex) {
+                (0x1017, 0) => {
+                    buf[..2].copy_from_slice(&self.producer_time.to_le_bytes());
+                    Ok(2)
+                }
+                (0x1016, 0) => {
+                    buf[0] = 3;
+                    Ok(1)
+                }
+                (0x1016, sub @ 1..=3) => {
+                    buf[..4].copy_from_slice(&self.consumer[(sub as usize) - 1].to_le_bytes());
+                    Ok(4)
+                }
+                _ => Err(OdError::NotFound),
+            }
+        }
+        fn write(&mut self, index: u16, subindex: u8, data: &[u8]) -> Result<(), OdError> {
+            match (index, subindex) {
+                (0x1017, 0) if data.len() == 2 => {
+                    self.producer_time = u16::from_le_bytes(data.try_into().unwrap());
+                    Ok(())
+                }
+                (0x1016, sub @ 1..=3) if data.len() == 4 => {
+                    self.consumer[(sub as usize) - 1] =
+                        u32::from_le_bytes(data.try_into().unwrap());
+                    Ok(())
+                }
+                (0x1016 | 0x1017, _) => Err(OdError::DataTypeMismatch),
+                _ => Err(OdError::NotFound),
+            }
+        }
+        fn sub_count(&self, index: u16) -> Option<u8> {
+            match index {
+                0x1016 => Some(3),
+                _ => None,
+            }
+        }
+    }
+
+    fn make_hb_node(od: HbOd) -> (Node<HbOd, 1, 1>, MailboxTransport<32, 32>) {
+        let config = NodeConfig::<1, 1> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 1000,
+            auto_start: false,
+            tpdo: [TpdoConfig::default()],
+            rpdo: [RpdoConfig::default()],
+            identity: LssIdentity::default(),
+        };
+        (Node::new(config, od), MailboxTransport::<32, 32>::new())
+    }
+
+    /// Drain transmitted frames, returning the heartbeat state bytes seen.
+    fn drain_heartbeats(transport: &MailboxTransport<32, 32>) -> heapless::Vec<u8, 8> {
+        let mut out = heapless::Vec::new();
+        while let Some(frame) = transport.next_to_transmit() {
+            if frame.raw_id() == 0x701 {
+                let _ = out.push(frame.data()[0]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn producer_interval_from_od_wins_over_config() {
+        // NodeConfig says 1000ms, OD 0x1017 says 100ms — OD wins.
+        let (mut node, mut transport) = make_hb_node(HbOd {
+            producer_time: 100,
+            consumer: [0; 3],
+        });
+        assert_eq!(node.heartbeat_interval_ms(), 100);
+
+        node.process(&mut transport, &TestClock(0)); // boot frame
+        assert_eq!(drain_heartbeats(&transport), &[0x00]);
+
+        node.process(&mut transport, &TestClock(50_000));
+        assert!(drain_heartbeats(&transport).is_empty());
+
+        node.process(&mut transport, &TestClock(100_000));
+        assert_eq!(drain_heartbeats(&transport), &[0x7F]);
+    }
+
+    #[test]
+    fn sdo_write_1017_changes_cadence() {
+        let (mut node, mut transport) = make_hb_node(HbOd {
+            producer_time: 1000,
+            consumer: [0; 3],
+        });
+        node.process(&mut transport, &TestClock(0)); // boot
+        while transport.next_to_transmit().is_some() {}
+
+        // SDO expedited write: 0x1017:0 = 50ms
+        let req = CanFrame::new(0x601, &[0x2B, 0x17, 0x10, 0x00, 50, 0, 0, 0]).unwrap();
+        transport.store_received(req).unwrap();
+        node.process(&mut transport, &TestClock(10_000));
+        let resp = transport.next_to_transmit().unwrap();
+        assert_eq!(resp.raw_id(), 0x581);
+        assert_eq!(resp.data()[0], 0x60); // download response, not abort
+        assert_eq!(node.heartbeat_interval_ms(), 50);
+
+        // Old 1000ms cadence no longer applies; the next heartbeat is due
+        // 50ms after the boot frame (last-sent timestamp), then every 50ms.
+        node.process(&mut transport, &TestClock(20_000));
+        assert!(drain_heartbeats(&transport).is_empty());
+        node.process(&mut transport, &TestClock(50_000));
+        assert_eq!(drain_heartbeats(&transport), &[0x7F]);
+        node.process(&mut transport, &TestClock(70_000));
+        assert!(drain_heartbeats(&transport).is_empty());
+        node.process(&mut transport, &TestClock(100_000));
+        assert_eq!(drain_heartbeats(&transport), &[0x7F]);
+    }
+
+    #[test]
+    fn sdo_write_1017_zero_disables_producer() {
+        let (mut node, mut transport) = make_hb_node(HbOd {
+            producer_time: 100,
+            consumer: [0; 3],
+        });
+        node.process(&mut transport, &TestClock(0)); // boot
+        while transport.next_to_transmit().is_some() {}
+
+        let req = CanFrame::new(0x601, &[0x2B, 0x17, 0x10, 0x00, 0, 0, 0, 0]).unwrap();
+        transport.store_received(req).unwrap();
+        node.process(&mut transport, &TestClock(10_000));
+        let resp = transport.next_to_transmit().unwrap();
+        assert_eq!(resp.data()[0], 0x60);
+        assert_eq!(node.heartbeat_interval_ms(), 0);
+
+        for t in [100_000u64, 500_000, 5_000_000, 60_000_000] {
+            node.process(&mut transport, &TestClock(t));
+            assert!(drain_heartbeats(&transport).is_empty());
+        }
+    }
+
+    #[test]
+    fn consumer_monitors_node_from_od() {
+        let remote = NodeId::new(5).unwrap();
+        // Monitor node 5 with 200ms consumer time
+        let (mut node, mut transport) = make_hb_node(HbOd {
+            producer_time: 0,
+            consumer: [(5 << 16) | 200, 0, 0],
+        });
+        node.process(&mut transport, &TestClock(0)); // boot
+        while transport.next_to_transmit().is_some() {}
+
+        assert_eq!(
+            node.heartbeat_status(remote),
+            HeartbeatMonitorState::Waiting
+        );
+        // Nothing monitored for other nodes
+        assert_eq!(
+            node.heartbeat_status(NodeId::new(6).unwrap()),
+            HeartbeatMonitorState::Disabled
+        );
+
+        // Configured-but-silent node never times out (monitoring not started)
+        node.process(&mut transport, &TestClock(10_000_000));
+        assert!(node.next_heartbeat_event().is_none());
+
+        // First heartbeat starts monitoring
+        let hb = CanFrame::new(0x705, &[0x05]).unwrap();
+        transport.store_received(hb).unwrap();
+        node.process(&mut transport, &TestClock(10_100_000));
+        assert_eq!(
+            node.next_heartbeat_event(),
+            Some(HeartbeatEvent::Started {
+                node: remote,
+                state: NmtState::Operational
+            })
+        );
+        assert!(node.heartbeat_status(remote).is_alive());
+
+        // 150ms later: still fresh
+        node.process(&mut transport, &TestClock(10_250_000));
+        assert!(node.next_heartbeat_event().is_none());
+
+        // 250ms after last heartbeat: timeout
+        node.process(&mut transport, &TestClock(10_350_000));
+        assert_eq!(
+            node.next_heartbeat_event(),
+            Some(HeartbeatEvent::Timeout { node: remote })
+        );
+        assert!(!node.heartbeat_status(remote).is_alive());
+
+        // Heartbeat resumes: recovery
+        let hb = CanFrame::new(0x705, &[0x05]).unwrap();
+        transport.store_received(hb).unwrap();
+        node.process(&mut transport, &TestClock(10_400_000));
+        assert_eq!(
+            node.next_heartbeat_event(),
+            Some(HeartbeatEvent::Recovered {
+                node: remote,
+                state: NmtState::Operational
+            })
+        );
+        assert!(node.heartbeat_status(remote).is_alive());
+    }
+
+    #[test]
+    fn consumer_configured_at_runtime_via_sdo() {
+        let remote = NodeId::new(9).unwrap();
+        let (mut node, mut transport) = make_hb_node(HbOd {
+            producer_time: 0,
+            consumer: [0; 3],
+        });
+        node.process(&mut transport, &TestClock(0)); // boot
+        while transport.next_to_transmit().is_some() {}
+        assert_eq!(
+            node.heartbeat_status(remote),
+            HeartbeatMonitorState::Disabled
+        );
+
+        // 0x1016:1 = node 9, 100ms
+        let value: u32 = (9 << 16) | 100;
+        let mut req = [0x23, 0x16, 0x10, 0x01, 0, 0, 0, 0];
+        req[4..8].copy_from_slice(&value.to_le_bytes());
+        transport
+            .store_received(CanFrame::new(0x601, &req).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(10_000));
+        let resp = transport.next_to_transmit().unwrap();
+        assert_eq!(resp.data()[0], 0x60);
+        assert_eq!(
+            node.heartbeat_status(remote),
+            HeartbeatMonitorState::Waiting
+        );
+
+        // Boot-up frame also starts monitoring
+        transport
+            .store_received(CanFrame::new(0x709, &[0x00]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(20_000));
+        assert_eq!(
+            node.next_heartbeat_event(),
+            Some(HeartbeatEvent::Started {
+                node: remote,
+                state: NmtState::Initializing
+            })
+        );
+
+        // Rewriting the same value must not reset the running monitor
+        transport
+            .store_received(CanFrame::new(0x601, &req).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(30_000));
+        let resp = transport.next_to_transmit().unwrap();
+        assert_eq!(resp.data()[0], 0x60);
+        assert!(node.heartbeat_status(remote).is_alive());
+
+        // Writing 0 disables the monitor
+        let req0 = [0x23, 0x16, 0x10, 0x01, 0, 0, 0, 0];
+        transport
+            .store_received(CanFrame::new(0x601, &req0).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(40_000));
+        let resp = transport.next_to_transmit().unwrap();
+        assert_eq!(resp.data()[0], 0x60);
+        assert_eq!(
+            node.heartbeat_status(remote),
+            HeartbeatMonitorState::Disabled
+        );
+    }
+
+    /// Expect an SDO abort with the given code in response to a 0x1016 write.
+    fn expect_1016_abort(value: u32, subindex: u8, existing: [u32; 3], code: u32) {
+        let (mut node, mut transport) = make_hb_node(HbOd {
+            producer_time: 0,
+            consumer: existing,
+        });
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+
+        let mut req = [0x23, 0x16, 0x10, subindex, 0, 0, 0, 0];
+        req[4..8].copy_from_slice(&value.to_le_bytes());
+        transport
+            .store_received(CanFrame::new(0x601, &req).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(10_000));
+        let resp = transport.next_to_transmit().unwrap();
+        assert_eq!(
+            resp.data()[0],
+            0x80,
+            "expected abort for value {value:#010X}"
+        );
+        assert_eq!(
+            u32::from_le_bytes(resp.data()[4..8].try_into().unwrap()),
+            code
+        );
+    }
+
+    #[test]
+    fn invalid_1016_writes_abort() {
+        // Node id 0 with non-zero time
+        expect_1016_abort(100, 1, [0; 3], 0x0609_0030);
+        // Node id > 127
+        expect_1016_abort((200 << 16) | 100, 1, [0; 3], 0x0609_0030);
+        // Reserved bits set
+        expect_1016_abort(0xFF00_0000 | (5 << 16) | 100, 1, [0; 3], 0x0609_0030);
+        // Reserved bits are rejected even on a disabled entry (time 0)
+        expect_1016_abort(0x0100_0000, 1, [0; 3], 0x0609_0030);
+        // Same node monitored by another active entry
+        expect_1016_abort((5 << 16) | 300, 2, [(5 << 16) | 200, 0, 0], 0x0604_0043);
+    }
+
+    #[test]
+    fn valid_1016_overwrite_of_same_slot_is_not_a_duplicate() {
+        // Changing the timeout of the entry that already monitors the node
+        // must be allowed (the duplicate check skips the written subindex).
+        let remote = NodeId::new(5).unwrap();
+        let (mut node, mut transport) = make_hb_node(HbOd {
+            producer_time: 0,
+            consumer: [(5 << 16) | 200, 0, 0],
+        });
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+
+        let value: u32 = (5 << 16) | 500;
+        let mut req = [0x23, 0x16, 0x10, 0x01, 0, 0, 0, 0];
+        req[4..8].copy_from_slice(&value.to_le_bytes());
+        transport
+            .store_received(CanFrame::new(0x601, &req).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(10_000));
+        let resp = transport.next_to_transmit().unwrap();
+        assert_eq!(resp.data()[0], 0x60);
+        assert_eq!(
+            node.heartbeat_status(remote),
+            HeartbeatMonitorState::Waiting
+        );
+    }
+
+    #[test]
+    fn config_resync_survives_full_event_queue() {
+        // The runtime resync is signalled directly by the SDO server; a full
+        // OD event queue (default EVT_QUEUE = 16, oldest evicted on push)
+        // must not swallow a 0x1017 config change.
+        let (mut node, mut transport) = make_hb_node(HbOd {
+            producer_time: 1000,
+            consumer: [0; 3],
+        });
+        node.process(&mut transport, &TestClock(0)); // boot
+        while transport.next_to_transmit().is_some() {}
+
+        // Fill the event queue past capacity without draining: 20 distinct
+        // writes to 0x1016:1 (rewriting the same slot is always valid).
+        for i in 0..20u32 {
+            let value: u32 = (9 << 16) | (100 + i);
+            let mut req = [0x23, 0x16, 0x10, 0x01, 0, 0, 0, 0];
+            req[4..8].copy_from_slice(&value.to_le_bytes());
+            transport
+                .store_received(CanFrame::new(0x601, &req).unwrap())
+                .unwrap();
+            node.process(&mut transport, &TestClock(1_000 + i as u64));
+            while transport.next_to_transmit().is_some() {}
+        }
+        assert!(node.events_dropped() > 0, "queue should have overflowed");
+
+        // Queue is full — the 0x1017 write must still reach the producer.
+        let req = CanFrame::new(0x601, &[0x2B, 0x17, 0x10, 0x00, 77, 0, 0, 0]).unwrap();
+        transport.store_received(req).unwrap();
+        node.process(&mut transport, &TestClock(50_000));
+        let resp = transport.next_to_transmit().unwrap();
+        assert_eq!(resp.data()[0], 0x60);
+        assert_eq!(node.heartbeat_interval_ms(), 77);
+    }
+
+    #[test]
+    fn local_reset_restarts_heartbeat_monitors() {
+        // SDO rewrites of an unchanged entry keep monitor state, but a local
+        // reset reinitializes: monitoring starts with the first heartbeat
+        // again.
+        let remote = NodeId::new(5).unwrap();
+        let (mut node, mut transport) = make_hb_node(HbOd {
+            producer_time: 0,
+            consumer: [(5 << 16) | 200, 0, 0],
+        });
+        node.process(&mut transport, &TestClock(0)); // boot
+        while transport.next_to_transmit().is_some() {}
+
+        transport
+            .store_received(CanFrame::new(0x705, &[0x05]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(10_000));
+        assert!(node.heartbeat_status(remote).is_alive());
+
+        node.request_reset(ResetType::Communication);
+        assert_eq!(
+            node.heartbeat_status(remote),
+            HeartbeatMonitorState::Waiting
+        );
+
+        // No stale timeout after the reset — the monitor is waiting again.
+        node.process(&mut transport, &TestClock(20_000)); // re-boot
+        while transport.next_to_transmit().is_some() {}
+        node.process(&mut transport, &TestClock(10_000_000));
+        while let Some(evt) = node.next_heartbeat_event() {
+            assert!(
+                !matches!(evt, HeartbeatEvent::Timeout { .. }),
+                "timeout fired from pre-reset monitor state"
+            );
+        }
     }
 }

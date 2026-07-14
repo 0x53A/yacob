@@ -28,6 +28,9 @@ object_dictionary! {
         [0x1000] device_type: u32 = 0x0000_0191, ro;
         [0x1001] error_register: u8 = 0x00, ro;
         [0x1017] heartbeat_time: u16 = 500, rw;
+        // Consumer heartbeat: up to 4 monitored producers, configured via SDO
+        // ((node_id << 16) | timeout_ms). All disabled by default.
+        [0x1016] consumer_heartbeat: array<u32, 4>, rw;
         [0x1018] identity: record {
             [1] vendor_id: u32 = 0x0000_CAFE, ro;
             [2] product_code: u32 = 0x0001, ro;
@@ -166,6 +169,25 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
                     0x00 => node.clear_all_errors(),
                     _ => {}
                 }
+            }
+        }
+
+        // Heartbeat consumer (0x1016) is monitored by the stack, but the
+        // consequences are app policy: report EMCY 0x8130 with the failed
+        // node id on timeout, clear when its heartbeat resumes.
+        while let Some(evt) = node.next_heartbeat_event() {
+            match evt {
+                canopen_core::HeartbeatEvent::Timeout { node: remote } => {
+                    node.set_error(
+                        canopen_core::EmcyErrorCode::HeartbeatError as u16,
+                        canopen_core::error_register::COMMUNICATION,
+                        &[remote.raw()],
+                    );
+                }
+                canopen_core::HeartbeatEvent::Recovered { .. } => {
+                    node.clear_all_errors();
+                }
+                _ => {}
             }
         }
 

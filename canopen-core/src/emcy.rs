@@ -15,6 +15,13 @@ pub enum EmcyErrorCode {
     AdditionalModulesGeneric = 0x7000,
     MonitoringGeneric = 0x8000,
     CommunicationGeneric = 0x8100,
+    /// Life guard error or heartbeat error — a monitored node's heartbeat
+    /// timed out (0x1016 consumer). The stack never sends this automatically
+    /// (CANopenNode and others do — if auto-EMCY is ever added, this is the
+    /// prime candidate); applications react to `HeartbeatEvent::Timeout` and
+    /// report it via `Node::set_error`, conventionally with
+    /// `error_register::COMMUNICATION` and the node id in the vendor bytes.
+    HeartbeatError = 0x8130,
     ProtocolError = 0x8200,
     /// RPDO timeout — deadline monitoring (event timer) expired without
     /// reception. The stack never sends this automatically; applications

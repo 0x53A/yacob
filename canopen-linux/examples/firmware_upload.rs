@@ -37,7 +37,7 @@
 //!    SDO transfers needed. Making this a const generic (`SdoClient<const BUF: usize>`)
 //!    would help — though the server's 889-byte limit is the real ceiling.
 //!
-//! 5. **HeartbeatConsumer not async-friendly**: `HeartbeatConsumer` tracks state
+//! 5. **HeartbeatMonitor not async-friendly**: `HeartbeatMonitor` tracks state
 //!    and timeouts but requires polling. For an async master that awaits heartbeats
 //!    before starting operations, an `async fn wait_heartbeat()` would help.
 //!    The `wait_heartbeat()` in sdo_helpers is blocking, not truly async.

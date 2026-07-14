@@ -8,11 +8,12 @@ VendorName=
 ProductName=DemoOd
 
 [MandatoryObjects]
-SupportedObjects=4
+SupportedObjects=5
 1=0x1000
 2=0x1001
-3=0x1017
-4=0x1018
+3=0x1016
+4=0x1017
+5=0x1018
 
 [OptionalObjects]
 SupportedObjects=8
@@ -58,6 +59,51 @@ ObjectType=0x7
 DataType=0x0006
 AccessType=rw
 DefaultValue=500
+PDOMapping=0
+
+[1016]
+ParameterName=consumer_heartbeat
+ObjectType=0x8
+SubNumber=5
+
+[1016sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=4
+PDOMapping=0
+
+[1016sub1]
+ParameterName=consumer_heartbeat
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0
+PDOMapping=0
+
+[1016sub2]
+ParameterName=consumer_heartbeat
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0
+PDOMapping=0
+
+[1016sub3]
+ParameterName=consumer_heartbeat
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0
+PDOMapping=0
+
+[1016sub4]
+ParameterName=consumer_heartbeat
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0
 PDOMapping=0
 
 [1018]

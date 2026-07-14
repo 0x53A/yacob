@@ -35,6 +35,7 @@ pub use cobid::{CobId, NodeId, ParsedCobId};
 pub use datatypes::DataType;
 pub use emcy::{build_emcy_frame, error_register, EmcyErrorCode, EmcyMessage, EmcyProducer};
 pub use events::CanOpenEvent;
+pub use heartbeat::{HeartbeatEvent, HeartbeatMonitor, HeartbeatMonitorState, HeartbeatProducer};
 pub use lss::{LssEvent, LssIdentity, LssMode, LssSlave};
 pub use nmt::{NmtCommand, NmtHandler, NmtState, NmtTransition};
 #[cfg(feature = "embassy")]

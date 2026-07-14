@@ -84,11 +84,25 @@ impl TransferState {
 /// SDO server state machine. Handles one transfer at a time.
 pub struct SdoServer {
     transfer: Option<TransferState>,
+    /// (index, subindex) of the most recent committed download. Taken by the
+    /// node to resync runtime config (PDO engines, heartbeat) — unlike the OD
+    /// event queue, this signal cannot be lost to queue overflow.
+    committed_write: Option<(u16, u8)>,
 }
 
 impl SdoServer {
     pub const fn new() -> Self {
-        Self { transfer: None }
+        Self {
+            transfer: None,
+            committed_write: None,
+        }
+    }
+
+    /// (index, subindex) of the download committed by the last `process()`
+    /// call, if any. Clears the signal; each SDO request commits at most one
+    /// write, so take this after every `process()`.
+    pub fn take_committed_write(&mut self) -> Option<(u16, u8)> {
+        self.committed_write.take()
     }
 
     /// Abort any in-progress transfer (e.g. on NMT reset).
@@ -331,8 +345,8 @@ impl SdoServer {
             };
             let data = &request[4..4 + data_len];
 
-            if let Err(e) = od.validate_write(index, subindex, data) {
-                *response = encode_abort(index, subindex, od_error_to_abort(e));
+            if let Err(code) = validate_download(od, index, subindex, data) {
+                *response = encode_abort(index, subindex, code);
                 self.transfer = None;
                 return Ok(());
             }
@@ -340,6 +354,7 @@ impl SdoServer {
             match od.write(index, subindex, data) {
                 Ok(()) => {
                     *response = encode_download_response(index, subindex);
+                    self.committed_write = Some((index, subindex));
                     push_event(
                         events,
                         OdEvent {
@@ -434,13 +449,14 @@ impl SdoServer {
             write_buf[..data_len].copy_from_slice(&transfer.buf[..data_len]);
             self.transfer = None;
 
-            if let Err(e) = od.validate_write(index, subindex, &write_buf[..data_len]) {
-                *response = encode_abort(index, subindex, od_error_to_abort(e));
+            if let Err(code) = validate_download(od, index, subindex, &write_buf[..data_len]) {
+                *response = encode_abort(index, subindex, code);
                 return Ok(());
             }
 
             match od.write(index, subindex, &write_buf[..data_len]) {
                 Ok(()) => {
+                    self.committed_write = Some((index, subindex));
                     push_event(
                         events,
                         OdEvent {
@@ -685,13 +701,16 @@ impl SdoServer {
                         *response = [0; 8];
                         response[0] = (5 << 5) | 0x01;
 
-                        if let Err(e) = od.validate_write(index, subindex, &write_buf[..data_len]) {
-                            *response = encode_abort(index, subindex, od_error_to_abort(e));
+                        if let Err(code) =
+                            validate_download(od, index, subindex, &write_buf[..data_len])
+                        {
+                            *response = encode_abort(index, subindex, code);
                             return Ok(());
                         }
 
                         match od.write(index, subindex, &write_buf[..data_len]) {
                             Ok(()) => {
+                                self.committed_write = Some((index, subindex));
                                 push_event(
                                     events,
                                     OdEvent {
@@ -804,6 +823,62 @@ fn push_event<const N: usize>(events: &mut Deque<OdEvent, N>, event: OdEvent) {
         let _ = events.pop_front();
     }
     let _ = events.push_back(event);
+}
+
+/// Validate a download before committing it: CiA 301 semantic rules for
+/// communication-profile objects that plain OD type checking cannot express,
+/// then the OD's application-level `validate_write` hook.
+fn validate_download<OD: ObjectDictionary>(
+    od: &OD,
+    index: u16,
+    subindex: u8,
+    data: &[u8],
+) -> Result<(), AbortCode> {
+    validate_heartbeat_consumer_write(od, index, subindex, data)?;
+    od.validate_write(index, subindex, data)
+        .map_err(od_error_to_abort)
+}
+
+/// CiA 301 rules for 0x1016 (Consumer heartbeat time) entries: reserved bits
+/// 24..32 must always be zero; a non-disabled entry (consumer time != 0) must
+/// additionally carry a valid producer node id (1..=127), and no two entries
+/// may monitor the same node (abort 0x0604_0043).
+fn validate_heartbeat_consumer_write<OD: ObjectDictionary>(
+    od: &OD,
+    index: u16,
+    subindex: u8,
+    data: &[u8],
+) -> Result<(), AbortCode> {
+    if index != 0x1016 || subindex == 0 || data.len() != 4 {
+        return Ok(());
+    }
+    let raw = u32::from_le_bytes(data.try_into().unwrap());
+    if raw >> 24 != 0 {
+        return Err(AbortCode::ValueRangeExceeded);
+    }
+    if raw & 0xFFFF == 0 {
+        // Consumer time 0 disables the entry — node id bits don't matter.
+        return Ok(());
+    }
+    let node = (raw >> 16) & 0xFF;
+    if node == 0 || node > 127 {
+        return Err(AbortCode::ValueRangeExceeded);
+    }
+    // The same producer must not be monitored by two active entries.
+    let count = od.sub_count(index).unwrap_or(0);
+    let mut buf = [0u8; 4];
+    for sub in 1..=count {
+        if sub == subindex {
+            continue;
+        }
+        if od.read(index, sub, &mut buf).is_ok() {
+            let other = u32::from_le_bytes(buf);
+            if other & 0xFFFF != 0 && (other >> 16) & 0xFF == node {
+                return Err(AbortCode::ParameterIncompatibility);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns true if the index is a PDO communication or mapping parameter (0x1400-0x1BFF).

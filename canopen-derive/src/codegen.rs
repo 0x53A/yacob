@@ -1389,6 +1389,13 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             type Change = #change_name;
 
             fn decode_event(&self, event: canopen_core::od::OdEvent) -> Option<#change_name> {
+                // Only actual OD writes decode into changes; marker events
+                // (e.g. RpdoDeadline) address OD entries without writing them.
+                match event.source {
+                    canopen_core::od::OdEventSource::Sdo
+                    | canopen_core::od::OdEventSource::Rpdo => {}
+                    _ => return None,
+                }
                 match (event.index, event.subindex) {
                     #(#decode_arms)*
                     _ => None,

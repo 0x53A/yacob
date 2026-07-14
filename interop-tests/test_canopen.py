@@ -515,6 +515,131 @@ class TestRpdoDeadline:
 
 
 # ---------------------------------------------------------------------------
+# Heartbeat OD integration (0x1017 producer time, 0x1016 consumer entries)
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatProducerConfig:
+    """0x1017 Producer heartbeat time drives the producer at runtime:
+    SDO writes change the cadence, 0 disables production."""
+
+    def _collect_heartbeats(self, bus, count, timeout):
+        hb_cob = 0x700 + NODE_ID
+        timestamps = []
+        deadline = time.time() + timeout
+        while time.time() < deadline and len(timestamps) < count:
+            msg = bus.recv(timeout=0.5)
+            if msg and msg.arbitration_id == hb_cob and msg.data[0] != 0x00:
+                timestamps.append(msg.timestamp)
+        return timestamps
+
+    def test_sdo_write_1017_changes_cadence(self, network, node, raw_bus):
+        node.nmt.wait_for_heartbeat(timeout=2)
+        node.sdo[0x1017].raw = 100
+
+        ts = self._collect_heartbeats(raw_bus, 5, 2.0)
+        assert len(ts) >= 4, f"Only got {len(ts)} heartbeats after 0x1017 = 100"
+        for a, b in zip(ts, ts[1:]):
+            assert 0.05 < b - a < 0.25, f"Interval {b - a:.3f}s not ~100ms"
+
+    def test_sdo_write_1017_zero_disables_producer(self, network, node, raw_bus):
+        node.nmt.wait_for_heartbeat(timeout=2)
+        node.sdo[0x1017].raw = 0
+
+        # Flush heartbeats already in flight, then expect silence
+        time.sleep(0.6)
+        while raw_bus.recv(timeout=0.05):
+            pass
+        hb_cob = 0x700 + NODE_ID
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            msg = raw_bus.recv(timeout=0.5)
+            assert not (msg and msg.arbitration_id == hb_cob), \
+                "Heartbeat sent while 0x1017 = 0"
+
+        # Re-enable and expect heartbeats again
+        node.sdo[0x1017].raw = 200
+        ts = self._collect_heartbeats(raw_bus, 1, 2.0)
+        assert ts, "No heartbeat after re-enabling 0x1017"
+
+
+class TestHeartbeatConsumer:
+    """0x1016 consumer entries are monitored by the node. vcan_node's app
+    policy reports EMCY 0x8130 with the failed node id on timeout and clears
+    the error on recovery. Monitoring starts with the first heartbeat from
+    the producer, not at configuration time."""
+
+    PRODUCER = 99
+
+    def _send_producer_hb(self, bus, state=0x05):
+        bus.send(can.Message(
+            arbitration_id=0x700 + self.PRODUCER,
+            data=bytes([state]),
+            is_extended_id=False,
+        ))
+
+    def _wait_for_emcy(self, bus, code, timeout=3.0, keepalive=None):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if keepalive:
+                keepalive()
+            msg = bus.recv(timeout=0.1)
+            if msg and msg.arbitration_id == 0x080 + NODE_ID and len(msg.data) >= 8:
+                error_code = struct.unpack_from("<H", msg.data, 0)[0]
+                if error_code == code:
+                    return msg
+        return None
+
+    def test_timeout_emcy_and_recovery(self, network, node, raw_bus):
+        node.nmt.wait_for_heartbeat(timeout=2)
+        # Monitor node 99 with a 300 ms consumer time
+        node.sdo[0x1016][1].raw = (self.PRODUCER << 16) | 300
+
+        # Silence before the first heartbeat is not an error
+        msg = self._wait_for_emcy(raw_bus, 0x8130, timeout=1.0)
+        assert msg is None, "Heartbeat EMCY before the producer ever spoke"
+
+        # Produce heartbeats, then go silent
+        for _ in range(4):
+            self._send_producer_hb(raw_bus)
+            time.sleep(0.1)
+
+        msg = self._wait_for_emcy(raw_bus, 0x8130, timeout=3.0)
+        assert msg is not None, "No heartbeat-timeout EMCY (0x8130) after silence"
+        assert msg.data[2] & 0x10, "Communication bit not set in error register"
+        assert msg.data[3] == self.PRODUCER, "Wrong node id in vendor bytes"
+
+        # Resume heartbeats: expect error-reset EMCY (0x0000)
+        msg = self._wait_for_emcy(
+            raw_bus, 0x0000, timeout=3.0,
+            keepalive=lambda: self._send_producer_hb(raw_bus),
+        )
+        assert msg is not None, "No error-reset EMCY after heartbeat resumed"
+
+    def test_invalid_1016_writes_abort(self, network, node):
+        # Node id 0 with non-zero consumer time
+        with pytest.raises(canopen.SdoAbortedError) as ei:
+            node.sdo[0x1016][1].raw = 100
+        assert ei.value.code == 0x06090030
+        # Reserved bits 24..32 set
+        with pytest.raises(canopen.SdoAbortedError) as ei:
+            node.sdo[0x1016][1].raw = 0xFF000000 | (42 << 16) | 100
+        assert ei.value.code == 0x06090030
+        # Reserved bits are rejected even on a disabled entry (time 0)
+        with pytest.raises(canopen.SdoAbortedError) as ei:
+            node.sdo[0x1016][1].raw = 0x01000000
+        assert ei.value.code == 0x06090030
+        # Same producer monitored by two active entries
+        node.sdo[0x1016][1].raw = (42 << 16) | 200
+        with pytest.raises(canopen.SdoAbortedError) as ei:
+            node.sdo[0x1016][2].raw = (42 << 16) | 500
+        assert ei.value.code == 0x06040043
+        # Changing the entry that already monitors the node is allowed
+        node.sdo[0x1016][1].raw = (42 << 16) | 500
+        assert node.sdo[0x1016][1].raw == (42 << 16) | 500
+
+
+# ---------------------------------------------------------------------------
 # PDO mapping mutability (immutable by default, CiA 301 dynamic mapping opt-in)
 # ---------------------------------------------------------------------------
 
