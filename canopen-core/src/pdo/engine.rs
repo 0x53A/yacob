@@ -2,6 +2,25 @@ use crate::od::{ObjectDictionary, OdEvent, OdEventSource};
 use crate::transport::CanFrame;
 use heapless::{Deque, Vec};
 
+/// Maximum PDO payload size in bits.
+///
+/// A classic CANopen PDO carries at most 8 data bytes = 64 bits. This is a
+/// fixed CiA 301 / classic-CAN fact, independent of how many mapping entries a
+/// PDO holds. Enforced against the sum of mapped entry bit lengths.
+pub const PDO_MAX_PAYLOAD_BITS: usize = 64;
+
+/// Default storage capacity for PDO mapping records.
+///
+/// With bit-granular mapping, the [`PDO_MAX_PAYLOAD_BITS`] budget permits up to
+/// 64 one-bit mapped objects in one PDO, so mapping storage defaults to that
+/// worst case. The payload-size limit is still enforced separately (a full 64
+/// entries only fits if every entry is one bit).
+///
+/// This must equal the `PDO_MAX_MAPPINGS` in `canopen-derive`'s `dsl.rs`: the
+/// derive crate sizes generated arrays against this constant but uses its own
+/// copy for the parse-time entry-count check.
+pub const PDO_MAX_MAPPINGS: usize = 64;
+
 /// One PDO mapping entry: which OD entry maps to which bits in the PDO frame.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PdoMapping {
@@ -9,7 +28,7 @@ pub struct PdoMapping {
     pub index: u16,
     /// OD subindex
     pub subindex: u8,
-    /// Length in bits (must be a multiple of 8 for now)
+    /// Length in bits.
     pub bit_length: u8,
 }
 
@@ -27,6 +46,29 @@ impl PdoMapping {
     pub const fn to_mapping_value(self) -> u32 {
         (self.index as u32) << 16 | (self.subindex as u32) << 8 | self.bit_length as u32
     }
+}
+
+fn copy_bits(
+    src: &[u8],
+    src_bit_offset: usize,
+    dst: &mut [u8],
+    dst_bit_offset: usize,
+    bit_len: usize,
+) {
+    for bit in 0..bit_len {
+        let src_bit = src_bit_offset + bit;
+        let dst_bit = dst_bit_offset + bit;
+        let value = (src[src_bit / 8] >> (src_bit % 8)) & 1;
+        if value != 0 {
+            dst[dst_bit / 8] |= 1 << (dst_bit % 8);
+        } else {
+            dst[dst_bit / 8] &= !(1 << (dst_bit % 8));
+        }
+    }
+}
+
+const fn bytes_for_bits(bits: usize) -> usize {
+    (bits + 7) / 8
 }
 
 // ---- Transmission type constants (CiA 301) ----
@@ -184,7 +226,7 @@ pub trait PdoConfigSource<const TPDO: usize, const RPDO: usize> {
 
 /// Configuration for one TPDO (transmit PDO).
 #[derive(Clone, Debug)]
-pub struct TpdoConfig<const MAX_MAPPINGS: usize = 8> {
+pub struct TpdoConfig<const MAX_MAPPINGS: usize = PDO_MAX_MAPPINGS> {
     /// 1-based CANopen PDO number (TPDO1 = 1). Determines the OD index of the
     /// communication/mapping parameter records (0x1800/0x1A00 + number - 1).
     /// 0 = derive from the engine slot (slot n is PDO n+1).
@@ -229,7 +271,7 @@ impl<const N: usize> TpdoConfig<N> {
 
 /// Configuration for one RPDO (receive PDO).
 #[derive(Clone, Debug)]
-pub struct RpdoConfig<const MAX_MAPPINGS: usize = 8> {
+pub struct RpdoConfig<const MAX_MAPPINGS: usize = PDO_MAX_MAPPINGS> {
     /// 1-based CANopen PDO number (RPDO1 = 1). Determines the OD index of the
     /// communication/mapping parameter records (0x1400/0x1600 + number - 1).
     /// 0 = derive from the engine slot (slot n is PDO n+1).
@@ -395,25 +437,35 @@ impl<const N: usize> TpdoEngine<N> {
     fn build_pdo_frame<OD: ObjectDictionary>(&self, pdo_idx: usize, od: &OD) -> Option<CanFrame> {
         let pdo = &self.pdos[pdo_idx];
         let mut data = [0u8; 8];
+        let mut object_data = [0u8; 8];
         let mut bit_offset: usize = 0;
 
         for mapping in &pdo.mappings {
-            let byte_offset = bit_offset / 8;
-            let byte_len = mapping.bit_length as usize / 8;
-            if byte_offset + byte_len > 8 {
+            let bit_len = mapping.bit_length as usize;
+            let end_bit = bit_offset + bit_len;
+            if end_bit > 64 {
                 return None; // PDO too long
             }
+            let object_len = bytes_for_bits(bit_len);
             if od
                 .read(
                     mapping.index,
                     mapping.subindex,
-                    &mut data[byte_offset..byte_offset + byte_len],
+                    &mut object_data[..object_len],
                 )
                 .is_err()
             {
                 return None;
             }
-            bit_offset += mapping.bit_length as usize;
+            copy_bits(
+                &object_data[..object_len],
+                0,
+                &mut data,
+                bit_offset,
+                bit_len,
+            );
+            object_data[..object_len].fill(0);
+            bit_offset = end_bit;
         }
 
         let total_bytes = (bit_offset + 7) / 8;
@@ -509,20 +561,19 @@ impl<const N: usize> RpdoEngine<N> {
 
             let data = frame.data();
             let mut bit_offset: usize = 0;
+            let mut object_data = [0u8; 8];
             let mut dropped = 0u32;
 
             for mapping in &pdo.mappings {
-                let byte_offset = bit_offset / 8;
-                let byte_len = mapping.bit_length as usize / 8;
-                if byte_offset + byte_len > data.len() {
+                let bit_len = mapping.bit_length as usize;
+                let end_bit = bit_offset + bit_len;
+                let object_len = bytes_for_bits(bit_len);
+                if end_bit > data.len() * 8 || object_len > object_data.len() {
                     break;
                 }
+                copy_bits(data, bit_offset, &mut object_data, 0, bit_len);
                 if od
-                    .write(
-                        mapping.index,
-                        mapping.subindex,
-                        &data[byte_offset..byte_offset + byte_len],
-                    )
+                    .write(mapping.index, mapping.subindex, &object_data[..object_len])
                     .is_ok()
                 {
                     if events.is_full() {
@@ -535,7 +586,8 @@ impl<const N: usize> RpdoEngine<N> {
                         source: OdEventSource::Rpdo,
                     });
                 }
-                bit_offset += mapping.bit_length as usize;
+                object_data[..object_len].fill(0);
+                bit_offset = end_bit;
             }
             return (true, dropped);
         }
@@ -614,7 +666,11 @@ mod tests {
     struct PdoTestOd {
         input1: u8,
         input2: u16,
+        input_flag1: bool,
+        input_flag2: bool,
         output1: u8,
+        output_flag1: bool,
+        output_flag2: bool,
     }
 
     static PDO_TEST_META: &[OdEntryMeta] = &[
@@ -645,6 +701,42 @@ mod tests {
             name: "output1",
             max_size: None,
         },
+        OdEntryMeta {
+            index: 0x6001,
+            subindex: 1,
+            data_type: DataType::Boolean,
+            access: AccessType::Ro,
+            pdo_mappable: true,
+            name: "input_flag1",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x6001,
+            subindex: 2,
+            data_type: DataType::Boolean,
+            access: AccessType::Ro,
+            pdo_mappable: true,
+            name: "input_flag2",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x6201,
+            subindex: 1,
+            data_type: DataType::Boolean,
+            access: AccessType::Rw,
+            pdo_mappable: true,
+            name: "output_flag1",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x6201,
+            subindex: 2,
+            data_type: DataType::Boolean,
+            access: AccessType::Rw,
+            pdo_mappable: true,
+            name: "output_flag2",
+            max_size: None,
+        },
     ];
 
     impl ObjectDictionary for PdoTestOd {
@@ -667,6 +759,22 @@ mod tests {
                     buf[0] = self.output1;
                     Ok(1)
                 }
+                (0x6001, 1) => {
+                    buf[0] = u8::from(self.input_flag1);
+                    Ok(1)
+                }
+                (0x6001, 2) => {
+                    buf[0] = u8::from(self.input_flag2);
+                    Ok(1)
+                }
+                (0x6201, 1) => {
+                    buf[0] = u8::from(self.output_flag1);
+                    Ok(1)
+                }
+                (0x6201, 2) => {
+                    buf[0] = u8::from(self.output_flag2);
+                    Ok(1)
+                }
                 _ => Err(OdError::NotFound),
             }
         }
@@ -674,6 +782,14 @@ mod tests {
             match (index, subindex) {
                 (0x6200, 1) => {
                     self.output1 = data[0];
+                    Ok(())
+                }
+                (0x6201, 1) => {
+                    self.output_flag1 = data[0] != 0;
+                    Ok(())
+                }
+                (0x6201, 2) => {
+                    self.output_flag2 = data[0] != 0;
                     Ok(())
                 }
                 _ => Err(OdError::ReadOnly),
@@ -686,7 +802,7 @@ mod tests {
 
     #[test]
     fn tpdo_sync_cyclic() {
-        let mut mappings = Vec::<PdoMapping, 8>::new();
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         mappings
             .push(PdoMapping {
                 index: 0x6000,
@@ -716,7 +832,11 @@ mod tests {
         let od = PdoTestOd {
             input1: 0x42,
             input2: 0x1234,
+            input_flag1: false,
+            input_flag2: false,
             output1: 0,
+            output_flag1: false,
+            output_flag2: false,
         };
         let mut out = Vec::<CanFrame, 1>::new();
 
@@ -730,7 +850,7 @@ mod tests {
 
     #[test]
     fn rpdo_process() {
-        let mut mappings = Vec::<PdoMapping, 8>::new();
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         mappings
             .push(PdoMapping {
                 index: 0x6200,
@@ -752,7 +872,11 @@ mod tests {
         let mut od = PdoTestOd {
             input1: 0,
             input2: 0,
+            input_flag1: false,
+            input_flag2: false,
             output1: 0,
+            output_flag1: false,
+            output_flag2: false,
         };
         let mut events: Deque<OdEvent, 16> = Deque::new();
 
@@ -772,8 +896,114 @@ mod tests {
         assert_eq!(od.output1, 0xFF); // unchanged
     }
 
+    #[test]
+    fn tpdo_packs_boolean_mappings_as_bits() {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6001,
+                subindex: 1,
+                bit_length: 1,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6001,
+                subindex: 2,
+                bit_length: 1,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+
+        let config = TpdoConfig {
+            od_number: 0,
+            cob_id: 0x181,
+            transmission_type: 1,
+            inhibit_time_100us: 0,
+            event_timer_ms: 0,
+            mappings,
+            enabled: true,
+        };
+
+        let mut engine = TpdoEngine::new([config]);
+        let od = PdoTestOd {
+            input1: 0b1010_1100,
+            input2: 0,
+            input_flag1: true,
+            input_flag2: false,
+            output1: 0,
+            output_flag1: false,
+            output_flag2: false,
+        };
+        let mut out = Vec::<CanFrame, 1>::new();
+
+        engine.on_sync(&od, &mut out);
+
+        assert_eq!(out[0].data(), &[0b1011_0001, 0b0000_0010]);
+    }
+
+    #[test]
+    fn rpdo_unpacks_boolean_mappings_from_bits() {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6201,
+                subindex: 1,
+                bit_length: 1,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6201,
+                subindex: 2,
+                bit_length: 1,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+
+        let config = RpdoConfig {
+            od_number: 0,
+            cob_id: 0x201,
+            transmission_type: 255,
+            deadline_ms: 0,
+            mappings,
+            enabled: true,
+        };
+
+        let mut engine = RpdoEngine::new([config]);
+        let mut od = PdoTestOd {
+            input1: 0,
+            input2: 0,
+            input_flag1: false,
+            input_flag2: false,
+            output1: 0,
+            output_flag1: false,
+            output_flag2: false,
+        };
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+        let frame = CanFrame::new(0x201, &[0b1110_0101, 0b0000_0010]).unwrap();
+
+        assert!(engine.process(&frame, &mut od, &mut events, 0));
+
+        assert!(od.output_flag1);
+        assert!(!od.output_flag2);
+        assert_eq!(od.output1, 0b1011_1001);
+    }
+
     fn deadline_test_engine(deadline_ms: u16) -> RpdoEngine<1> {
-        let mut mappings = Vec::<PdoMapping, 8>::new();
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         mappings
             .push(PdoMapping {
                 index: 0x6200,
@@ -795,7 +1025,11 @@ mod tests {
         PdoTestOd {
             input1: 0,
             input2: 0,
+            input_flag1: false,
+            input_flag2: false,
             output1: 0,
+            output_flag1: false,
+            output_flag2: false,
         }
     }
 
@@ -956,7 +1190,7 @@ mod tests {
 
     #[test]
     fn tpdo_event_timer() {
-        let mut mappings = Vec::<PdoMapping, 8>::new();
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         mappings
             .push(PdoMapping {
                 index: 0x6000,
@@ -979,7 +1213,11 @@ mod tests {
         let od = PdoTestOd {
             input1: 0x99,
             input2: 0,
+            input_flag1: false,
+            input_flag2: false,
             output1: 0,
+            output_flag1: false,
+            output_flag2: false,
         };
         let dirty = Vec::<(u16, u8), 8>::new();
 

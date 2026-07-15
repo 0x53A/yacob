@@ -302,6 +302,11 @@ fn write_pdo_sub(
     writeln!(out).unwrap();
 }
 
+fn write_pdo_sub_limits(out: &mut String, low_limit: u8, high_limit: u8) {
+    writeln!(out, "LowLimit={low_limit}").unwrap();
+    writeln!(out, "HighLimit={high_limit}").unwrap();
+}
+
 fn predefined_pdo_cob_id(direction: PdoDirection, number: u16) -> String {
     debug_assert!(number <= 4, "PDOs >4 have no predefined COB-ID");
     let base = match direction {
@@ -410,18 +415,26 @@ fn write_pdo_mapping_eds(
         MappingKind::Mutable => "rw",
         MappingKind::Immutable => "const",
     };
-    write_record_header(out, index, name, 9);
-    write_pdo_sub(
-        out,
-        index,
-        0,
-        "Number of Mapped Objects",
-        0x0005,
-        access,
-        &format!("0x{:X}", mappings.len()),
-    );
+    let exported_mapping_slots = match mapping_kind {
+        MappingKind::Mutable => PDO_MAX_MAPPINGS as u8,
+        MappingKind::Immutable => mappings.len() as u8,
+    };
+    write_record_header(out, index, name, exported_mapping_slots + 1);
+    writeln!(out, "[{:04X}sub0]", index).unwrap();
+    writeln!(out, "ParameterName=Number of Mapped Objects").unwrap();
+    writeln!(out, "ObjectType=0x7").unwrap();
+    writeln!(out, "DataType=0x0005").unwrap();
+    writeln!(out, "AccessType={access}").unwrap();
+    writeln!(out, "DefaultValue=0x{:X}", mappings.len()).unwrap();
+    writeln!(out, "PDOMapping=0").unwrap();
+    // Limits describe the writable value range, so they only carry meaning for a
+    // mutable (rw) count. A const count can't be written — no range to advertise.
+    if mapping_kind == MappingKind::Mutable {
+        write_pdo_sub_limits(out, 0, exported_mapping_slots);
+    }
+    writeln!(out).unwrap();
 
-    for sub in 1..=8u8 {
+    for sub in 1..=exported_mapping_slots {
         let default_value = mappings
             .get((sub - 1) as usize)
             .map(|m| format!("0x{:08X}", m.raw()))

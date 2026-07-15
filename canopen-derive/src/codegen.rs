@@ -89,7 +89,8 @@ pub(crate) fn resolve_pdo_mappings(pdo: &PdoDef, flat: &[FlatEntry]) -> Vec<Reso
         pdo.number,
     );
     let mut resolved = Vec::new();
-    for field_name in &pdo.mappings {
+    for mapping in &pdo.mappings {
+        let field_name = &mapping.field_name;
         let entry = flat
             .iter()
             .find(|e| e.field_name == *field_name)
@@ -119,15 +120,25 @@ pub(crate) fn resolve_pdo_mappings(pdo: &PdoDef, flat: &[FlatEntry]) -> Vec<Reso
         if is_variable_length_type(&ty_str) {
             panic!(
                 "{pdo_label} maps field `{field_name}` which has variable-length type `{ty_str}`. \
-                 Only fixed-size types (u8, u16, u24, u32, i8, i16, i24, i32, f32, f64) can be PDO-mapped.",
+                 Only fixed-size types (bool, u8, u16, u24, u32, i8, i16, i24, i32, f32, f64) can be PDO-mapped.",
             );
         }
-        let bit_length = type_size(&ty_str).expect("unsupported type") as u8 * 8;
+        let bit_length = mapping.bit_length.unwrap_or_else(|| {
+            if ty_str == "bool" {
+                1
+            } else {
+                type_size(&ty_str).expect("unsupported type") as u8 * 8
+            }
+        });
         resolved.push(ResolvedMapping {
             index: entry.index,
             subindex: entry.subindex,
             bit_length,
         });
+    }
+    let total_bits: usize = resolved.iter().map(|m| m.bit_length as usize).sum();
+    if total_bits > PDO_MAX_PAYLOAD_BITS {
+        panic!("{pdo_label} maps {total_bits} bits, but classic CANopen PDOs can carry at most {PDO_MAX_PAYLOAD_BITS} bits");
     }
     resolved
 }
@@ -447,7 +458,9 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             fields.push(quote! { pub tpdo_inhibit_time: [u16; #tc] });
             fields.push(quote! { pub tpdo_event_timer: [u16; #tc] });
             fields.push(quote! { pub tpdo_mapping_count: [u8; #tc] });
-            fields.push(quote! { pub tpdo_mappings: [[u32; 8]; #tc] });
+            fields.push(
+                quote! { pub tpdo_mappings: [[u32; canopen_core::pdo::PDO_MAX_MAPPINGS]; #tc] },
+            );
         }
         if rc > 0 {
             fields.push(quote! { pub rpdo_cob_id: [u32; #rc] });
@@ -455,7 +468,9 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             // CiA 301 event timer (comm param sub 5): RPDO deadline monitoring, ms.
             fields.push(quote! { pub rpdo_deadline: [u16; #rc] });
             fields.push(quote! { pub rpdo_mapping_count: [u8; #rc] });
-            fields.push(quote! { pub rpdo_mappings: [[u32; 8]; #rc] });
+            fields.push(
+                quote! { pub rpdo_mappings: [[u32; canopen_core::pdo::PDO_MAX_MAPPINGS]; #rc] },
+            );
         }
         fields
     } else {
@@ -484,7 +499,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             let map_arrays: Vec<TokenStream> = tpdo_resolved
                 .iter()
                 .map(|mappings| {
-                    let mut vals = [0u32; 8];
+                    let mut vals = [0u32; PDO_MAX_MAPPINGS];
                     for (i, m) in mappings.iter().enumerate() {
                         vals[i] = m.raw();
                     }
@@ -514,7 +529,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             let map_arrays: Vec<TokenStream> = rpdo_resolved
                 .iter()
                 .map(|mappings| {
-                    let mut vals = [0u32; 8];
+                    let mut vals = [0u32; PDO_MAX_MAPPINGS];
                     for (i, m) in mappings.iter().enumerate() {
                         vals[i] = m.raw();
                     }
@@ -661,12 +676,15 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         });
 
         // Mapping params. Mutable (CiA 301 dynamic mapping): sub0=count(rw),
-        // sub1..8=mapping(rw, guarded by count==0 — the unlock protocol).
+        // sub1..64=mapping(rw, guarded by count==0 — the unlock protocol).
         // Immutable (default): whole record is const, SDO writes rejected.
         let mutable = pdo.mapping == MappingKind::Mutable;
         let map_access = if mutable { "Rw" } else { "Const" };
-        let map_count = tpdo_resolved[i].len() as u8;
-        let max_map_sub = if map_count > 0 { map_count } else { 8 };
+        let max_map_sub = if mutable {
+            PDO_MAX_MAPPINGS as u8
+        } else {
+            tpdo_resolved[i].len() as u8
+        };
         pdo_sub_counts.insert(map_idx, max_map_sub);
 
         // sub 0: mapping count
@@ -677,6 +695,18 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             quote! {
                 (#map_idx, 0) => {
                     if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                    if data[0] as usize > canopen_core::pdo::PDO_MAX_MAPPINGS {
+                        return Err(canopen_core::od::OdError::ValueRange);
+                    }
+                    let mut total_bits = 0usize;
+                    let mut j = 0usize;
+                    while j < data[0] as usize {
+                        total_bits += (self.tpdo_mappings[#n][j] & 0xFF) as usize;
+                        j += 1;
+                    }
+                    if total_bits > canopen_core::pdo::PDO_MAX_PAYLOAD_BITS {
+                        return Err(canopen_core::od::OdError::ValueRange);
+                    }
                     self.tpdo_mapping_count[#n] = data[0];
                     Ok(())
                 }
@@ -685,8 +715,9 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             quote! { (#map_idx, 0) => Err(canopen_core::od::OdError::ReadOnly), }
         });
 
-        // sub 1..8: mapping entries
-        for sub in 1u8..=8 {
+        // Immutable mappings only expose the active entries. Mutable mappings
+        // expose the full runtime remapping capacity.
+        for sub in 1u8..=max_map_sub {
             let arr_idx = (sub - 1) as usize;
             all_meta_entries.push(gen_pdo_meta(
                 map_idx,
@@ -711,7 +742,11 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                         if data.len() != 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                         let mut arr = [0u8; 4];
                         arr.copy_from_slice(&data[..4]);
-                        self.tpdo_mappings[#n][#arr_idx] = u32::from_le_bytes(arr);
+                        let mapping = u32::from_le_bytes(arr);
+                        if (mapping & 0xFF) as usize > canopen_core::pdo::PDO_MAX_PAYLOAD_BITS {
+                            return Err(canopen_core::od::OdError::ValueRange);
+                        }
+                        self.tpdo_mappings[#n][#arr_idx] = mapping;
                         Ok(())
                     }
                 }
@@ -788,8 +823,11 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         // Mapping params — same mutable/immutable split as TPDOs above.
         let mutable = pdo.mapping == MappingKind::Mutable;
         let map_access = if mutable { "Rw" } else { "Const" };
-        let map_count = rpdo_resolved[i].len() as u8;
-        let max_map_sub = if map_count > 0 { map_count } else { 8 };
+        let max_map_sub = if mutable {
+            PDO_MAX_MAPPINGS as u8
+        } else {
+            rpdo_resolved[i].len() as u8
+        };
         pdo_sub_counts.insert(map_idx, max_map_sub);
 
         all_meta_entries.push(gen_pdo_meta(map_idx, 0, "U8", map_access, "mapping_count"));
@@ -799,6 +837,18 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             quote! {
                 (#map_idx, 0) => {
                     if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                    if data[0] as usize > canopen_core::pdo::PDO_MAX_MAPPINGS {
+                        return Err(canopen_core::od::OdError::ValueRange);
+                    }
+                    let mut total_bits = 0usize;
+                    let mut j = 0usize;
+                    while j < data[0] as usize {
+                        total_bits += (self.rpdo_mappings[#n][j] & 0xFF) as usize;
+                        j += 1;
+                    }
+                    if total_bits > canopen_core::pdo::PDO_MAX_PAYLOAD_BITS {
+                        return Err(canopen_core::od::OdError::ValueRange);
+                    }
                     self.rpdo_mapping_count[#n] = data[0];
                     Ok(())
                 }
@@ -807,7 +857,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             quote! { (#map_idx, 0) => Err(canopen_core::od::OdError::ReadOnly), }
         });
 
-        for sub in 1u8..=8 {
+        for sub in 1u8..=max_map_sub {
             let arr_idx = (sub - 1) as usize;
             all_meta_entries.push(gen_pdo_meta(
                 map_idx,
@@ -832,7 +882,11 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                         if data.len() != 4 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
                         let mut arr = [0u8; 4];
                         arr.copy_from_slice(&data[..4]);
-                        self.rpdo_mappings[#n][#arr_idx] = u32::from_le_bytes(arr);
+                        let mapping = u32::from_le_bytes(arr);
+                        if (mapping & 0xFF) as usize > canopen_core::pdo::PDO_MAX_PAYLOAD_BITS {
+                            return Err(canopen_core::od::OdError::ValueRange);
+                        }
+                        self.rpdo_mappings[#n][#arr_idx] = mapping;
                         Ok(())
                     }
                 }
@@ -1088,7 +1142,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     let mut mappings = canopen_core::pdo::heapless_vec_new();
                     let count = self.tpdo_mapping_count[#i] as usize;
                     let mut j = 0;
-                    while j < count && j < 8 {
+                    while j < count && j < canopen_core::pdo::PDO_MAX_MAPPINGS {
                         let _ = canopen_core::pdo::heapless_vec_push(&mut mappings,
                             canopen_core::pdo::PdoMapping::from_mapping_value(self.tpdo_mappings[#i][j]));
                         j += 1;
@@ -1133,7 +1187,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     let mut mappings = canopen_core::pdo::heapless_vec_new();
                     let count = self.rpdo_mapping_count[#i] as usize;
                     let mut j = 0;
-                    while j < count && j < 8 {
+                    while j < count && j < canopen_core::pdo::PDO_MAX_MAPPINGS {
                         let _ = canopen_core::pdo::heapless_vec_push(&mut mappings,
                             canopen_core::pdo::PdoMapping::from_mapping_value(self.rpdo_mappings[#i][j]));
                         j += 1;

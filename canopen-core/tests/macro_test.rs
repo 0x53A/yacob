@@ -315,6 +315,81 @@ object_dictionary! {
     }
 }
 
+object_dictionary! {
+    pub struct BoolPdoTestOd {
+        [0x1000] device_type: u32 = 0x0000_0191, ro;
+        [0x2000] status: record {
+            [1] limit_low: bool = false, ro, pdo;
+            [2] limit_high: bool = false, ro, pdo;
+            [3] flag3: bool = false, ro, pdo;
+            [4] flag4: bool = false, ro, pdo;
+            [5] flag5: bool = false, ro, pdo;
+            [6] flag6: bool = false, ro, pdo;
+            [7] flag7: bool = false, ro, pdo;
+            [8] flag8: bool = false, ro, pdo;
+            [9] flag9: bool = false, ro, pdo;
+        };
+        [0x2001] command: record {
+            [1] enable: bool = false, rw, pdo;
+            [2] reset_fault: bool = false, rw, pdo;
+        };
+
+        tpdo[1](transmission_type = event_driven) {
+            limit_low,
+            limit_high,
+            flag3,
+            flag4,
+            flag5,
+            flag6,
+            flag7,
+            flag8,
+            flag9,
+        };
+        rpdo[1](transmission_type = event_driven) {
+            enable,
+            reset_fault,
+        };
+    }
+}
+
+#[test]
+fn dsl_bool_pdo_mappings_are_one_bit() {
+    let od = BoolPdoTestOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(1).unwrap();
+
+    let tpdo = od.tpdo_configs(node_id);
+    assert_eq!(tpdo[0].mappings[0].index, 0x2000);
+    assert_eq!(tpdo[0].mappings[0].subindex, 1);
+    assert_eq!(tpdo[0].mappings[0].bit_length, 1);
+    assert_eq!(tpdo[0].mappings[1].index, 0x2000);
+    assert_eq!(tpdo[0].mappings[1].subindex, 2);
+    assert_eq!(tpdo[0].mappings[1].bit_length, 1);
+    assert_eq!(tpdo[0].mappings.len(), 9);
+    assert_eq!(tpdo[0].mappings[8].index, 0x2000);
+    assert_eq!(tpdo[0].mappings[8].subindex, 9);
+    assert_eq!(tpdo[0].mappings[8].bit_length, 1);
+
+    let rpdo = od.rpdo_configs(node_id);
+    assert_eq!(rpdo[0].mappings[0].index, 0x2001);
+    assert_eq!(rpdo[0].mappings[0].subindex, 1);
+    assert_eq!(rpdo[0].mappings[0].bit_length, 1);
+    assert_eq!(rpdo[0].mappings[1].index, 0x2001);
+    assert_eq!(rpdo[0].mappings[1].subindex, 2);
+    assert_eq!(rpdo[0].mappings[1].bit_length, 1);
+
+    let mut buf = [0u8; 4];
+    assert_eq!(od.read(0x1A00, 1, &mut buf), Ok(4));
+    assert_eq!(u32::from_le_bytes(buf), 0x2000_0101);
+    assert_eq!(od.read(0x1A00, 2, &mut buf), Ok(4));
+    assert_eq!(u32::from_le_bytes(buf), 0x2000_0201);
+    assert_eq!(od.read(0x1A00, 9, &mut buf), Ok(4));
+    assert_eq!(u32::from_le_bytes(buf), 0x2000_0901);
+    assert_eq!(od.read(0x1600, 1, &mut buf), Ok(4));
+    assert_eq!(u32::from_le_bytes(buf), 0x2001_0101);
+    assert_eq!(od.read(0x1600, 2, &mut buf), Ok(4));
+    assert_eq!(u32::from_le_bytes(buf), 0x2001_0201);
+}
+
 #[test]
 fn pdo_od_has_tpdo_comm_params() {
     let od = PdoTestOd::new();
@@ -422,6 +497,49 @@ fn pdo_od_mapping_lock_protocol() {
 }
 
 #[test]
+fn mutable_pdo_mapping_accepts_more_than_eight_one_bit_entries() {
+    let mut od = PdoTestOd::new();
+
+    od.write(0x1A00, 0, &[0]).unwrap();
+    for sub in 1u8..=9 {
+        let mapping = 0x6000_0101u32;
+        od.write(0x1A00, sub, &mapping.to_le_bytes()).unwrap();
+    }
+    od.write(0x1A00, 0, &[9]).unwrap();
+
+    let node_id = canopen_core::cobid::NodeId::new(1).unwrap();
+    let configs = od.tpdo_configs(node_id);
+    assert_eq!(configs[0].mappings.len(), 9);
+    assert!(configs[0].mappings.iter().all(|m| m.bit_length == 1));
+}
+
+#[test]
+fn mutable_pdo_mapping_rejects_capacity_and_payload_overflow() {
+    let mut od = PdoTestOd::new();
+
+    od.write(0x1A00, 0, &[0]).unwrap();
+    assert_eq!(
+        od.write(0x1A00, 1, &0x6000_0141u32.to_le_bytes()),
+        Err(canopen_core::od::OdError::ValueRange)
+    );
+
+    od.write(0x1A00, 1, &0x6000_0140u32.to_le_bytes()).unwrap();
+    od.write(0x1A00, 2, &0x6000_0101u32.to_le_bytes()).unwrap();
+    assert_eq!(
+        od.write(0x1A00, 0, &[2]),
+        Err(canopen_core::od::OdError::ValueRange)
+    );
+    assert_eq!(
+        od.write(
+            0x1A00,
+            0,
+            &[(canopen_core::pdo::PDO_MAX_MAPPINGS + 1) as u8]
+        ),
+        Err(canopen_core::od::OdError::ValueRange)
+    );
+}
+
+#[test]
 fn pdo_od_immutable_mapping_rejects_writes() {
     let mut od = PdoTestOd::new();
 
@@ -495,9 +613,13 @@ fn pdo_od_eds_includes_pdo_registers() {
     assert!(eds.contains("DefaultValue=0x3E8"));
     assert!(eds.contains("[1A00]"));
     assert!(eds.contains("[1A00sub1]"));
+    assert!(eds.contains("[1A00sub40]"));
+    assert!(eds.contains("HighLimit=64"));
     assert!(eds.contains("DefaultValue=0x60000108"));
     assert!(eds.contains("[1400]"));
     assert!(eds.contains("[1600]"));
+    assert!(eds.contains("[1600sub2]"));
+    assert!(!eds.contains("[1600sub3]"));
     assert!(eds.contains("DefaultValue=0x62000108"));
     assert!(eds.contains("DefaultValue=$NODEID+0x180"));
     assert!(eds.contains("DefaultValue=$NODEID+0x200"));

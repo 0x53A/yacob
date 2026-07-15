@@ -1,6 +1,6 @@
 use crate::dsl::{
     AccessKind, CobIdSpec, EntryKind, MappingKind, OdDefinition, OdEntry, PdoDef, PdoDirection,
-    SubEntry, VarDef,
+    PdoMappingDef, SubEntry, VarDef,
 };
 use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
@@ -374,8 +374,8 @@ fn extract_pdos(
                 if let Some(val_str) = get_prop(props, "DefaultValue") {
                     if let Some(val) = parse_int(&val_str) {
                         if val != 0 {
-                            if let Some(field_name) = resolve_mapping(val as u32, entries) {
-                                mappings.push(field_name);
+                            if let Some(mapping) = resolve_mapping(val as u32, entries) {
+                                mappings.push(mapping);
                             }
                         }
                     }
@@ -438,8 +438,8 @@ fn extract_pdos(
                 if let Some(val_str) = get_prop(props, "DefaultValue") {
                     if let Some(val) = parse_int(&val_str) {
                         if val != 0 {
-                            if let Some(field_name) = resolve_mapping(val as u32, entries) {
-                                mappings.push(field_name);
+                            if let Some(mapping) = resolve_mapping(val as u32, entries) {
+                                mappings.push(mapping);
                             }
                         }
                     }
@@ -475,20 +475,27 @@ fn mapping_kind_from_access(access: Option<String>) -> MappingKind {
 
 /// Resolve a PDO mapping value (e.g. 0x60400010) to a field name in the OD,
 /// and mark the referenced entry as pdo_mappable.
-fn resolve_mapping(mapping_val: u32, entries: &mut [OdEntry]) -> Option<Ident> {
+fn resolve_mapping(mapping_val: u32, entries: &mut [OdEntry]) -> Option<PdoMappingDef> {
     let mapped_index = (mapping_val >> 16) as u16;
     let mapped_sub = ((mapping_val >> 8) & 0xFF) as u8;
+    let bit_length = mapping_val as u8;
     for entry in entries.iter_mut() {
         match &mut entry.kind {
             EntryKind::Var(ref mut var) if entry.index == mapped_index && mapped_sub == 0 => {
                 var.pdo_mappable = true;
-                return Some(entry.name.clone());
+                return Some(PdoMappingDef {
+                    field_name: entry.name.clone(),
+                    bit_length: Some(bit_length),
+                });
             }
             EntryKind::Record(ref mut subs) if entry.index == mapped_index => {
                 for sub in subs.iter_mut() {
                     if sub.subindex == mapped_sub {
                         sub.var.pdo_mappable = true;
-                        return Some(sub.name.clone());
+                        return Some(PdoMappingDef {
+                            field_name: sub.name.clone(),
+                            bit_length: Some(bit_length),
+                        });
                     }
                 }
             }

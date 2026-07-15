@@ -1005,7 +1005,7 @@ mod tests {
     use crate::datatypes::DataType;
     use crate::lss::LssIdentity;
     use crate::od::*;
-    use crate::pdo::PdoMapping;
+    use crate::pdo::{PdoMapping, PDO_MAX_MAPPINGS};
     use crate::transport::MailboxTransport;
 
     struct MinimalOd {
@@ -1228,7 +1228,7 @@ mod tests {
     }
 
     fn make_event_node() -> (Node<EventTestOd, 1, 1>, MailboxTransport<32, 32>) {
-        let mut rpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        let mut rpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         rpdo_mappings
             .push(PdoMapping {
                 index: 0x6200,
@@ -1244,7 +1244,7 @@ mod tests {
             })
             .unwrap();
 
-        let mut tpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        let mut tpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         tpdo_mappings
             .push(PdoMapping {
                 index: 0x6000,
@@ -1336,7 +1336,7 @@ mod tests {
     }
 
     fn make_deadline_node() -> (Node<EventTestOd, 1, 1>, MailboxTransport<32, 32>) {
-        let mut rpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        let mut rpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         rpdo_mappings
             .push(PdoMapping {
                 index: 0x6200,
@@ -1376,7 +1376,7 @@ mod tests {
 
     #[test]
     fn placeholder_pdos_not_addressable_and_unresolved_cob_id_is_none() {
-        let mut rpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        let mut rpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         rpdo_mappings
             .push(PdoMapping {
                 index: 0x6200,
@@ -1538,7 +1538,7 @@ mod tests {
     fn rpdo_deadline_event_index_does_not_truncate_slots_above_255() {
         let mut rpdo: [RpdoConfig; 257] = core::array::from_fn(|_| RpdoConfig::default());
 
-        let mut mappings = heapless::Vec::<PdoMapping, 8>::new();
+        let mut mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         mappings
             .push(PdoMapping {
                 index: 0x6200,
@@ -1595,7 +1595,7 @@ mod tests {
     #[test]
     fn event_queue_overflow_drops_oldest() {
         // Use a tiny queue of size 2
-        let mut rpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        let mut rpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         rpdo_mappings
             .push(PdoMapping {
                 index: 0x6200,
@@ -1664,7 +1664,7 @@ mod tests {
 
     #[test]
     fn event_queue_drop_count_includes_drops_inside_multi_mapping_rpdo() {
-        let mut rpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        let mut rpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         rpdo_mappings
             .push(PdoMapping {
                 index: 0x6200,
@@ -1734,7 +1734,7 @@ mod tests {
 
     #[test]
     fn notify_changed_respects_inhibit_time() {
-        let mut tpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        let mut tpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         tpdo_mappings
             .push(PdoMapping {
                 index: 0x6000,
@@ -1793,7 +1793,7 @@ mod tests {
 
     #[test]
     fn notify_changed_does_not_trigger_sync_tpdo() {
-        let mut tpdo_mappings = heapless::Vec::<PdoMapping, 8>::new();
+        let mut tpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         tpdo_mappings
             .push(PdoMapping {
                 index: 0x6000,

@@ -1,6 +1,16 @@
 use syn::parse::{Parse, ParseStream};
 use syn::{braced, bracketed, parenthesized, Ident, LitInt, LitStr, Result, Token, Visibility};
 
+/// Maximum PDO payload in bits (classic CANopen: 8 bytes). Mirrors
+/// `canopen_core::pdo::PDO_MAX_PAYLOAD_BITS` — kept as a proc-macro-time copy so
+/// the compile-time budget check runs during macro expansion.
+pub const PDO_MAX_PAYLOAD_BITS: usize = 64;
+
+/// Maximum mapping entries per PDO. Must equal
+/// `canopen_core::pdo::PDO_MAX_MAPPINGS` (that constant sizes the generated
+/// arrays); this copy drives the parse-time entry-count check.
+pub const PDO_MAX_MAPPINGS: usize = 64;
+
 /// Top-level OD definition parsed from the macro input.
 #[derive(Debug)]
 pub struct OdDefinition {
@@ -92,8 +102,15 @@ pub struct PdoDef {
     /// mapping"). Default is immutable: the PDO's meaning is a device
     /// invariant.
     pub mapping: MappingKind,
-    /// Field names referencing previously defined OD entries.
-    pub mappings: Vec<Ident>,
+    /// Field names referencing previously defined OD entries, with an optional
+    /// bit length preserved from imported EDS mapping entries.
+    pub mappings: Vec<PdoMappingDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PdoMappingDef {
+    pub field_name: Ident,
+    pub bit_length: Option<u8>,
 }
 
 /// Mutability of a PDO's mapping record (DSL: `mapping = mutable|immutable`).
@@ -499,15 +516,18 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
     let mut mappings = Vec::new();
     while !mapping_content.is_empty() {
         let field: Ident = mapping_content.parse()?;
-        mappings.push(field);
+        mappings.push(PdoMappingDef {
+            field_name: field,
+            bit_length: None,
+        });
         if mapping_content.peek(Token![,]) {
             mapping_content.parse::<Token![,]>()?;
         }
     }
-    if mappings.len() > 8 {
+    if mappings.len() > PDO_MAX_MAPPINGS {
         return Err(syn::Error::new(
-            mappings[8].span(),
-            "a PDO can map at most 8 objects (CiA 301)",
+            mappings[PDO_MAX_MAPPINGS].field_name.span(),
+            "a classic CANopen PDO can map at most 64 one-bit objects",
         ));
     }
 
