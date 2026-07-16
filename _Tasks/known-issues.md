@@ -99,6 +99,16 @@ There are tests for ordinary transfers and some block sequence errors, but not f
 
 ## Ergonomic Improvements (backlog)
 
+### No DSL syntax for dummy PDO mappings
+
+(2026-07-16.) The PDO engines support dummy mappings (padding via static data
+type indices 0x0001–0x0007: TPDOs emit zeros, RPDOs skip) and EDS
+import/export round-trips them, but the hand-written `object_dictionary!` DSL
+cannot declare one — useful for alignment padding now that bools map as
+1 bit. Would need e.g. `dummy<bits>` in the PDO mapping list;
+`PdoMappingDef.raw_mapping` is already plumbed through codegen, so only the
+parser needs the syntax.
+
 ### `TryFrom<u8> for NodeId`
 
 `NodeId::new(x).unwrap()` is the only way to create a `NodeId`. A `TryFrom<u8>` impl would be more idiomatic and enable `let node: NodeId = 5u8.try_into()?;`.

@@ -1,0 +1,120 @@
+[FileInfo]
+FileName=test_dummy_mapping.eds
+FileVersion=1
+CreatedBy=canopen-rs test
+
+[DeviceInfo]
+VendorName=Test
+ProductName=DummyMapping
+BaudRate_500=1
+SimpleBootUpSlave=1
+
+[MandatoryObjects]
+SupportedObjects=1
+1=0x1000
+
+[OptionalObjects]
+SupportedObjects=2
+1=0x1800
+2=0x1A00
+
+[ManufacturerObjects]
+SupportedObjects=2
+1=0x2000
+2=0x2001
+
+[1000]
+ParameterName=Device Type
+ObjectType=0x7
+DataType=0x0007
+AccessType=ro
+DefaultValue=0
+
+[2000]
+ParameterName=flag
+ObjectType=0x7
+DataType=0x0001
+AccessType=ro
+DefaultValue=false
+PDOMapping=1
+
+[2001]
+ParameterName=value
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=0
+PDOMapping=1
+
+[1800]
+ParameterName=TPDO1 Communication
+ObjectType=0x9
+SubNumber=5
+
+[1800sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=5
+
+[1800sub1]
+ParameterName=COB-ID
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=$NODEID+0x180
+
+[1800sub2]
+ParameterName=Transmission Type
+ObjectType=0x7
+DataType=0x0005
+AccessType=rw
+DefaultValue=0xFF
+
+[1800sub3]
+ParameterName=Inhibit Time
+ObjectType=0x7
+DataType=0x0006
+AccessType=rw
+DefaultValue=0
+
+[1800sub5]
+ParameterName=Event Timer
+ObjectType=0x7
+DataType=0x0006
+AccessType=rw
+DefaultValue=0
+
+[1A00]
+ParameterName=TPDO1 Mapping
+ObjectType=0x9
+SubNumber=4
+
+[1A00sub0]
+ParameterName=Number of Mapped Objects
+ObjectType=0x7
+DataType=0x0005
+AccessType=const
+DefaultValue=3
+
+[1A00sub1]
+ParameterName=Mapping Entry 1
+ObjectType=0x7
+DataType=0x0007
+AccessType=const
+DefaultValue=0x20000001
+
+[1A00sub2]
+ParameterName=Mapping Entry 2
+ObjectType=0x7
+DataType=0x0007
+AccessType=const
+DefaultValue=0x00010007
+
+[1A00sub3]
+ParameterName=Mapping Entry 3
+ObjectType=0x7
+DataType=0x0007
+AccessType=const
+DefaultValue=0x20010008

@@ -90,6 +90,14 @@ pub(crate) fn resolve_pdo_mappings(pdo: &PdoDef, flat: &[FlatEntry]) -> Vec<Reso
     );
     let mut resolved = Vec::new();
     for mapping in &pdo.mappings {
+        if let Some(raw_mapping) = mapping.raw_mapping {
+            resolved.push(ResolvedMapping {
+                index: (raw_mapping >> 16) as u16,
+                subindex: ((raw_mapping >> 8) & 0xFF) as u8,
+                bit_length: raw_mapping as u8,
+            });
+            continue;
+        }
         let field_name = &mapping.field_name;
         let entry = flat
             .iter()

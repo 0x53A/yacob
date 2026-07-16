@@ -48,6 +48,13 @@ impl PdoMapping {
     }
 }
 
+/// CiA 301 dummy mapping: entries mapping a static data type carry no data —
+/// TPDOs emit zero bits, RPDOs skip the bits without an OD write. Keep in
+/// sync with the same range check in canopen-derive/src/eds_parser.rs.
+const fn is_dummy_mapping_index(index: u16) -> bool {
+    matches!(index, 0x0001..=0x0007)
+}
+
 fn copy_bits(
     src: &[u8],
     src_bit_offset: usize,
@@ -55,6 +62,14 @@ fn copy_bits(
     dst_bit_offset: usize,
     bit_len: usize,
 ) {
+    if src_bit_offset % 8 == 0 && dst_bit_offset % 8 == 0 && bit_len % 8 == 0 {
+        let byte_len = bit_len / 8;
+        let src_start = src_bit_offset / 8;
+        let dst_start = dst_bit_offset / 8;
+        dst[dst_start..dst_start + byte_len].copy_from_slice(&src[src_start..src_start + byte_len]);
+        return;
+    }
+
     for bit in 0..bit_len {
         let src_bit = src_bit_offset + bit;
         let dst_bit = dst_bit_offset + bit;
@@ -446,6 +461,10 @@ impl<const N: usize> TpdoEngine<N> {
             if end_bit > 64 {
                 return None; // PDO too long
             }
+            if is_dummy_mapping_index(mapping.index) {
+                bit_offset = end_bit;
+                continue;
+            }
             let object_len = bytes_for_bits(bit_len);
             if od
                 .read(
@@ -570,6 +589,10 @@ impl<const N: usize> RpdoEngine<N> {
                 let object_len = bytes_for_bits(bit_len);
                 if end_bit > data.len() * 8 || object_len > object_data.len() {
                     break;
+                }
+                if is_dummy_mapping_index(mapping.index) {
+                    bit_offset = end_bit;
+                    continue;
                 }
                 copy_bits(data, bit_offset, &mut object_data, 0, bit_len);
                 if od
@@ -1000,6 +1023,112 @@ mod tests {
         assert!(od.output_flag1);
         assert!(!od.output_flag2);
         assert_eq!(od.output1, 0b1011_1001);
+    }
+
+    #[test]
+    fn tpdo_dummy_mapping_pads_with_zero_bits() {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6001,
+                subindex: 1,
+                bit_length: 1,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x0001,
+                subindex: 0,
+                bit_length: 7,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+
+        let config = TpdoConfig {
+            od_number: 0,
+            cob_id: 0x181,
+            transmission_type: 1,
+            inhibit_time_100us: 0,
+            event_timer_ms: 0,
+            mappings,
+            enabled: true,
+        };
+
+        let mut engine = TpdoEngine::new([config]);
+        let od = PdoTestOd {
+            input1: 0xA5,
+            input2: 0,
+            input_flag1: true,
+            input_flag2: false,
+            output1: 0,
+            output_flag1: false,
+            output_flag2: false,
+        };
+        let mut out = Vec::<CanFrame, 1>::new();
+
+        engine.on_sync(&od, &mut out);
+
+        assert_eq!(out[0].data(), &[0x01, 0xA5]);
+    }
+
+    #[test]
+    fn rpdo_dummy_mapping_skips_padding_bits() {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6201,
+                subindex: 1,
+                bit_length: 1,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x0001,
+                subindex: 0,
+                bit_length: 7,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+
+        let config = RpdoConfig {
+            od_number: 0,
+            cob_id: 0x201,
+            transmission_type: 255,
+            deadline_ms: 0,
+            mappings,
+            enabled: true,
+        };
+
+        let mut engine = RpdoEngine::new([config]);
+        let mut od = PdoTestOd {
+            input1: 0,
+            input2: 0,
+            input_flag1: false,
+            input_flag2: false,
+            output1: 0,
+            output_flag1: false,
+            output_flag2: false,
+        };
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+        let frame = CanFrame::new(0x201, &[0x01, 0xA5]).unwrap();
+
+        assert!(engine.process(&frame, &mut od, &mut events, 0));
+
+        assert!(od.output_flag1);
+        assert_eq!(od.output1, 0xA5);
+        assert_eq!(events.len(), 2);
     }
 
     fn deadline_test_engine(deadline_ms: u16) -> RpdoEngine<1> {

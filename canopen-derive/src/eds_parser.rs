@@ -479,6 +479,15 @@ fn resolve_mapping(mapping_val: u32, entries: &mut [OdEntry]) -> Option<PdoMappi
     let mapped_index = (mapping_val >> 16) as u16;
     let mapped_sub = ((mapping_val >> 8) & 0xFF) as u8;
     let bit_length = mapping_val as u8;
+    // CiA 301 dummy mapping (static data type index, padding — no OD entry).
+    // Keep in sync with is_dummy_mapping_index in canopen-core/src/pdo/engine.rs.
+    if (0x0001..=0x0007).contains(&mapped_index) {
+        return Some(PdoMappingDef {
+            field_name: Ident::new("__dummy_mapping", Span::call_site()),
+            bit_length: Some(bit_length),
+            raw_mapping: Some(mapping_val),
+        });
+    }
     for entry in entries.iter_mut() {
         match &mut entry.kind {
             EntryKind::Var(ref mut var) if entry.index == mapped_index && mapped_sub == 0 => {
@@ -486,6 +495,7 @@ fn resolve_mapping(mapping_val: u32, entries: &mut [OdEntry]) -> Option<PdoMappi
                 return Some(PdoMappingDef {
                     field_name: entry.name.clone(),
                     bit_length: Some(bit_length),
+                    raw_mapping: None,
                 });
             }
             EntryKind::Record(ref mut subs) if entry.index == mapped_index => {
@@ -495,6 +505,7 @@ fn resolve_mapping(mapping_val: u32, entries: &mut [OdEntry]) -> Option<PdoMappi
                         return Some(PdoMappingDef {
                             field_name: sub.name.clone(),
                             bit_length: Some(bit_length),
+                            raw_mapping: None,
                         });
                     }
                 }

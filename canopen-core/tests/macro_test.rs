@@ -391,6 +391,46 @@ fn dsl_bool_pdo_mappings_are_one_bit() {
 }
 
 #[test]
+fn dsl_bool_pdo_mappings_pack_end_to_end() {
+    use canopen_core::pdo::{RpdoEngine, TpdoEngine};
+    use canopen_core::transport::CanFrame;
+    use canopen_core::{NodeConfig, OdEvent};
+    use heapless::{Deque, Vec};
+
+    let mut od = BoolPdoTestOd::new();
+    od.limit_low = true;
+    od.limit_high = false;
+    od.flag3 = true;
+    od.flag4 = false;
+    od.flag5 = true;
+    od.flag6 = false;
+    od.flag7 = true;
+    od.flag8 = false;
+    od.flag9 = true;
+
+    let node_id = canopen_core::cobid::NodeId::new(1).unwrap();
+    let config = NodeConfig::<1, 1>::from_od(&od, node_id);
+
+    let mut tpdo = TpdoEngine::new(config.tpdo);
+    let mut dirty = Vec::<(u16, u8), 16>::new();
+    dirty.push((0x2000, 1)).unwrap();
+    let mut out = Vec::<CanFrame, 1>::new();
+    tpdo.poll(&od, 0, &dirty, &mut out);
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].raw_id(), 0x181);
+    assert_eq!(out[0].data(), &[0b0101_0101, 0b0000_0001]);
+
+    let mut rpdo = RpdoEngine::new(config.rpdo);
+    let mut events = Deque::<OdEvent, 4>::new();
+    let frame = CanFrame::new(0x201, &[0b0000_0001]).unwrap();
+    assert!(rpdo.process(&frame, &mut od, &mut events, 0));
+
+    assert!(od.enable);
+    assert!(!od.reset_fault);
+}
+
+#[test]
 fn pdo_od_has_tpdo_comm_params() {
     let od = PdoTestOd::new();
     let mut buf = [0u8; 4];

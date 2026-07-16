@@ -307,7 +307,7 @@ PDOMapping=0
 [1A00]
 ParameterName=TPDO1 Mapping
 ObjectType=0x9
-SubNumber=9
+SubNumber=3
 
 [1A00sub0]
 ParameterName=Number of Mapped Objects
@@ -331,54 +331,6 @@ ObjectType=0x7
 DataType=0x0007
 AccessType=const
 DefaultValue=0x60000210
-PDOMapping=0
-
-[1A00sub3]
-ParameterName=Mapping Entry 3
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
-PDOMapping=0
-
-[1A00sub4]
-ParameterName=Mapping Entry 4
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
-PDOMapping=0
-
-[1A00sub5]
-ParameterName=Mapping Entry 5
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
-PDOMapping=0
-
-[1A00sub6]
-ParameterName=Mapping Entry 6
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
-PDOMapping=0
-
-[1A00sub7]
-ParameterName=Mapping Entry 7
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
-PDOMapping=0
-
-[1A00sub8]
-ParameterName=Mapping Entry 8
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
 PDOMapping=0
 
 [1400]
@@ -421,7 +373,7 @@ PDOMapping=0
 [1600]
 ParameterName=RPDO1 Mapping
 ObjectType=0x9
-SubNumber=9
+SubNumber=3
 
 [1600sub0]
 ParameterName=Number of Mapped Objects
@@ -445,54 +397,6 @@ ObjectType=0x7
 DataType=0x0007
 AccessType=const
 DefaultValue=0x62000210
-PDOMapping=0
-
-[1600sub3]
-ParameterName=Mapping Entry 3
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
-PDOMapping=0
-
-[1600sub4]
-ParameterName=Mapping Entry 4
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
-PDOMapping=0
-
-[1600sub5]
-ParameterName=Mapping Entry 5
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
-PDOMapping=0
-
-[1600sub6]
-ParameterName=Mapping Entry 6
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
-PDOMapping=0
-
-[1600sub7]
-ParameterName=Mapping Entry 7
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
-PDOMapping=0
-
-[1600sub8]
-ParameterName=Mapping Entry 8
-ObjectType=0x7
-DataType=0x0007
-AccessType=const
-DefaultValue=0x00000000
 PDOMapping=0
 
 [1804]
@@ -543,7 +447,7 @@ PDOMapping=0
 [1A04]
 ParameterName=TPDO5 Mapping
 ObjectType=0x9
-SubNumber=9
+SubNumber=65
 
 [1A04sub0]
 ParameterName=Number of Mapped Objects
@@ -552,6 +456,8 @@ DataType=0x0005
 AccessType=rw
 DefaultValue=0x1
 PDOMapping=0
+LowLimit=0
+HighLimit=64
 
 [1A04sub1]
 ParameterName=Mapping Entry 1
@@ -617,6 +523,454 @@ AccessType=rw
 DefaultValue=0x00000000
 PDOMapping=0
 
+[1A04sub9]
+ParameterName=Mapping Entry 9
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04subA]
+ParameterName=Mapping Entry 10
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04subB]
+ParameterName=Mapping Entry 11
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04subC]
+ParameterName=Mapping Entry 12
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04subD]
+ParameterName=Mapping Entry 13
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04subE]
+ParameterName=Mapping Entry 14
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04subF]
+ParameterName=Mapping Entry 15
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub10]
+ParameterName=Mapping Entry 16
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub11]
+ParameterName=Mapping Entry 17
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub12]
+ParameterName=Mapping Entry 18
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub13]
+ParameterName=Mapping Entry 19
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub14]
+ParameterName=Mapping Entry 20
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub15]
+ParameterName=Mapping Entry 21
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub16]
+ParameterName=Mapping Entry 22
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub17]
+ParameterName=Mapping Entry 23
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub18]
+ParameterName=Mapping Entry 24
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub19]
+ParameterName=Mapping Entry 25
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub1A]
+ParameterName=Mapping Entry 26
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub1B]
+ParameterName=Mapping Entry 27
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub1C]
+ParameterName=Mapping Entry 28
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub1D]
+ParameterName=Mapping Entry 29
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub1E]
+ParameterName=Mapping Entry 30
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub1F]
+ParameterName=Mapping Entry 31
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub20]
+ParameterName=Mapping Entry 32
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub21]
+ParameterName=Mapping Entry 33
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub22]
+ParameterName=Mapping Entry 34
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub23]
+ParameterName=Mapping Entry 35
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub24]
+ParameterName=Mapping Entry 36
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub25]
+ParameterName=Mapping Entry 37
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub26]
+ParameterName=Mapping Entry 38
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub27]
+ParameterName=Mapping Entry 39
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub28]
+ParameterName=Mapping Entry 40
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub29]
+ParameterName=Mapping Entry 41
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub2A]
+ParameterName=Mapping Entry 42
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub2B]
+ParameterName=Mapping Entry 43
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub2C]
+ParameterName=Mapping Entry 44
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub2D]
+ParameterName=Mapping Entry 45
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub2E]
+ParameterName=Mapping Entry 46
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub2F]
+ParameterName=Mapping Entry 47
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub30]
+ParameterName=Mapping Entry 48
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub31]
+ParameterName=Mapping Entry 49
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub32]
+ParameterName=Mapping Entry 50
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub33]
+ParameterName=Mapping Entry 51
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub34]
+ParameterName=Mapping Entry 52
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub35]
+ParameterName=Mapping Entry 53
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub36]
+ParameterName=Mapping Entry 54
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub37]
+ParameterName=Mapping Entry 55
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub38]
+ParameterName=Mapping Entry 56
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub39]
+ParameterName=Mapping Entry 57
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub3A]
+ParameterName=Mapping Entry 58
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub3B]
+ParameterName=Mapping Entry 59
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub3C]
+ParameterName=Mapping Entry 60
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub3D]
+ParameterName=Mapping Entry 61
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub3E]
+ParameterName=Mapping Entry 62
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub3F]
+ParameterName=Mapping Entry 63
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1A04sub40]
+ParameterName=Mapping Entry 64
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
 [1404]
 ParameterName=RPDO5 Communication
 ObjectType=0x9
@@ -657,7 +1011,7 @@ PDOMapping=0
 [1604]
 ParameterName=RPDO5 Mapping
 ObjectType=0x9
-SubNumber=9
+SubNumber=65
 
 [1604sub0]
 ParameterName=Number of Mapped Objects
@@ -666,6 +1020,8 @@ DataType=0x0005
 AccessType=rw
 DefaultValue=0x1
 PDOMapping=0
+LowLimit=0
+HighLimit=64
 
 [1604sub1]
 ParameterName=Mapping Entry 1
@@ -725,6 +1081,454 @@ PDOMapping=0
 
 [1604sub8]
 ParameterName=Mapping Entry 8
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub9]
+ParameterName=Mapping Entry 9
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604subA]
+ParameterName=Mapping Entry 10
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604subB]
+ParameterName=Mapping Entry 11
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604subC]
+ParameterName=Mapping Entry 12
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604subD]
+ParameterName=Mapping Entry 13
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604subE]
+ParameterName=Mapping Entry 14
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604subF]
+ParameterName=Mapping Entry 15
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub10]
+ParameterName=Mapping Entry 16
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub11]
+ParameterName=Mapping Entry 17
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub12]
+ParameterName=Mapping Entry 18
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub13]
+ParameterName=Mapping Entry 19
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub14]
+ParameterName=Mapping Entry 20
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub15]
+ParameterName=Mapping Entry 21
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub16]
+ParameterName=Mapping Entry 22
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub17]
+ParameterName=Mapping Entry 23
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub18]
+ParameterName=Mapping Entry 24
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub19]
+ParameterName=Mapping Entry 25
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub1A]
+ParameterName=Mapping Entry 26
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub1B]
+ParameterName=Mapping Entry 27
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub1C]
+ParameterName=Mapping Entry 28
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub1D]
+ParameterName=Mapping Entry 29
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub1E]
+ParameterName=Mapping Entry 30
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub1F]
+ParameterName=Mapping Entry 31
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub20]
+ParameterName=Mapping Entry 32
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub21]
+ParameterName=Mapping Entry 33
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub22]
+ParameterName=Mapping Entry 34
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub23]
+ParameterName=Mapping Entry 35
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub24]
+ParameterName=Mapping Entry 36
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub25]
+ParameterName=Mapping Entry 37
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub26]
+ParameterName=Mapping Entry 38
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub27]
+ParameterName=Mapping Entry 39
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub28]
+ParameterName=Mapping Entry 40
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub29]
+ParameterName=Mapping Entry 41
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub2A]
+ParameterName=Mapping Entry 42
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub2B]
+ParameterName=Mapping Entry 43
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub2C]
+ParameterName=Mapping Entry 44
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub2D]
+ParameterName=Mapping Entry 45
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub2E]
+ParameterName=Mapping Entry 46
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub2F]
+ParameterName=Mapping Entry 47
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub30]
+ParameterName=Mapping Entry 48
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub31]
+ParameterName=Mapping Entry 49
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub32]
+ParameterName=Mapping Entry 50
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub33]
+ParameterName=Mapping Entry 51
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub34]
+ParameterName=Mapping Entry 52
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub35]
+ParameterName=Mapping Entry 53
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub36]
+ParameterName=Mapping Entry 54
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub37]
+ParameterName=Mapping Entry 55
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub38]
+ParameterName=Mapping Entry 56
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub39]
+ParameterName=Mapping Entry 57
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub3A]
+ParameterName=Mapping Entry 58
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub3B]
+ParameterName=Mapping Entry 59
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub3C]
+ParameterName=Mapping Entry 60
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub3D]
+ParameterName=Mapping Entry 61
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub3E]
+ParameterName=Mapping Entry 62
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub3F]
+ParameterName=Mapping Entry 63
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x00000000
+PDOMapping=0
+
+[1604sub40]
+ParameterName=Mapping Entry 64
 ObjectType=0x7
 DataType=0x0007
 AccessType=rw

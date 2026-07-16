@@ -80,6 +80,10 @@ object_dictionary_from_eds! {
     pub struct BoolMappedAsU8Od = "tests/test_bool_mapped_as_u8.eds";
 }
 
+object_dictionary_from_eds! {
+    pub struct DummyMappedOd = "tests/test_dummy_mapping.eds";
+}
+
 #[test]
 fn eds_pdo_device_string_default() {
     let od = PdoDeviceOd::new();
@@ -104,6 +108,26 @@ fn eds_import_preserves_declared_pdo_mapping_length() {
     assert_eq!(config.mappings[0].index, 0x2000);
     assert_eq!(config.mappings[0].subindex, 0);
     assert_eq!(config.mappings[0].bit_length, 8);
+}
+
+#[test]
+fn eds_import_preserves_dummy_pdo_mapping() {
+    let od = DummyMappedOd::new();
+    let mut buf = [0u8; 4];
+
+    assert_eq!(od.read(0x1A00, 1, &mut buf), Ok(4));
+    assert_eq!(u32::from_le_bytes(buf), 0x2000_0001);
+    assert_eq!(od.read(0x1A00, 2, &mut buf), Ok(4));
+    assert_eq!(u32::from_le_bytes(buf), 0x0001_0007);
+    assert_eq!(od.read(0x1A00, 3, &mut buf), Ok(4));
+    assert_eq!(u32::from_le_bytes(buf), 0x2001_0008);
+
+    let tpdo = od.tpdo_configs(canopen_core::cobid::NodeId::new(1).unwrap());
+    let config = &tpdo[0];
+    assert_eq!(config.mappings.len(), 3);
+    assert_eq!(config.mappings[1].index, 0x0001);
+    assert_eq!(config.mappings[1].subindex, 0);
+    assert_eq!(config.mappings[1].bit_length, 7);
 }
 
 #[test]

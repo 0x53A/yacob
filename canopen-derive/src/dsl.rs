@@ -111,6 +111,7 @@ pub struct PdoDef {
 pub struct PdoMappingDef {
     pub field_name: Ident,
     pub bit_length: Option<u8>,
+    pub raw_mapping: Option<u32>,
 }
 
 /// Mutability of a PDO's mapping record (DSL: `mapping = mutable|immutable`).
@@ -519,6 +520,7 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
         mappings.push(PdoMappingDef {
             field_name: field,
             bit_length: None,
+            raw_mapping: None,
         });
         if mapping_content.peek(Token![,]) {
             mapping_content.parse::<Token![,]>()?;
