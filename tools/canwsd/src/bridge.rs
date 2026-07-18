@@ -1,118 +1,60 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use axum::extract::ws::{self, WebSocket};
+use axum::extract::ws::{self, CloseFrame, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use socketcan::tokio::CanSocket;
-use socketcan::{CanFrame, EmbeddedFrame, Frame, SocketOptions};
-use tokio::sync::{broadcast, mpsc};
+use socketcan::{
+    CanFrame, CanRemoteFrame, EmbeddedFrame, ExtendedId, Frame, Id, SocketOptions, StandardId,
+};
+use tokio::sync::mpsc;
+use tokio::time::{Instant, MissedTickBehavior};
 
 use canwsd_proto::filter::ClientCommand;
-use canwsd_proto::{CanFilter, WireFrame};
+use canwsd_proto::{CanFilter, ServerStatusRef, WireFrame, close_code};
 
-const BROADCAST_CAPACITY: usize = 256;
-const WRITE_CHANNEL_CAPACITY: usize = 64;
+/// Per-client receive buffer between the CAN socket and the WebSocket:
+/// 16384 frames × 16 B = 256 KiB, roughly 3 s of a saturated 500 kbps bus.
+/// It absorbs short WS delivery hiccups; if it fills anyway the whole buffer
+/// is cleared and the client is told how much it lost (ServerStatus::Overflow)
+/// — a client that far behind wants a fresh start, not a stale replay.
+const FRAME_BUFFER: usize = 16384;
+/// CAN_RAW sockets accept at most this many kernel filters. The kernel filter
+/// is an optimization only — every failure path degrades to accept-all plus
+/// userspace filtering, never to over-filtering.
+const MAX_KERNEL_FILTERS: usize = 512;
+/// WS keepalive: ping cadence and how long a client may stay silent (no pong,
+/// no traffic) before the connection is considered half-open and dropped.
+const PING_INTERVAL: Duration = Duration::from_secs(10);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-enum KernelFilterUpdate {
-    DropAll,
-    AcceptAll,
-    Set(Vec<(u32, u32)>),
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(0);
+
+pub fn next_client_id() -> u64 {
+    NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-struct FilterManager {
-    clients: HashMap<u64, Option<Vec<CanFilter>>>,
-    next_id: u64,
-    filter_tx: mpsc::UnboundedSender<KernelFilterUpdate>,
-}
-
-impl FilterManager {
-    fn new(filter_tx: mpsc::UnboundedSender<KernelFilterUpdate>) -> Self {
-        Self {
-            clients: HashMap::new(),
-            next_id: 0,
-            filter_tx,
-        }
-    }
-
-    fn register(&mut self, initial: Option<Vec<CanFilter>>) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.clients.insert(id, initial);
-        self.recompute();
-        id
-    }
-
-    fn unregister(&mut self, id: u64) {
-        self.clients.remove(&id);
-        self.recompute();
-    }
-
-    fn update(&mut self, id: u64, filter: Option<Vec<CanFilter>>) {
-        if let Some(entry) = self.clients.get_mut(&id) {
-            *entry = filter;
-            self.recompute();
-        }
-    }
-
-    fn recompute(&self) {
-        let update = if self.clients.is_empty() {
-            KernelFilterUpdate::DropAll
-        } else if self.clients.values().any(|f| f.is_none()) {
-            KernelFilterUpdate::AcceptAll
-        } else {
-            let filters: Vec<(u32, u32)> = self
-                .clients
-                .values()
-                .flat_map(|f| f.as_ref().unwrap().iter())
-                .map(|f| (f.id, f.mask))
-                .collect();
-            if filters.is_empty() {
-                KernelFilterUpdate::DropAll
-            } else {
-                KernelFilterUpdate::Set(filters)
-            }
-        };
-        let _ = self.filter_tx.send(update);
-    }
-}
-
-struct Interface {
-    rx: broadcast::Sender<(u32, Vec<u8>)>,
-    write_tx: mpsc::Sender<(u32, Vec<u8>)>,
-    filters: Arc<Mutex<FilterManager>>,
-}
-
+/// Maps exposed network names to socketcan interface names. Each WS client
+/// gets its own CAN socket, so the kernel provides filtering and cross-client
+/// echo (loopback delivers a frame to the other sockets once it was actually
+/// transmitted; RECV_OWN_MSGS stays off, so a client never sees its own).
 pub struct BridgeHub {
-    interfaces: HashMap<String, Arc<Interface>>,
+    interfaces: HashMap<String, String>,
 }
 
 impl BridgeHub {
     pub fn new(specs: &[(String, String)]) -> Self {
-        let mut interfaces = HashMap::new();
-        for (can_name, exposed_name) in specs {
-            let (bc_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-            let (write_tx, write_rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
-            let (filter_tx, filter_rx) = mpsc::unbounded_channel();
-
-            let fm = Arc::new(Mutex::new(FilterManager::new(filter_tx)));
-
-            let iface = Arc::new(Interface {
-                rx: bc_tx.clone(),
-                write_tx,
-                filters: fm,
-            });
-
-            let can_name = can_name.clone();
-            let log_name = if *exposed_name != can_name {
-                format!("{can_name} (as {exposed_name})")
-            } else {
-                can_name.clone()
-            };
-            tokio::spawn(can_task(can_name, log_name, bc_tx, write_rx, filter_rx));
-
-            interfaces.insert(exposed_name.clone(), iface);
-        }
+        let interfaces = specs
+            .iter()
+            .map(|(can_name, exposed)| (exposed.clone(), can_name.clone()))
+            .collect();
         BridgeHub { interfaces }
+    }
+
+    pub fn resolve(&self, exposed: &str) -> Option<&str> {
+        self.interfaces.get(exposed).map(String::as_str)
     }
 
     pub fn interface_names(&self) -> Vec<String> {
@@ -120,203 +62,290 @@ impl BridgeHub {
         names.sort();
         names
     }
+}
 
-    pub async fn serve_client(
-        &self,
-        socket: WebSocket,
-        interface: &str,
-        initial_filter: Option<Vec<CanFilter>>,
-    ) -> Result<(), String> {
-        let iface = self
-            .interfaces
-            .get(interface)
-            .ok_or_else(|| format!("unknown interface: {interface}"))?;
+/// Open and configure the CAN socket for one client. Returns the socket and
+/// whether frames must additionally be filtered in userspace (kernel filter
+/// could not be applied exactly).
+pub fn open_client_socket(
+    can_name: &str,
+    filter: Option<&[CanFilter]>,
+    want_errors: bool,
+    log_name: &str,
+) -> std::io::Result<(CanSocket, bool)> {
+    let sock = CanSocket::open(can_name)?;
+    let userspace_filter = apply_filter(&sock, filter, log_name);
+    if want_errors
+        && let Err(e) = sock.set_error_filter_accept_all() {
+            log::warn!("{log_name}: failed to enable error frames: {e}");
+        }
+    Ok((sock, userspace_filter))
+}
 
-        let client_id = iface
-            .filters
-            .lock()
-            .unwrap()
-            .register(initial_filter.clone());
-        log::info!("{interface}: client {client_id} connected");
+struct RxState {
+    frames: VecDeque<WireFrame>,
+    /// Frames discarded by buffer clears since the last overflow report.
+    dropped: u64,
+    /// Set once by the reader when the CAN read fails; the reader exits after.
+    bus_error: Option<String>,
+}
 
-        let client_filters: Arc<Mutex<Option<Vec<CanFilter>>>> =
-            Arc::new(Mutex::new(initial_filter));
-        let mut can_rx = iface.rx.subscribe();
-        let write_tx = iface.write_tx.clone();
+enum RxEvent {
+    Frame(WireFrame),
+    Overflow(u64),
+    BusError(String),
+}
 
-        let (mut ws_tx, mut ws_rx) = socket.split();
-        let client_filters_recv = client_filters.clone();
-        let fm_for_send = iface.filters.clone();
+/// Wait for the next receive event. Overflow is reported before the frames
+/// that came after the clear; bus death is reported after everything that was
+/// buffered before it.
+async fn next_rx(state: &Mutex<RxState>, signal: &mut mpsc::Receiver<()>) -> RxEvent {
+    loop {
+        {
+            let mut s = state.lock().unwrap();
+            if s.dropped > 0 {
+                let n = s.dropped;
+                s.dropped = 0;
+                return RxEvent::Overflow(n);
+            }
+            if let Some(frame) = s.frames.pop_front() {
+                return RxEvent::Frame(frame);
+            }
+            if let Some(error) = s.bus_error.take() {
+                return RxEvent::BusError(error);
+            }
+        }
+        if signal.recv().await.is_none() {
+            // Reader gone without setting bus_error — only after abort, where
+            // nobody awaits us anymore. Report it anyway rather than spin.
+            return RxEvent::BusError("CAN reader task ended".into());
+        }
+    }
+}
 
-        let recv_task = tokio::spawn(async move {
-            loop {
-                let (id, data) = match can_rx.recv().await {
-                    Ok(frame) => frame,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        let msg = serde_json::json!({"status": "lagged", "dropped": n});
-                        let _ = ws_tx.send(ws::Message::text(msg.to_string())).await;
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+/// Drains the CAN socket into the buffer so the kernel-side queue (only
+/// ~200 frames at default rcvbuf) never fills while the WS is slow.
+async fn reader_task(sock: Arc<CanSocket>, state: Arc<Mutex<RxState>>, signal: mpsc::Sender<()>) {
+    loop {
+        match sock.read_frame().await {
+            Ok(frame) => {
+                // RTR frames: socketcan's data() yields DLC zero bytes, so
+                // the wire frame keeps the DLC.
+                let Some(wf) = WireFrame::new(frame.id_word(), frame.data()) else {
+                    continue;
                 };
-
-                let pass = {
-                    let f = client_filters_recv.lock().unwrap();
-                    match &*f {
-                        None => true,
-                        Some(filters) => filters.iter().any(|flt| flt.matches(id)),
+                {
+                    let mut s = state.lock().unwrap();
+                    if s.frames.len() >= FRAME_BUFFER {
+                        s.dropped += s.frames.len() as u64;
+                        s.frames.clear();
                     }
-                };
+                    s.frames.push_back(wf);
+                }
+                let _ = signal.try_send(());
+            }
+            Err(e) => {
+                state.lock().unwrap().bus_error = Some(e.to_string());
+                let _ = signal.try_send(());
+                return;
+            }
+        }
+    }
+}
 
-                if pass {
-                    let Some(frame) = WireFrame::new(id, &data) else {
-                        log::warn!(
-                            "dropping oversized CAN frame from socketcan: id={id:#x} len={}",
-                            data.len()
-                        );
-                        continue;
-                    };
-                    let (buf, len) = frame.encode();
-                    if ws_tx
-                        .send(ws::Message::binary(buf[..len].to_vec()))
-                        .await
-                        .is_err()
-                    {
+pub async fn run_client(
+    ws: WebSocket,
+    sock: CanSocket,
+    log_name: String,
+    mut filter: Option<Vec<CanFilter>>,
+    mut userspace_filter: bool,
+) {
+    log::info!("{log_name}: connected");
+
+    let sock = Arc::new(sock);
+    let state = Arc::new(Mutex::new(RxState {
+        frames: VecDeque::with_capacity(FRAME_BUFFER),
+        dropped: 0,
+        bus_error: None,
+    }));
+    let (signal_tx, mut signal_rx) = mpsc::channel::<()>(1);
+    let reader = tokio::spawn(reader_task(sock.clone(), state.clone(), signal_tx));
+
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_rx = Instant::now();
+
+    loop {
+        tokio::select! {
+            event = next_rx(&state, &mut signal_rx) => match event {
+                RxEvent::Frame(frame) => {
+                    // Error frames are only delivered if this client enabled
+                    // the error mask; they bypass id filters (kernel semantics).
+                    let pass = frame.is_error()
+                        || !userspace_filter
+                        || match &filter {
+                            None => true,
+                            Some(filters) => filters.iter().any(|flt| flt.matches(frame.id_word())),
+                        };
+                    if pass {
+                        let (buf, len) = frame.encode();
+                        if ws_tx
+                            .send(ws::Message::binary(buf[..len].to_vec()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                RxEvent::Overflow(dropped) => {
+                    log::warn!("{log_name}: rx buffer overflow, {dropped} frames dropped");
+                    let status =
+                        serde_json::to_string(&ServerStatusRef::Overflow { dropped }).unwrap();
+                    if ws_tx.send(ws::Message::text(status)).await.is_err() {
                         break;
                     }
                 }
-            }
-        });
+                RxEvent::BusError(error) => {
+                    log::warn!("{log_name}: bus error: {error}; disconnecting");
+                    let status =
+                        serde_json::to_string(&ServerStatusRef::BusError { error: &error })
+                            .unwrap();
+                    let _ = ws_tx.send(ws::Message::text(status)).await;
+                    let _ = ws_tx
+                        .send(ws::Message::Close(Some(CloseFrame {
+                            code: close_code::BUS_ERROR,
+                            reason: error.into(),
+                        })))
+                        .await;
+                    break;
+                }
+            },
 
-        let send_task = tokio::spawn(async move {
-            while let Some(Ok(msg)) = ws_rx.next().await {
+            msg = ws_rx.next() => {
+                let Some(Ok(msg)) = msg else { break };
+                last_rx = Instant::now();
                 match msg {
                     ws::Message::Binary(data) => match WireFrame::decode(&data) {
-                        Ok(frame) => {
-                            let _ = write_tx
-                                .send((frame.id_word(), frame.data().to_vec()))
-                                .await;
-                        }
+                        Ok(frame) => match can_frame_from_wire(&frame) {
+                            Some(out) => {
+                                if let Err(e) = sock.write_frame(out).await {
+                                    log::warn!("{log_name}: CAN write error: {e}");
+                                }
+                            }
+                            None => {
+                                log::warn!(
+                                    "{log_name}: refusing to send frame: id_word={:#x} dlc={}",
+                                    frame.id_word(),
+                                    frame.dlc()
+                                );
+                            }
+                        },
                         Err(e) => {
-                            log::debug!("ignoring invalid binary frame: {e}");
+                            log::debug!("{log_name}: ignoring invalid binary frame: {e}");
                         }
                     },
                     ws::Message::Text(text) => match serde_json::from_str::<ClientCommand>(&text) {
                         Ok(cmd) => {
-                            let new_filter = match &cmd {
+                            filter = match &cmd {
                                 ClientCommand::SetFilter { filter } => {
                                     Some(filter.iter().map(CanFilter::from).collect())
                                 }
                                 ClientCommand::ClearFilter => None,
                             };
-                            *client_filters.lock().unwrap() = new_filter.clone();
-                            fm_for_send.lock().unwrap().update(client_id, new_filter);
+                            userspace_filter = apply_filter(&sock, filter.as_deref(), &log_name);
                         }
                         Err(e) => {
-                            log::debug!("invalid client command: {e}");
+                            log::debug!("{log_name}: invalid client command: {e}");
                         }
                     },
                     ws::Message::Close(_) => break,
+                    // Pings are answered by the WS layer; Pongs only matter
+                    // for last_rx, updated above.
                     _ => {}
                 }
-            }
-        });
+            },
 
-        tokio::select! {
-            _ = recv_task => {},
-            _ = send_task => {},
-        }
-
-        iface.filters.lock().unwrap().unregister(client_id);
-        log::info!("{interface}: client {client_id} disconnected");
-
-        Ok(())
-    }
-}
-
-async fn can_task(
-    can_name: String,
-    log_name: String,
-    bc_tx: broadcast::Sender<(u32, Vec<u8>)>,
-    mut write_rx: mpsc::Receiver<(u32, Vec<u8>)>,
-    mut filter_rx: mpsc::UnboundedReceiver<KernelFilterUpdate>,
-) {
-    let sock = match CanSocket::open(&can_name) {
-        Ok(s) => {
-            log::info!("{log_name}: opened");
-            s
-        }
-        Err(e) => {
-            log::error!("{log_name}: failed to open: {e}");
-            return;
-        }
-    };
-
-    if let Err(e) = sock.set_filter_drop_all() {
-        log::warn!("{log_name}: failed to set initial drop-all filter: {e}");
-    }
-    log::info!("{log_name}: kernel filter set to drop-all (no clients)");
-
-    loop {
-        tokio::select! {
-            result = sock.read_frame() => {
-                match result {
-                    Ok(frame) => {
-                        let id = frame.id_word();
-                        let data = frame.data();
-                        let _ = bc_tx.send((id, data.to_vec()));
-                    }
-                    Err(e) => {
-                        log::error!("{log_name}: CAN read error: {e}");
-                    }
+            _ = ping.tick() => {
+                if last_rx.elapsed() > CLIENT_TIMEOUT {
+                    log::info!(
+                        "{log_name}: timed out ({}s without traffic)",
+                        CLIENT_TIMEOUT.as_secs()
+                    );
+                    break;
+                }
+                if ws_tx.send(ws::Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
                 }
             }
-
-            Some((id, data)) = write_rx.recv() => {
-                match CanFrame::from_raw_id(id, &data) {
-                    Some(frame) => {
-                        if let Err(e) = sock.write_frame(frame).await {
-                            log::warn!("{log_name}: CAN write error: {e}");
-                        }
-                    }
-                    None => {
-                        log::warn!("{log_name}: invalid CAN frame: id={id:#x} len={}", data.len());
-                    }
-                }
-            }
-
-            Some(update) = filter_rx.recv() => {
-                apply_kernel_filter(&sock, &log_name, update);
-            }
         }
     }
+
+    reader.abort();
+    log::info!("{log_name}: disconnected");
 }
 
-fn apply_kernel_filter(sock: &CanSocket, log_name: &str, update: KernelFilterUpdate) {
-    match update {
-        KernelFilterUpdate::DropAll => {
-            if let Err(e) = sock.set_filter_drop_all() {
-                log::warn!("{log_name}: failed to set drop-all filter: {e}");
-            } else {
-                log::info!("{log_name}: kernel filter set to drop-all");
-            }
-        }
-        KernelFilterUpdate::AcceptAll => {
+/// Apply a client filter to the socket's kernel filter. Returns whether
+/// frames must additionally be checked in userspace because the kernel could
+/// not be configured exactly (the kernel side is then accept-all).
+fn apply_filter(sock: &CanSocket, filter: Option<&[CanFilter]>, log_name: &str) -> bool {
+    match filter {
+        None => {
             if let Err(e) = sock.set_filter_accept_all() {
                 log::warn!("{log_name}: failed to set accept-all filter: {e}");
-            } else {
-                log::info!("{log_name}: kernel filter set to accept-all");
+            }
+            false
+        }
+        Some([]) => {
+            if let Err(e) = sock.set_filter_drop_all() {
+                log::warn!("{log_name}: failed to set drop-all filter: {e}");
+                return true;
+            }
+            false
+        }
+        Some(filters) if filters.len() > MAX_KERNEL_FILTERS => {
+            log::info!(
+                "{log_name}: {} filters exceed the kernel limit ({MAX_KERNEL_FILTERS}); filtering in userspace",
+                filters.len()
+            );
+            let _ = sock.set_filter_accept_all();
+            true
+        }
+        Some(filters) => {
+            let pairs: Vec<(u32, u32)> = filters.iter().map(|f| (f.id, f.mask)).collect();
+            match sock.set_filters(&pairs) {
+                Ok(()) => false,
+                Err(e) => {
+                    log::warn!(
+                        "{log_name}: failed to set {} kernel filters: {e}; falling back to accept-all",
+                        pairs.len()
+                    );
+                    let _ = sock.set_filter_accept_all();
+                    true
+                }
             }
         }
-        KernelFilterUpdate::Set(filters) => {
-            if let Err(e) = sock.set_filters(&filters) {
-                log::warn!("{log_name}: failed to set kernel filters: {e}");
-            } else {
-                log::info!(
-                    "{log_name}: kernel filter updated ({} rules)",
-                    filters.len()
-                );
-            }
-        }
+    }
+}
+
+/// Build a socketcan frame from a decoded wire frame. `None` for frames that
+/// cannot be transmitted (error frames, out-of-range IDs).
+///
+/// Not `CanFrame::from_raw_id`: that feeds the whole id word (flags included)
+/// into the ID range check, so every EFF or RTR frame would be rejected.
+fn can_frame_from_wire(wf: &WireFrame) -> Option<CanFrame> {
+    if wf.is_error() {
+        return None;
+    }
+    let id: Id = if wf.is_extended() {
+        ExtendedId::new(wf.id())?.into()
+    } else {
+        StandardId::new(wf.id() as u16)?.into()
+    };
+    if wf.is_rtr() {
+        CanRemoteFrame::new_remote(id, wf.dlc() as usize).map(CanFrame::Remote)
+    } else {
+        CanFrame::new(id, wf.data())
     }
 }

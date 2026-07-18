@@ -7,7 +7,7 @@ CANopen protocol stack for embedded Rust. `no_std`, `no_alloc`, uses `embedded-c
 - `canopen-core/` — protocol implementation (NMT, SDO, PDO, heartbeat, EMCY, SYNC, LSS)
 - `canopen-derive/` — proc macros (`object_dictionary!`, `object_dictionary_from_eds!`, `sdo_client_from_eds!`, EDS export)
 - `canopen-linux/` — socketcan, SLCAN, UDP multicast, and canwsd WebSocket transports + SDO client helpers
-- `canwsd-proto/` — shared canwsd interface definition (no_std): WS wire format, filter syntax, REST paths, JSON command types. Implemented by `tools/canwsd` (Linux server), consumed by `canopen-web`/`canopen-linux` clients and embedded servers
+- `canwsd-proto/` — shared canwsd interface definition (no_std): WS wire format, filter syntax, REST paths, JSON command/status types, WS close codes. Implemented by `tools/canwsd` (Linux server), consumed by `canopen-web`/`canopen-linux` clients and embedded servers
 - `hil-tests/` — hardware-in-the-loop test harness
 - `interop-tests/` — python-canopen interop tests over UDP multicast (no root needed)
 - `examples/stm32-node/` — Embassy firmware for Nucleo-G431KB (excluded from workspace, cross-compiled)

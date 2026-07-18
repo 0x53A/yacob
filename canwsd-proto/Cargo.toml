@@ -10,6 +10,6 @@ serde = { version = "1", default-features = false, features = ["derive"], option
 
 [features]
 default = ["std"]
-std = ["alloc"]
-alloc = []
+std = ["alloc", "serde?/std"]
+alloc = ["serde?/alloc"]
 serde = ["dep:serde"]
