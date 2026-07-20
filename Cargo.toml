@@ -9,6 +9,7 @@ members = [
     "examples/canopen-egui",
     "hil-tests",
     "tools/canwsd",
+    "tools/canwsd-dump",
 ]
 exclude = [
     "examples/stm32-node",

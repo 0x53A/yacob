@@ -54,11 +54,26 @@ pub mod close_code {
     pub const BUS_ERROR: u16 = 4000;
 }
 
+/// Network availability as reported by `GET /api/networks`.
+#[cfg(feature = "serde")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkStatus {
+    Available,
+    Unavailable,
+}
+
 /// One entry of the `GET /api/networks` response.
 #[cfg(all(feature = "serde", feature = "alloc"))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NetworkInfo {
     pub name: alloc::string::String,
+    pub interface: alloc::string::String,
+    /// Bitrate in bit/s. `0` means unknown or not applicable.
+    pub bitrate: u32,
+    pub status: NetworkStatus,
+    /// Empty when there is no current error.
+    pub error: alloc::string::String,
 }
 
 /// Borrowed variant of [`NetworkInfo`] for serialization without allocation
@@ -67,6 +82,10 @@ pub struct NetworkInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct NetworkInfoRef<'a> {
     pub name: &'a str,
+    pub interface: &'a str,
+    pub bitrate: u32,
+    pub status: NetworkStatus,
+    pub error: &'a str,
 }
 
 /// Server → client status message, sent as a JSON text frame.

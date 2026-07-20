@@ -5,15 +5,15 @@ use std::time::Duration;
 
 use axum::extract::ws::{self, CloseFrame, WebSocket};
 use futures_util::{SinkExt, StreamExt};
+use socketcan::SocketOptions;
 use socketcan::tokio::CanSocket;
-use socketcan::{
-    CanFrame, CanRemoteFrame, EmbeddedFrame, ExtendedId, Frame, Id, SocketOptions, StandardId,
-};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use canwsd_proto::filter::ClientCommand;
-use canwsd_proto::{CanFilter, ServerStatusRef, WireFrame, close_code};
+use canwsd_proto::{CanFilter, NetworkInfo, NetworkStatus, ServerStatusRef, WireFrame, close_code};
+
+use crate::socketcan_wire::{can_frame_from_wire, wire_from_can_frame};
 
 /// Per-client receive buffer between the CAN socket and the WebSocket:
 /// 16384 frames × 16 B = 256 KiB, roughly 3 s of a saturated 500 kbps bus.
@@ -62,6 +62,40 @@ impl BridgeHub {
         names.sort();
         names
     }
+
+    pub fn networks(&self) -> Vec<NetworkInfo> {
+        let mut networks: Vec<_> = self
+            .interfaces
+            .iter()
+            .map(|(name, interface)| network_info(name, interface))
+            .collect();
+        networks.sort_by(|a, b| a.name.cmp(&b.name));
+        networks
+    }
+}
+
+fn network_info(name: &str, interface: &str) -> NetworkInfo {
+    match CanSocket::open(interface) {
+        Ok(_) => NetworkInfo {
+            name: name.into(),
+            interface: interface.into(),
+            bitrate: read_bitrate(interface).unwrap_or(0),
+            status: NetworkStatus::Available,
+            error: String::new(),
+        },
+        Err(e) => NetworkInfo {
+            name: name.into(),
+            interface: interface.into(),
+            bitrate: read_bitrate(interface).unwrap_or(0),
+            status: NetworkStatus::Unavailable,
+            error: e.to_string(),
+        },
+    }
+}
+
+fn read_bitrate(interface: &str) -> Option<u32> {
+    let path = format!("/sys/class/net/{interface}/can_bittiming/bitrate");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Open and configure the CAN socket for one client. Returns the socket and
@@ -75,10 +109,9 @@ pub fn open_client_socket(
 ) -> std::io::Result<(CanSocket, bool)> {
     let sock = CanSocket::open(can_name)?;
     let userspace_filter = apply_filter(&sock, filter, log_name);
-    if want_errors
-        && let Err(e) = sock.set_error_filter_accept_all() {
-            log::warn!("{log_name}: failed to enable error frames: {e}");
-        }
+    if want_errors && let Err(e) = sock.set_error_filter_accept_all() {
+        log::warn!("{log_name}: failed to enable error frames: {e}");
+    }
     Ok((sock, userspace_filter))
 }
 
@@ -129,9 +162,7 @@ async fn reader_task(sock: Arc<CanSocket>, state: Arc<Mutex<RxState>>, signal: m
     loop {
         match sock.read_frame().await {
             Ok(frame) => {
-                // RTR frames: socketcan's data() yields DLC zero bytes, so
-                // the wire frame keeps the DLC.
-                let Some(wf) = WireFrame::new(frame.id_word(), frame.data()) else {
+                let Some(wf) = wire_from_can_frame(&frame) else {
                     continue;
                 };
                 {
@@ -326,26 +357,5 @@ fn apply_filter(sock: &CanSocket, filter: Option<&[CanFilter]>, log_name: &str) 
                 }
             }
         }
-    }
-}
-
-/// Build a socketcan frame from a decoded wire frame. `None` for frames that
-/// cannot be transmitted (error frames, out-of-range IDs).
-///
-/// Not `CanFrame::from_raw_id`: that feeds the whole id word (flags included)
-/// into the ID range check, so every EFF or RTR frame would be rejected.
-fn can_frame_from_wire(wf: &WireFrame) -> Option<CanFrame> {
-    if wf.is_error() {
-        return None;
-    }
-    let id: Id = if wf.is_extended() {
-        ExtendedId::new(wf.id())?.into()
-    } else {
-        StandardId::new(wf.id() as u16)?.into()
-    };
-    if wf.is_rtr() {
-        CanRemoteFrame::new_remote(id, wf.dlc() as usize).map(CanFrame::Remote)
-    } else {
-        CanFrame::new(id, wf.data())
     }
 }

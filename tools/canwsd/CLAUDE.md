@@ -1,6 +1,7 @@
 # canwsd
 
-CAN WebSocket daemon — bridges socketCAN interfaces over WebSocket.
+CAN WebSocket daemon/tool — exposes socketCAN interfaces over WebSocket and can
+attach a remote canwsd network to a local SocketCAN interface.
 
 The public interface (REST paths, wire format, filter syntax, JSON command
 types) is defined in the `canwsd-proto` crate, shared with all clients and
@@ -9,7 +10,10 @@ is the Linux/socketCAN implementation of that interface.
 
 ## Architecture
 
-- REST: `GET /api/networks` → list available CAN interfaces
+- REST: `GET /` → small human HTML status page
+- REST: `GET /api/networks` → JSON list of configured CAN networks with live
+  status, backing interface, bitrate in bit/s (`0` = unknown/not applicable),
+  and current error string
 - WS: `GET /api/networks/<name>?filter=id:mask,id:mask&errors=1` → upgrade to
   WebSocket. Connect errors before upgrade: 404 unknown name, 400 bad filter,
   503 interface cannot be opened (down/absent)
@@ -54,7 +58,10 @@ Little-endian, `5 + DLC` bytes, one frame per WebSocket message:
 
 ```sh
 cargo build
-cargo run -- --listen 0.0.0.0:8080 can0 can_arm
+cargo run -- expose --listen 0.0.0.0:8080 can0 can_arm:arm
+cargo run -- list http://127.0.0.1:8080
+cargo run -- list --json http://127.0.0.1:8080
+cargo run -- attach --remote ws://remote:8080/api/networks/arm canwsd0
 ```
 
 ## Dependencies
