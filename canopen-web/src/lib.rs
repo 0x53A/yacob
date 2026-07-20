@@ -8,8 +8,10 @@
 pub mod transport;
 
 #[cfg(target_arch = "wasm32")]
-pub use transport::{
-    canwsd::{fetch_canwsd_networks, CanwsdTransport},
-    slcan::SlcanTransport,
-    CanEvent, CanTransport,
-};
+pub use transport::{CanEvent, CanTransport};
+
+#[cfg(all(target_arch = "wasm32", feature = "canwsd"))]
+pub use transport::canwsd::{fetch_canwsd_networks, CanwsdTransport};
+
+#[cfg(all(target_arch = "wasm32", feature = "slcan"))]
+pub use transport::slcan::SlcanTransport;

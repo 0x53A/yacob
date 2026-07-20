@@ -12,35 +12,48 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{BinaryType, ErrorEvent, Event as WebEvent, MessageEvent, Response, WebSocket};
 
 pub struct CanwsdTransport {
-    inner: Rc<RefCell<Inner>>,
+    inner: Rc<Inner>,
+}
+
+/// Two disjoint cells so the frame/event queue and the WebSocket handle never
+/// share a borrow. The browser callbacks and `poll_event` touch only `events`;
+/// `send`/`connect`/`disconnect` touch only `session` (`connect` also seeds
+/// `events` on its constructor-error path, but that runs outside any callback).
+#[derive(Default)]
+struct Inner {
+    events: RefCell<VecDeque<CanEvent>>,
+    session: RefCell<Session>,
 }
 
 #[derive(Default)]
-struct Inner {
-    events: VecDeque<CanEvent>,
-    running: bool,
+struct Session {
     ws: Option<WebSocket>,
-    ws_onopen: Option<Closure<dyn FnMut(WebEvent)>>,
-    ws_onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
-    ws_onerror: Option<Closure<dyn FnMut(ErrorEvent)>>,
-    ws_onclose: Option<Closure<dyn FnMut(WebEvent)>>,
+    onopen: Option<Closure<dyn FnMut(WebEvent)>>,
+    onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
+    onerror: Option<Closure<dyn FnMut(ErrorEvent)>>,
+    onclose: Option<Closure<dyn FnMut(WebEvent)>>,
 }
 
 impl CanwsdTransport {
     pub fn connect(url: impl AsRef<str>) -> Self {
-        let inner = Rc::new(RefCell::new(Inner::default()));
+        let inner = Rc::new(Inner::default());
         connect(inner.clone(), url.as_ref().to_string());
         Self { inner }
     }
 }
 
+// Borrows are held only for the duration of a single field access and never
+// across a call into JS, and the browser never dispatches these callbacks
+// re-entrantly, so the `events` and `session` borrows never nest. Plain
+// `borrow`/`borrow_mut` is used deliberately: if that invariant is ever
+// violated it panics loudly rather than silently dropping a frame or event.
 impl CanTransport for CanwsdTransport {
     fn disconnect(&mut self) {
         disconnect_inner(self.inner.clone());
     }
 
     fn send(&self, frame: CanFrame) {
-        let Some(ws) = self.inner.borrow().ws.clone() else {
+        let Some(ws) = self.inner.session.borrow().ws.clone() else {
             return;
         };
         if let Some(wire) = WireFrame::new(frame.raw_id() as u32, frame.data()) {
@@ -50,7 +63,7 @@ impl CanTransport for CanwsdTransport {
     }
 
     fn poll_event(&mut self) -> Option<CanEvent> {
-        self.inner.borrow_mut().events.pop_front()
+        self.inner.events.borrow_mut().pop_front()
     }
 }
 
@@ -79,13 +92,13 @@ pub async fn fetch_canwsd_networks(base_url: &str) -> Result<Vec<String>, String
     Ok(networks.into_iter().map(|n| n.name).collect())
 }
 
-fn connect(inner: Rc<RefCell<Inner>>, url: String) {
+fn connect(inner: Rc<Inner>, url: String) {
     let ws = match WebSocket::new(&url) {
         Ok(ws) => ws,
         Err(e) => {
             inner
-                .borrow_mut()
                 .events
+                .borrow_mut()
                 .push_back(CanEvent::Error(js_error(e)));
             return;
         }
@@ -94,9 +107,10 @@ fn connect(inner: Rc<RefCell<Inner>>, url: String) {
 
     let onopen_inner = inner.clone();
     let onopen = Closure::wrap(Box::new(move |_event: WebEvent| {
-        let mut inner = onopen_inner.borrow_mut();
-        inner.running = true;
-        inner.events.push_back(CanEvent::Connected);
+        onopen_inner
+            .events
+            .borrow_mut()
+            .push_back(CanEvent::Connected);
     }) as Box<dyn FnMut(_)>);
     ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
 
@@ -106,8 +120,8 @@ fn connect(inner: Rc<RefCell<Inner>>, url: String) {
             let data = Uint8Array::new(&array).to_vec();
             if let Ok(frame) = decode_wire_frame(&data) {
                 onmessage_inner
-                    .borrow_mut()
                     .events
+                    .borrow_mut()
                     .push_back(CanEvent::Frame(frame));
             }
         }
@@ -117,37 +131,57 @@ fn connect(inner: Rc<RefCell<Inner>>, url: String) {
     let onerror_inner = inner.clone();
     let onerror = Closure::wrap(Box::new(move |event: ErrorEvent| {
         onerror_inner
-            .borrow_mut()
             .events
-            .push_back(CanEvent::Error(event.message()));
+            .borrow_mut()
+            .push_back(CanEvent::Error(error_message(event)));
     }) as Box<dyn FnMut(_)>);
     ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
     let onclose_inner = inner.clone();
     let onclose = Closure::wrap(Box::new(move |_event: WebEvent| {
-        let mut inner = onclose_inner.borrow_mut();
-        inner.running = false;
-        inner.events.push_back(CanEvent::Disconnected);
+        onclose_inner
+            .events
+            .borrow_mut()
+            .push_back(CanEvent::Disconnected);
     }) as Box<dyn FnMut(_)>);
     ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
 
-    let mut state = inner.borrow_mut();
-    state.ws = Some(ws);
-    state.ws_onopen = Some(onopen);
-    state.ws_onmessage = Some(onmessage);
-    state.ws_onerror = Some(onerror);
-    state.ws_onclose = Some(onclose);
+    let mut session = inner.session.borrow_mut();
+    session.ws = Some(ws);
+    session.onopen = Some(onopen);
+    session.onmessage = Some(onmessage);
+    session.onerror = Some(onerror);
+    session.onclose = Some(onclose);
 }
 
-fn disconnect_inner(inner: Rc<RefCell<Inner>>) {
-    let ws = {
-        let mut inner = inner.borrow_mut();
-        inner.running = false;
-        inner.ws.take()
-    };
+fn disconnect_inner(inner: Rc<Inner>) {
+    let ws = { inner.session.borrow().ws.clone() };
+    if let Some(ws) = ws.as_ref() {
+        ws.set_onopen(None);
+        ws.set_onmessage(None);
+        ws.set_onerror(None);
+        ws.set_onclose(None);
+    }
 
+    let ws = {
+        let mut session = inner.session.borrow_mut();
+        session.onopen = None;
+        session.onmessage = None;
+        session.onerror = None;
+        session.onclose = None;
+        session.ws.take()
+    };
     if let Some(ws) = ws {
         let _ = ws.close();
+    }
+}
+
+fn error_message(event: ErrorEvent) -> String {
+    let message = js_error(event.into());
+    if message.is_empty() {
+        "WebSocket error".to_string()
+    } else {
+        message
     }
 }
 

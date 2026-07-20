@@ -9,6 +9,11 @@ description = "Browser transports for canopen-rs using Web Serial and WebSocket"
 canopen-core = { path = "../canopen-core", features = ["std"] }
 canwsd-proto = { path = "../canwsd-proto", features = ["serde"] }
 
+[features]
+default = ["canwsd", "slcan"]
+canwsd = []
+slcan = []
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"
 serde = { version = "1.0.228", features = ["derive"] }

@@ -1,7 +1,10 @@
 use canopen_core::transport::CanFrame;
+#[cfg(any(feature = "canwsd", feature = "slcan"))]
 use wasm_bindgen::JsValue;
 
+#[cfg(feature = "canwsd")]
 pub mod canwsd;
+#[cfg(feature = "slcan")]
 pub mod slcan;
 
 #[derive(Debug)]
@@ -18,6 +21,7 @@ pub trait CanTransport {
     fn poll_event(&mut self) -> Option<CanEvent>;
 }
 
+#[cfg(any(feature = "canwsd", feature = "slcan"))]
 pub(crate) fn js_error(value: JsValue) -> String {
     value
         .as_string()
