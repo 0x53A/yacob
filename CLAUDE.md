@@ -60,6 +60,7 @@ CAN_IFACE=can0 cargo test -p hil-tests -- --test-threads=1 --ignored
 - `CanDemux` owns a transport and routes frames to per-protocol buffers (SDO, PDO, heartbeat). `DemuxSdoPort` implements `AsyncCan` so `SdoDriver` works seamlessly while non-SDO traffic is buffered. **Legacy** for master-side code — superseded by the bus model; do not grow it.
 - `SdoPort` is a simpler single-consumer filter with overflow buffer.
 - SDO server supports expedited, segmented, and block transfers (upload + download) with CRC.
+- **Additional SDO servers** (CiA 301 0x1201–0x127F): DSL `sdo_server[N](cob_rx = ..., cob_tx = ...)` declares extra channels alongside the implicit default (0x1200, `0x600/0x580 + node_id`) — e.g. one channel for normal ops, one for a diagnostics tool. Each is an independent `SdoServer` transfer state machine over the shared OD, so a transfer on one channel never disturbs another. COB-IDs are fixed (absolute or `node_id + base`, resolved at `Node::new`) and **const** — the 0x1201+ records are read-only, never remappable at runtime (the CiA 302 SDO Manager is the only spec reason to remap and is out of scope). Threaded through a `const SDO: usize = 0` generic on `Node`/`NodeConfig` (default 0 = zero cost); the macro emits `SDO_COUNT`, `SdoServerConfigSource` (pulled by `NodeConfig::from_od`), and the OD mirror-back (`store_sdo_server_cob_ids`, an `ObjectDictionary` provided method). Dispatch matches incoming frames against each server's configured rx COB-ID. COB-ID uniqueness (rx≠tx, no shadowing of the default `0x600/0x580 + node_id` or another server) is enforced in two layers: the macro rejects every statically-decidable collision at compile time (including node-relative bases vs the default), and `Node::new` has a real `assert!` (not debug-only) for the residual node-id-dependent case (an absolute COB-ID landing on the default for a particular node id). EDS export yes; EDS import pending (`sdo_server[N]` DSL only for now). Design: `_Tasks/additional-sdo-servers.md`; `vcan_node.rs` carries a diagnostics channel.
 - All types use static allocation (heapless).
 - `Dcf` (behind `alloc` feature) parses DCF/EDS files at runtime and applies configured values to local ODs or remote nodes via SDO.
 - STM32 firmware uses Embassy channels to bridge async CAN driver and polling Node.
@@ -85,6 +86,9 @@ object_dictionary! {
         rpdo[1](deadline = 500ms) {
             output1,
         };
+
+        // Optional extra SDO server (0x1201) beside the implicit default 0x1200.
+        sdo_server[2](cob_rx = node_id + 0x640, cob_tx = node_id + 0x5C0);
     }
 }
 ```
@@ -102,8 +106,8 @@ Generated besides the struct itself:
 - `MyOd::EDS: &'static str` (uncompressed) and `MyOd::EDS_COMPRESSED: &'static [u8]` (deflate). Auto-registers 0x1021 (Store EDS, compressed) and 0x1022 (Store Format = 1) for device self-description via SDO.
 - Address consts: `MyOd::INPUT1: (u16, u8)` per entry (usable as match patterns), `MyOd::ERROR_FIELD_INDEX: u16` for arrays.
 - `MyOdChange` enum + `OdChanges` impl: one variant per writable entry (`Input1(u8)`, arrays as `Name(subindex, value)`, variable-length as unit variants), decoded by `node.next_change()`.
-- `MyOdNode` type alias = `Node<MyOd, TPDO_COUNT, RPDO_COUNT>`.
-- `PdoConfigSource` impl for `NodeConfig::from_od`.
+- `MyOdNode` type alias = `Node<MyOd, TPDO_COUNT, RPDO_COUNT, SDO_COUNT>` (`SDO_COUNT` = number of `sdo_server[N]` declarations, 0 if none).
+- `PdoConfigSource` and `SdoServerConfigSource` impls for `NodeConfig::from_od`.
 
 Variable-length types: `visible_string<N>`, `octet_string<N>`, `domain<N>` backed by heapless. Use `#[use_alloc]` attribute for `String`/`Vec<u8>` instead (no capacity needed).
 

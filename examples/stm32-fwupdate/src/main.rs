@@ -397,6 +397,7 @@ async fn main(spawner: Spawner) {
             auto_start: true,
             tpdo: od.tpdo_configs(node_id),
             rpdo: [],
+            sdo_servers: [],
             identity: canopen_core::LssIdentity::default(),
         },
         od,

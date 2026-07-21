@@ -778,3 +778,97 @@ class TestLss:
                     ))
                     return
         pytest.fail("No LSS switch state response received")
+
+
+# ---------------------------------------------------------------------------
+# Additional SDO server (0x1201) — a second "diagnostics" channel
+# ---------------------------------------------------------------------------
+
+
+class TestAdditionalSdoServer:
+    """The node declares a second SDO server at 0x1201 with node-relative
+    COB-IDs 0x641 (client->server) / 0x5C1 (server->client) for node 1. A
+    diagnostics tool can drive the shared OD over this channel independently of
+    the default 0x601/0x581 channel."""
+
+    DIAG_RX = 0x641  # client -> server (requests go here)
+    DIAG_TX = 0x5C1  # server -> client (responses come here)
+
+    def _exchange(self, raw_bus, tx_cobid, rx_cobid, req):
+        """Send an 8-byte SDO request and return the matching response frame."""
+        raw_bus.send(
+            can.Message(arbitration_id=tx_cobid, data=bytes(req), is_extended_id=False)
+        )
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            msg = raw_bus.recv(timeout=0.5)
+            if msg and msg.arbitration_id == rx_cobid and len(msg.data) == 8:
+                return msg
+        return None
+
+    def test_diag_channel_records_readable(self, network, node):
+        """0x1201 sub 1/2 report the resolved diagnostics COB-IDs over the
+        default channel (a config tool discovering the extra server)."""
+        assert node.sdo[0x1201][1].raw == self.DIAG_RX
+        assert node.sdo[0x1201][2].raw == self.DIAG_TX
+
+    def test_diag_channel_read(self, raw_bus):
+        """Expedited upload of device type (0x1000:0) over the diag channel."""
+        resp = self._exchange(
+            raw_bus,
+            self.DIAG_RX,
+            self.DIAG_TX,
+            [0x40, 0x00, 0x10, 0x00, 0, 0, 0, 0],
+        )
+        assert resp is not None, "no response on the diagnostics tx COB-ID"
+        assert resp.data[0] == 0x43, "expedited upload response, 4 data bytes"
+        assert struct.unpack_from("<I", resp.data, 4)[0] == 0x191
+
+    def test_diag_channel_writes_shared_od(self, raw_bus):
+        """A write over the diag channel is visible when reading back over the
+        default channel — both servers share one object dictionary."""
+        # Download 0x37 to output1 (0x6200:1, u8) via the diagnostics channel.
+        resp = self._exchange(
+            raw_bus,
+            self.DIAG_RX,
+            self.DIAG_TX,
+            [0x2F, 0x00, 0x62, 0x01, 0x37, 0, 0, 0],
+        )
+        assert resp is not None and resp.data[0] == 0x60, "download acknowledged"
+
+        # Read it back over the default channel (0x601 -> 0x581).
+        resp = self._exchange(
+            raw_bus, 0x601, 0x581, [0x40, 0x00, 0x62, 0x01, 0, 0, 0, 0]
+        )
+        assert resp is not None, "no response on the default tx COB-ID"
+        assert resp.data[4] == 0x37
+
+    def test_channels_independent(self, raw_bus):
+        """A parked segmented transfer on the default channel does not disturb a
+        full transaction on the diagnostics channel (independent state)."""
+        # Start (but do not finish) a segmented download to 0x2001 (blob) on the
+        # default channel: init with size 10, not expedited. This parks a
+        # transfer in the default server awaiting segments.
+        init = self._exchange(
+            raw_bus, 0x601, 0x581, [0x21, 0x01, 0x20, 0x00, 10, 0, 0, 0]
+        )
+        assert init is not None and init.data[0] == 0x60, "download init ack"
+
+        # A full expedited exchange on the diag channel completes meanwhile.
+        resp = self._exchange(
+            raw_bus,
+            self.DIAG_RX,
+            self.DIAG_TX,
+            [0x40, 0x00, 0x10, 0x00, 0, 0, 0, 0],
+        )
+        assert resp is not None and resp.data[0] == 0x43
+        assert struct.unpack_from("<I", resp.data, 4)[0] == 0x191
+
+        # The default channel's parked transfer is still alive: send the first
+        # download segment (toggle 0, 7 bytes) and expect a segment ack (scs=1,
+        # 0x20), not an abort.
+        seg = self._exchange(
+            raw_bus, 0x601, 0x581, [0x00, 1, 2, 3, 4, 5, 6, 7]
+        )
+        assert seg is not None, "default segmented transfer continued"
+        assert seg.data[0] == 0x20, "download segment acknowledged (not aborted)"

@@ -78,6 +78,13 @@ object_dictionary! {
         rpdo[5](cob_id = node_id + 0x230, transmission_type = 255, mapping = mutable) {
             output3,
         };
+
+        // A second, "diagnostics" SDO server (0x1201) alongside the default
+        // 0x1200 channel — e.g. one for normal operations, one for a
+        // diagnostics tool. Node-relative COB-IDs (0x641/0x5C1 for node 1);
+        // independent transfer state from the default channel. Const: fixed at
+        // build time, never remapped at runtime.
+        sdo_server[2](cob_rx = node_id + 0x640, cob_tx = node_id + 0x5C0);
     }
 }
 
@@ -103,12 +110,13 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
     let node_id = NodeId::new(1).unwrap();
     let od = DemoOd::new();
 
-    let config = NodeConfig::<2, 2> {
+    let config = NodeConfig::<2, 2, 1> {
         node_id,
         heartbeat_interval_ms: 500,
         auto_start: false,
         tpdo: od.tpdo_configs(node_id),
         rpdo: od.rpdo_configs(node_id),
+        sdo_servers: od.sdo_server_configs(node_id),
         identity: LssIdentity {
             vendor_id: 0xCAFE,
             product_code: 0x0001,
@@ -117,7 +125,7 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
         },
     };
 
-    let mut node: Node<DemoOd, 2, 2> = Node::new(config, od);
+    let mut node: Node<DemoOd, 2, 2, 1> = Node::new(config, od);
     let clock = StdClock::new();
     let mut deadline_error = false;
 

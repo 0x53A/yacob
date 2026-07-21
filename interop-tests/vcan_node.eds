@@ -16,7 +16,7 @@ SupportedObjects=5
 5=0x1018
 
 [OptionalObjects]
-SupportedObjects=8
+SupportedObjects=9
 1=0x1400
 2=0x1404
 3=0x1600
@@ -25,6 +25,7 @@ SupportedObjects=8
 6=0x1804
 7=0x1A00
 8=0x1A04
+9=0x1201
 
 [ManufacturerObjects]
 SupportedObjects=1
@@ -1533,5 +1534,34 @@ ObjectType=0x7
 DataType=0x0007
 AccessType=rw
 DefaultValue=0x00000000
+PDOMapping=0
+
+[1201]
+ParameterName=SDO Server Parameter
+ObjectType=0x9
+SubNumber=3
+
+[1201sub0]
+ParameterName=Highest sub-index supported
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=2
+PDOMapping=0
+
+[1201sub1]
+ParameterName=COB-ID Client to Server (Receive SDO)
+ObjectType=0x7
+DataType=0x0007
+AccessType=ro
+DefaultValue=$NODEID+0x640
+PDOMapping=0
+
+[1201sub2]
+ParameterName=COB-ID Server to Client (Transmit SDO)
+ObjectType=0x7
+DataType=0x0007
+AccessType=ro
+DefaultValue=$NODEID+0x5C0
 PDOMapping=0
 

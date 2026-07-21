@@ -1446,3 +1446,200 @@ fn i24_metadata_and_mapping() {
     assert!(I24Od::EDS.contains("DataType=0x0010"));
     assert!(I24Od::EDS.contains("DataType=0x0016"));
 }
+
+// ---- Additional SDO servers (0x1201+) ----
+
+// DiagOd: a node with a second ("diagnostics") SDO server alongside the
+// default. Node-relative COB-IDs so multiple devices can share this OD.
+object_dictionary! {
+    pub struct DiagOd {
+        [0x1000] device_type: u32 = 0x0000_0191, ro;
+        [0x2000] level: u16 = 7, rw;
+
+        sdo_server[2](cob_rx = node_id + 0x640, cob_tx = node_id + 0x5C0);
+    }
+}
+
+#[test]
+fn sdo_server_od_records_and_count() {
+    // The declaration count is exposed, and the 0x1201 record reads back the
+    // node-relative-resolved COB-IDs after Node::new mirrors them in.
+    assert_eq!(DiagOd::SDO_COUNT, 1);
+
+    use canopen_core::node::{Node, NodeConfig};
+    let od = DiagOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+    let config = NodeConfig {
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let node: Node<DiagOd, 0, 0, 1> = Node::new(config, od);
+
+    let mut b1 = [0u8; 1];
+    node.od().read(0x1201, 0, &mut b1).unwrap();
+    assert_eq!(b1[0], 2, "highest subindex");
+
+    let mut b4 = [0u8; 4];
+    node.od().read(0x1201, 1, &mut b4).unwrap();
+    assert_eq!(u32::from_le_bytes(b4), 0x645, "cob_rx = node_id + 0x640");
+    node.od().read(0x1201, 2, &mut b4).unwrap();
+    assert_eq!(u32::from_le_bytes(b4), 0x5C5, "cob_tx = node_id + 0x5C0");
+
+    // The records are const: writes to the COB-IDs are rejected.
+    use canopen_core::od::{ObjectDictionary, OdError};
+    let mut writable = DiagOd::new();
+    assert_eq!(
+        writable.write(0x1201, 1, &0x777u32.to_le_bytes()),
+        Err(OdError::ReadOnly)
+    );
+    assert_eq!(
+        writable.write(0x1201, 2, &0x777u32.to_le_bytes()),
+        Err(OdError::ReadOnly)
+    );
+
+    // EDS export describes the additional server as a read-only, node-relative
+    // SDO Server Parameter record.
+    assert!(DiagOd::EDS.contains("[1201]"));
+    assert!(DiagOd::EDS.contains("$NODEID+0x640"));
+    assert!(DiagOd::EDS.contains("$NODEID+0x5C0"));
+}
+
+#[test]
+fn sdo_server_second_channel_serves_and_is_independent() {
+    use canopen_core::node::{Node, NodeConfig};
+    use canopen_core::transport::{CanFrame, MailboxTransport};
+
+    let od = DiagOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+    let config = NodeConfig {
+        auto_start: true,
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let mut node: Node<DiagOd, 0, 0, 1> = Node::new(config, od);
+    let mut transport = MailboxTransport::<32, 32>::new();
+    node.process(&mut transport, &FixedClock(0));
+    drain(&mut transport);
+
+    // Default channel (0x605 -> 0x585): expedited upload of 0x1000:0.
+    transport
+        .store_received(CanFrame::new(0x605, &[0x40, 0x00, 0x10, 0x00, 0, 0, 0, 0]).unwrap())
+        .unwrap();
+    // Diagnostics channel (0x645 -> 0x5C5): the same upload, interleaved.
+    transport
+        .store_received(CanFrame::new(0x645, &[0x40, 0x00, 0x10, 0x00, 0, 0, 0, 0]).unwrap())
+        .unwrap();
+    node.process(&mut transport, &FixedClock(1_000));
+    let frames = drain(&mut transport);
+
+    let default_resp = frames.iter().find(|f| f.raw_id() == 0x585);
+    let diag_resp = frames.iter().find(|f| f.raw_id() == 0x5C5);
+    assert!(default_resp.is_some(), "default channel response on 0x585");
+    assert!(diag_resp.is_some(), "diag channel response on 0x5C5");
+    // Both are expedited upload responses (cs 0x43) carrying device_type 0x191.
+    for resp in [default_resp.unwrap(), diag_resp.unwrap()] {
+        assert_eq!(resp.data()[0], 0x43);
+        assert_eq!(u32::from_le_bytes(resp.data()[4..8].try_into().unwrap()), 0x191);
+    }
+
+    // Writing via the diagnostics channel updates the shared OD, and the
+    // response comes back on the diag tx COB-ID.
+    transport
+        .store_received(
+            CanFrame::new(0x645, &[0x2B, 0x00, 0x20, 0x00, 0x2A, 0x00, 0, 0]).unwrap(),
+        )
+        .unwrap();
+    node.process(&mut transport, &FixedClock(2_000));
+    let frames = drain(&mut transport);
+    let dl_resp = frames.iter().find(|f| f.raw_id() == 0x5C5).unwrap();
+    assert_eq!(dl_resp.data()[0], 0x60, "download acknowledged");
+    assert_eq!(node.od().level, 0x2A);
+}
+
+#[test]
+fn sdo_server_channels_have_independent_transfer_state() {
+    use canopen_core::node::{Node, NodeConfig};
+    use canopen_core::transport::{CanFrame, MailboxTransport};
+
+    let od = DiagOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+    let config = NodeConfig {
+        auto_start: true,
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let mut node: Node<DiagOd, 0, 0, 1> = Node::new(config, od);
+    let mut transport = MailboxTransport::<32, 32>::new();
+    node.process(&mut transport, &FixedClock(0));
+    drain(&mut transport);
+
+    // Start a segmented upload of the (large) EDS object on the default channel
+    // without finishing it — this parks a transfer in the default server.
+    transport
+        .store_received(CanFrame::new(0x605, &[0x40, 0x21, 0x10, 0x00, 0, 0, 0, 0]).unwrap())
+        .unwrap();
+    node.process(&mut transport, &FixedClock(1_000));
+    let init = drain(&mut transport);
+    assert!(init.iter().any(|f| f.raw_id() == 0x585), "default upload init");
+
+    // Meanwhile a full expedited transaction on the diag channel must complete
+    // normally, unaffected by the parked default transfer.
+    transport
+        .store_received(CanFrame::new(0x645, &[0x40, 0x00, 0x10, 0x00, 0, 0, 0, 0]).unwrap())
+        .unwrap();
+    node.process(&mut transport, &FixedClock(2_000));
+    let frames = drain(&mut transport);
+    let diag = frames.iter().find(|f| f.raw_id() == 0x5C5).unwrap();
+    assert_eq!(diag.data()[0], 0x43);
+    assert_eq!(u32::from_le_bytes(diag.data()[4..8].try_into().unwrap()), 0x191);
+
+    // The default channel's segmented transfer is still alive: continue it and
+    // get the first segment back.
+    transport
+        .store_received(CanFrame::new(0x605, &[0x60, 0, 0, 0, 0, 0, 0, 0]).unwrap())
+        .unwrap();
+    node.process(&mut transport, &FixedClock(3_000));
+    let frames = drain(&mut transport);
+    assert!(
+        frames.iter().any(|f| f.raw_id() == 0x585),
+        "default segmented transfer continued independently"
+    );
+}
+
+// CollideOd: an absolute diagnostics rx COB-ID (0x605) that coincides with the
+// *default* server's rx (0x600 + node_id) only for node id 5. The macro cannot
+// catch this (absolute vs the default's node-relative COB-ID), so it is the
+// residual case enforced by Node::new's runtime assert.
+object_dictionary! {
+    pub struct CollideOd {
+        [0x1000] device_type: u32 = 0x0000_0191, ro;
+        sdo_server[2](cob_rx = 0x605, cob_tx = 0x5C5);
+    }
+}
+
+#[test]
+#[should_panic(expected = "collide")]
+fn sdo_server_runtime_collision_with_default_panics() {
+    use canopen_core::node::{Node, NodeConfig};
+    let od = CollideOd::new();
+    // node id 5 -> default rx = 0x605, colliding with the diagnostics rx.
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+    let config = NodeConfig {
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let _node: Node<CollideOd, 0, 0, 1> = Node::new(config, od);
+}
+
+#[test]
+fn sdo_server_no_collision_at_other_node_id() {
+    use canopen_core::node::{Node, NodeConfig};
+    let od = CollideOd::new();
+    // node id 6 -> default rx = 0x606, tx = 0x586; no overlap with 0x605/0x5C5.
+    let node_id = canopen_core::cobid::NodeId::new(6).unwrap();
+    let config = NodeConfig {
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let _node: Node<CollideOd, 0, 0, 1> = Node::new(config, od);
+}

@@ -132,4 +132,14 @@ pub trait ObjectDictionary {
     fn validate_write(&self, _index: u16, _subindex: u8, _data: &[u8]) -> Result<(), OdError> {
         Ok(())
     }
+
+    /// Mirror resolved additional-SDO-server COB-IDs into the OD's 0x1201+
+    /// records so SDO reads of sub 1/2 return the real (node-relative-resolved)
+    /// values. Called once by [`crate::node::Node::new`], analogous to the PDO
+    /// COB-ID mirror-back.
+    ///
+    /// The default implementation is a no-op (for ODs without additional SDO
+    /// servers). The `object_dictionary!` macro overrides it when
+    /// `sdo_server[N]` declarations are present.
+    fn store_sdo_server_cob_ids(&mut self, _node_id: crate::cobid::NodeId) {}
 }

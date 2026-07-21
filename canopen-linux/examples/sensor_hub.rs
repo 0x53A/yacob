@@ -231,6 +231,7 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
         auto_start: false,
         tpdo: od.tpdo_configs(node_id),
         rpdo: od.rpdo_configs(node_id),
+        sdo_servers: [],
         identity: LssIdentity {
             vendor_id: 0xCAFE,
             product_code: 0x0003,
@@ -241,7 +242,7 @@ fn run_node(transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
 
     // Note the const generics: 2 TPDOs, 1 RPDO, 32-event queue (more headroom
     // since we update 6 values per cycle), 8 dirty set entries.
-    let mut node: Node<SensorHubOd, 2, 1, 32, 8> = Node::new(config, od);
+    let mut node: Node<SensorHubOd, 2, 1, 0, 32, 8> = Node::new(config, od);
     let clock = StdClock::new();
     let mut simulator = SensorSimulator::new();
 

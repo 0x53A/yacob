@@ -198,6 +198,125 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         .map(|p| resolve_pdo_mappings(p, &flat))
         .collect();
 
+    // ---- Additional SDO servers (0x1201+) ----
+    let sdo_servers = &od.sdo_servers;
+    let sdo_count = sdo_servers.len();
+
+    // Reject duplicate server numbers (they map to the same OD record).
+    {
+        let mut nums: Vec<u16> = sdo_servers.iter().map(|s| s.number).collect();
+        nums.sort_unstable();
+        nums.dedup();
+        if nums.len() != sdo_servers.len() {
+            panic!("duplicate sdo_server[N] definition: each server number may only be declared once");
+        }
+    }
+    // Compile-time COB-ID collision check. Every rx/tx slot — including the
+    // default server's node-relative 0x600/0x580 + node_id — is compared against
+    // every other. Two slots collide statically when they are the same *kind*
+    // (both absolute, or both node-relative) and share a value: absolute-equals,
+    // node-relative-base-equals (collides for every node id), and a rx == tx
+    // within one server. This catches node-relative shadowing of the default
+    // server. The residual mixed absolute-vs-node-relative case depends on the
+    // runtime node id and is enforced by `Node::new`'s assert.
+    {
+        // (is_node_relative, value, human label)
+        let mut slots: Vec<(bool, u32, String)> = vec![
+            (true, 0x600, "the default SDO server rx (0x600+node_id)".to_string()),
+            (true, 0x580, "the default SDO server tx (0x580+node_id)".to_string()),
+        ];
+        for s in sdo_servers.iter() {
+            for (spec, dir) in [(s.cob_rx, "cob_rx"), (s.cob_tx, "cob_tx")] {
+                let (is_rel, val) = match spec {
+                    CobIdSpec::Absolute(id) => (false, id),
+                    CobIdSpec::NodeRelative(base) => (true, base),
+                };
+                slots.push((is_rel, val, format!("sdo_server[{}] {dir}", s.number)));
+            }
+        }
+        for i in 0..slots.len() {
+            for j in (i + 1)..slots.len() {
+                if slots[i].0 == slots[j].0 && slots[i].1 == slots[j].1 {
+                    panic!(
+                        "SDO server COB-ID collision: {} and {} resolve to the same COB-ID",
+                        slots[i].2, slots[j].2
+                    );
+                }
+            }
+        }
+    }
+    // A resolved-COB-ID expression (u16) for a spec: absolute value as-is, or
+    // node-relative base folded against `node_id` at runtime.
+    let resolve_cob = |spec: CobIdSpec| -> TokenStream {
+        match spec {
+            CobIdSpec::Absolute(id) => {
+                let id = id as u16;
+                quote! { #id }
+            }
+            CobIdSpec::NodeRelative(base) => {
+                let base = base as u16;
+                quote! { (#base + node_id.raw() as u16) }
+            }
+        }
+    };
+    // Struct field default (u32) for the OD's stored COB-ID: absolute value, or
+    // 0 for node-relative (resolved into the field by store_sdo_server_cob_ids).
+    let sdo_server_struct_fields: Vec<TokenStream> = if sdo_count > 0 {
+        vec![
+            quote! { pub sdo_server_cob_rx: [u32; #sdo_count] },
+            quote! { pub sdo_server_cob_tx: [u32; #sdo_count] },
+        ]
+    } else {
+        Vec::new()
+    };
+    let sdo_server_field_defaults: Vec<TokenStream> = if sdo_count > 0 {
+        let rx: Vec<TokenStream> = sdo_servers
+            .iter()
+            .map(|s| match s.cob_rx {
+                CobIdSpec::Absolute(id) => quote! { #id },
+                CobIdSpec::NodeRelative(_) => quote! { 0 },
+            })
+            .collect();
+        let tx: Vec<TokenStream> = sdo_servers
+            .iter()
+            .map(|s| match s.cob_tx {
+                CobIdSpec::Absolute(id) => quote! { #id },
+                CobIdSpec::NodeRelative(_) => quote! { 0 },
+            })
+            .collect();
+        vec![
+            quote! { sdo_server_cob_rx: [#(#rx),*] },
+            quote! { sdo_server_cob_tx: [#(#tx),*] },
+        ]
+    } else {
+        Vec::new()
+    };
+    // Resolved-config items for the `sdo_server_configs` method / config source.
+    let sdo_config_items: Vec<TokenStream> = sdo_servers
+        .iter()
+        .map(|s| {
+            let number = s.number;
+            let rx = resolve_cob(s.cob_rx);
+            let tx = resolve_cob(s.cob_tx);
+            quote! {
+                canopen_core::sdo::SdoServerConfig { number: #number, cob_rx: #rx, cob_tx: #tx }
+            }
+        })
+        .collect();
+    // Mirror-back statements for store_sdo_server_cob_ids.
+    let sdo_store_items: Vec<TokenStream> = sdo_servers
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let rx = resolve_cob(s.cob_rx);
+            let tx = resolve_cob(s.cob_tx);
+            quote! {
+                self.sdo_server_cob_rx[#i] = (#rx) as u32;
+                self.sdo_server_cob_tx[#i] = (#tx) as u32;
+            }
+        })
+        .collect();
+
     // ---- Generate user-defined struct fields ----
     let struct_fields: Vec<TokenStream> = flat
         .iter()
@@ -904,6 +1023,41 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         }
     }
 
+    // ---- Additional SDO server records (0x1201+) read/write/meta ----
+    // Record layout (CiA 301 0x1200+): sub0 highest-sub = 2, sub1 COB-ID
+    // client→server, sub2 COB-ID server→client. All read-only (const, never
+    // remappable at runtime — see `_Tasks/additional-sdo-servers.md`). Stored
+    // COB-IDs are mirrored in by `store_sdo_server_cob_ids` so node-relative
+    // values read back resolved.
+    for (i, s) in sdo_servers.iter().enumerate() {
+        let idx = 0x1200u16 + (s.number - 1);
+        pdo_sub_counts.insert(idx, 2);
+
+        all_meta_entries.push(gen_pdo_meta(idx, 0, "U8", "Ro", "highest_subindex"));
+        pdo_read_arms.push(quote! { (#idx, 0) => { buf[0] = 2; Ok(1) } });
+        pdo_write_arms.push(quote! { (#idx, 0) => Err(canopen_core::od::OdError::ReadOnly), });
+
+        all_meta_entries.push(gen_pdo_meta(idx, 1, "U32", "Ro", "cob_id_client_to_server"));
+        pdo_read_arms.push(quote! {
+            (#idx, 1) => {
+                let bytes = self.sdo_server_cob_rx[#i].to_le_bytes();
+                buf[..4].copy_from_slice(&bytes);
+                Ok(4)
+            }
+        });
+        pdo_write_arms.push(quote! { (#idx, 1) => Err(canopen_core::od::OdError::ReadOnly), });
+
+        all_meta_entries.push(gen_pdo_meta(idx, 2, "U32", "Ro", "cob_id_server_to_client"));
+        pdo_read_arms.push(quote! {
+            (#idx, 2) => {
+                let bytes = self.sdo_server_cob_tx[#i].to_le_bytes();
+                buf[..4].copy_from_slice(&bytes);
+                Ok(4)
+            }
+        });
+        pdo_write_arms.push(quote! { (#idx, 2) => Err(canopen_core::od::OdError::ReadOnly), });
+    }
+
     // ---- Generate user-entry read/write arms ----
     let read_arms: Vec<TokenStream> = flat
         .iter()
@@ -1376,7 +1530,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
     let rc = rpdo_count;
     let node_alias = format_ident!("{}Node", name);
     let alias_doc = format!(
-        "[`Node`](canopen_core::node::Node) preconfigured for [`{name}`] ({tc} TPDO, {rc} RPDO)."
+        "[`Node`](canopen_core::node::Node) preconfigured for [`{name}`] \
+         ({tc} TPDO, {rc} RPDO, {sdo_count} extra SDO server(s))."
     );
 
     let pdo_source_impl = if has_pdos {
@@ -1403,6 +1558,45 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         }
     };
 
+    // ---- SDO server helper methods, config source, and OD mirror-back ----
+    let sdo_helper_methods = quote! {
+        /// Number of additional SDO servers (0x1201+); the default server
+        /// (0x1200) is not counted.
+        pub const SDO_COUNT: usize = #sdo_count;
+
+        /// Resolved additional SDO server configs — node-relative COB-IDs
+        /// folded against `node_id`. Empty when no `sdo_server[N]` is declared.
+        pub fn sdo_server_configs(
+            &self,
+            node_id: canopen_core::cobid::NodeId,
+        ) -> [canopen_core::sdo::SdoServerConfig; #sdo_count] {
+            let _ = node_id;
+            [#(#sdo_config_items),*]
+        }
+    };
+    let sdo_source_impl = quote! {
+        impl canopen_core::sdo::SdoServerConfigSource<#sdo_count> for #name {
+            fn sdo_server_configs(
+                &self,
+                node_id: canopen_core::cobid::NodeId,
+            ) -> [canopen_core::sdo::SdoServerConfig; #sdo_count] {
+                #name::sdo_server_configs(self, node_id)
+            }
+        }
+    };
+    // Override the ObjectDictionary mirror-back only when there are extra
+    // servers (the default trait impl is a no-op otherwise).
+    let sdo_store_impl = if sdo_count > 0 {
+        quote! {
+            fn store_sdo_server_cob_ids(&mut self, node_id: canopen_core::cobid::NodeId) {
+                let _ = node_id;
+                #(#sdo_store_items)*
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     // ---- Assemble output ----
     let meta_len = all_meta_entries.len();
 
@@ -1412,6 +1606,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             #(#struct_fields,)*
             #(#array_struct_fields,)*
             #(#pdo_struct_fields,)*
+            #(#sdo_server_struct_fields,)*
         }
 
         static #meta_name: [canopen_core::od::OdEntryMeta; #meta_len] = [
@@ -1432,10 +1627,13 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     #(#field_defaults,)*
                     #(#array_field_defaults,)*
                     #(#pdo_field_defaults,)*
+                    #(#sdo_server_field_defaults,)*
                 }
             }
 
             #pdo_helper_methods
+
+            #sdo_helper_methods
         }
 
         impl canopen_core::od::ObjectDictionary for #name {
@@ -1469,6 +1667,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             }
 
             #validate_write_impl
+
+            #sdo_store_impl
         }
 
         #[doc = #change_doc]
@@ -1497,8 +1697,10 @@ pub fn generate(od: OdDefinition) -> TokenStream {
 
         #pdo_source_impl
 
+        #sdo_source_impl
+
         #[doc = #alias_doc]
-        #vis type #node_alias = canopen_core::node::Node<#name, #tc, #rc>;
+        #vis type #node_alias = canopen_core::node::Node<#name, #tc, #rc, #sdo_count>;
     }
 }
 

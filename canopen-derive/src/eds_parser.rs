@@ -85,6 +85,10 @@ pub fn parse_eds_to_od(def: EdsDefinition) -> std::result::Result<OdDefinition, 
         name: def.name,
         entries,
         pdos,
+        // EDS import of additional SDO servers (0x1201+) is not yet supported;
+        // declare extra channels via the inline DSL. See
+        // `_Tasks/additional-sdo-servers.md`.
+        sdo_servers: Vec::new(),
         export_eds_path: None,
         use_alloc: false,
         validate_write_fn: None,

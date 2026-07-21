@@ -10,7 +10,7 @@ use crate::od::OdEvent;
 #[cfg(feature = "embassy")]
 use crate::od::OdEventSignal;
 use crate::pdo::{PdoMapping, PdoNumber, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine};
-use crate::sdo::SdoServer;
+use crate::sdo::{SdoServer, SdoServerConfig};
 use crate::time::Clock;
 use crate::transport::CanFrame;
 use heapless::{Deque, Vec};
@@ -26,7 +26,11 @@ pub enum ResetType {
 }
 
 /// Configuration for creating a Node.
-pub struct NodeConfig<const TPDO: usize = 4, const RPDO: usize = 4> {
+///
+/// `SDO` is the number of *additional* SDO servers (0x1201+); the default
+/// server (0x1200) is always present and not counted here. It defaults to 0, so
+/// nodes that don't declare extra SDO channels pay no cost.
+pub struct NodeConfig<const TPDO: usize = 4, const RPDO: usize = 4, const SDO: usize = 0> {
     pub node_id: NodeId,
     /// Producer heartbeat interval in ms (0 = disabled). Fallback only: if
     /// the OD declares 0x1017 (Producer heartbeat time), that entry is the
@@ -38,14 +42,17 @@ pub struct NodeConfig<const TPDO: usize = 4, const RPDO: usize = 4> {
     pub auto_start: bool,
     pub tpdo: [TpdoConfig; TPDO],
     pub rpdo: [RpdoConfig; RPDO],
+    /// Additional SDO servers (0x1201+), resolved COB-IDs. Empty for the common
+    /// single-server node.
+    pub sdo_servers: [SdoServerConfig; SDO],
     /// LSS identity (0x1018). Set to default if LSS is not needed.
     pub identity: LssIdentity,
 }
 
-impl<const TPDO: usize, const RPDO: usize> NodeConfig<TPDO, RPDO> {
-    /// Build a config with PDO settings pulled from the OD (declared in the
-    /// `object_dictionary!` macro) and defaults for the rest: heartbeat every
-    /// 1000 ms, no auto-start, default LSS identity.
+impl<const TPDO: usize, const RPDO: usize, const SDO: usize> NodeConfig<TPDO, RPDO, SDO> {
+    /// Build a config with PDO and additional-SDO-server settings pulled from
+    /// the OD (declared in the `object_dictionary!` macro) and defaults for the
+    /// rest: heartbeat every 1000 ms, no auto-start, default LSS identity.
     ///
     /// Override the defaults with struct update syntax:
     /// ```ignore
@@ -55,13 +62,18 @@ impl<const TPDO: usize, const RPDO: usize> NodeConfig<TPDO, RPDO> {
     ///     ..NodeConfig::from_od(&od, node_id)
     /// };
     /// ```
-    pub fn from_od(od: &impl crate::pdo::PdoConfigSource<TPDO, RPDO>, node_id: NodeId) -> Self {
+    pub fn from_od(
+        od: &(impl crate::pdo::PdoConfigSource<TPDO, RPDO>
+              + crate::sdo::SdoServerConfigSource<SDO>),
+        node_id: NodeId,
+    ) -> Self {
         Self {
             node_id,
             heartbeat_interval_ms: 1000,
             auto_start: false,
             tpdo: od.tpdo_configs(node_id),
             rpdo: od.rpdo_configs(node_id),
+            sdo_servers: od.sdo_server_configs(node_id),
             identity: LssIdentity::default(),
         }
     }
@@ -74,6 +86,7 @@ pub struct Node<
     OD: ObjectDictionary,
     const TPDO: usize = 4,
     const RPDO: usize = 4,
+    const SDO: usize = 0,
     const EVT_QUEUE: usize = 16,
     const DIRTY_SET: usize = 8,
 > {
@@ -81,6 +94,14 @@ pub struct Node<
     od: OD,
     nmt: NmtHandler,
     sdo_server: SdoServer,
+    /// Additional SDO servers (0x1201+), each an independent transfer state
+    /// machine. `SDO` is 0 for the common single-server node.
+    extra_sdo: [SdoServer; SDO],
+    /// Resolved rx COB-ID (client→server) for each additional SDO server,
+    /// parallel to `extra_sdo`. Dispatch matches incoming frames against these.
+    extra_sdo_rx: [u16; SDO],
+    /// Resolved tx COB-ID (server→client) for each additional SDO server.
+    extra_sdo_tx: [u16; SDO],
     tpdo: TpdoEngine<TPDO>,
     rpdo: RpdoEngine<RPDO>,
     heartbeat: HeartbeatProducer,
@@ -107,6 +128,15 @@ pub const MAX_HEARTBEAT_MONITORS: usize = 8;
 /// and [`Node::events_dropped`] is incremented.
 const HB_EVENT_QUEUE: usize = 8;
 
+/// Selects which SDO server an incoming request is dispatched to.
+#[derive(Clone, Copy)]
+enum SdoServerSel {
+    /// The default server (0x1200, `0x600/0x580 + node_id`).
+    Default,
+    /// An additional server (0x1201+); index into `extra_sdo`.
+    Extra(usize),
+}
+
 /// 0-based offset of a PDO's comm/mapping records from the range base
 /// (0x1400/0x1600/0x1800/0x1A00): explicit CANopen number if set, else the
 /// engine slot.
@@ -123,16 +153,22 @@ impl<
         OD: ObjectDictionary,
         const TPDO: usize,
         const RPDO: usize,
+        const SDO: usize,
         const EVT_QUEUE: usize,
         const DIRTY_SET: usize,
-    > Node<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+    > Node<OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>
 {
-    pub fn new(config: NodeConfig<TPDO, RPDO>, od: OD) -> Self {
+    pub fn new(config: NodeConfig<TPDO, RPDO, SDO>, od: OD) -> Self {
+        let extra_sdo_rx = config.sdo_servers.map(|s| s.cob_rx);
+        let extra_sdo_tx = config.sdo_servers.map(|s| s.cob_tx);
         let mut node = Self {
             node_id: config.node_id,
             od,
             nmt: NmtHandler::new(),
             sdo_server: SdoServer::new(),
+            extra_sdo: [const { SdoServer::new() }; SDO],
+            extra_sdo_rx,
+            extra_sdo_tx,
             tpdo: TpdoEngine::new(config.tpdo),
             rpdo: RpdoEngine::new(config.rpdo),
             heartbeat: HeartbeatProducer::new(config.node_id, config.heartbeat_interval_ms),
@@ -149,8 +185,49 @@ impl<
             event_signal: None,
         };
         node.write_pdo_cob_ids_to_od();
+        // Mirror resolved additional-SDO-server COB-IDs into the OD (0x1201+)
+        // so SDO reads return real values (node-relative resolved).
+        node.od.store_sdo_server_cob_ids(config.node_id);
+        // A hard invariant, not a debug-only check: colliding COB-IDs make the
+        // dispatcher steal frames from the default server (extras are matched
+        // first) or answer on the wrong COB-ID. The config is fixed at build
+        // time, so a violation is a deterministic programming error — fail fast
+        // in every build rather than silently misroute SDO traffic in release.
+        // Most cases are already rejected at compile time by the macro; this
+        // catches the node-id-dependent residue (an absolute COB-ID that lands
+        // on the default or another server for this particular node id).
+        assert!(
+            node.extra_sdo_cob_ids_are_unique(),
+            "additional SDO server COB-IDs collide with the default server, \
+             each other, or are zero (for node id {})",
+            config.node_id.raw()
+        );
         node.sync_heartbeat_from_od(false);
         node
+    }
+
+    /// Additional SDO server rx/tx COB-IDs must be non-zero, distinct from each
+    /// other, and distinct from the default SDO server's `0x600/0x580 +
+    /// node_id`. Enforced by an assert in [`Node::new`] (see there).
+    fn extra_sdo_cob_ids_are_unique(&self) -> bool {
+        let def_rx = CobId::sdo_rx(self.node_id).raw();
+        let def_tx = CobId::sdo_tx(self.node_id).raw();
+        for i in 0..SDO {
+            let (rx, tx) = (self.extra_sdo_rx[i], self.extra_sdo_tx[i]);
+            if rx == 0 || tx == 0 || rx == tx {
+                return false;
+            }
+            if rx == def_rx || rx == def_tx || tx == def_rx || tx == def_tx {
+                return false;
+            }
+            for j in (i + 1)..SDO {
+                let (orx, otx) = (self.extra_sdo_rx[j], self.extra_sdo_tx[j]);
+                if rx == orx || rx == otx || tx == orx || tx == otx {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Re-read heartbeat configuration from the OD: producer heartbeat time
@@ -254,7 +331,7 @@ impl<
     ///     od.echo_out = 42;
     /// } // single diff, notifies both
     /// ```
-    pub fn od_mut(&mut self) -> OdGuard<'_, OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+    pub fn od_mut(&mut self) -> OdGuard<'_, OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>
     where
         OD: Clone,
     {
@@ -423,7 +500,7 @@ impl<
     /// `ResetCommunication` to re-initialize only communication parameters.
     pub fn request_reset(&mut self, reset_type: ResetType) {
         self.booted = false;
-        self.sdo_server.abort_transfer();
+        self.abort_all_sdo_transfers();
         self.sync_pdo_from_od();
         self.sync_heartbeat_from_od(false);
         match reset_type {
@@ -505,19 +582,33 @@ impl<
             }
         }
 
-        // SDO timeout check — abort stale transfers
+        // SDO timeout check — abort stale transfers (default + extra servers)
         if let Some(abort_frame) = self.sdo_server.check_timeout(now) {
             let resp_cob = CobId::sdo_tx(self.node_id);
             if let Some(frame) = CanFrame::new(resp_cob.raw(), &abort_frame) {
                 let _ = transport.transmit(&frame);
             }
         }
+        for i in 0..SDO {
+            if let Some(abort_frame) = self.extra_sdo[i].check_timeout(now) {
+                if let Some(frame) = CanFrame::new(self.extra_sdo_tx[i], &abort_frame) {
+                    let _ = transport.transmit(&frame);
+                }
+            }
+        }
 
-        // SDO block upload — send pending sub-block segments
+        // SDO block upload — send pending sub-block segments (default + extra)
         while let Some(seg_data) = self.sdo_server.poll_block_upload(now) {
             let resp_cob = CobId::sdo_tx(self.node_id);
             if let Some(frame) = CanFrame::new(resp_cob.raw(), &seg_data) {
                 let _ = transport.transmit(&frame);
+            }
+        }
+        for i in 0..SDO {
+            while let Some(seg_data) = self.extra_sdo[i].poll_block_upload(now) {
+                if let Some(frame) = CanFrame::new(self.extra_sdo_tx[i], &seg_data) {
+                    let _ = transport.transmit(&frame);
+                }
             }
         }
 
@@ -663,6 +754,78 @@ impl<
         }
     }
 
+    /// Abort any in-progress transfer on every SDO server (default + extra).
+    /// Used on NMT reset and external resync so a stale transfer on one channel
+    /// cannot outlive a reset.
+    fn abort_all_sdo_transfers(&mut self) {
+        self.sdo_server.abort_transfer();
+        for i in 0..SDO {
+            self.extra_sdo[i].abort_transfer();
+        }
+    }
+
+    /// Process an SDO request against the selected server (the default 0x1200
+    /// channel or an additional 0x1201+ channel) and transmit the response on
+    /// that server's tx COB-ID. All servers share the OD, event queue, and
+    /// config-resync path; only the transfer state machine and COB-IDs differ.
+    fn handle_sdo_request(
+        &mut self,
+        sel: SdoServerSel,
+        frame: &CanFrame,
+        transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
+        now: u64,
+    ) {
+        if frame.raw_dlc() < 8 {
+            return;
+        }
+        let req: [u8; 8] = frame.data().try_into().unwrap();
+        let mut resp = [0u8; 8];
+        let state = self.nmt.state();
+        let was_full = self.event_queue.is_full();
+
+        // Disjoint field borrows: the selected server plus `self.od` /
+        // `self.event_queue`. Kept in per-arm expressions so the borrow checker
+        // sees the fields as separate.
+        let ok = match sel {
+            SdoServerSel::Default => self
+                .sdo_server
+                .process(&req, &mut self.od, &mut resp, &mut self.event_queue, state, now)
+                .is_ok(),
+            SdoServerSel::Extra(i) => self.extra_sdo[i]
+                .process(&req, &mut self.od, &mut resp, &mut self.event_queue, state, now)
+                .is_ok(),
+        };
+
+        if ok {
+            let resp_cob = match sel {
+                SdoServerSel::Default => CobId::sdo_tx(self.node_id).raw(),
+                SdoServerSel::Extra(i) => self.extra_sdo_tx[i],
+            };
+            if let Some(resp_frame) = CanFrame::new(resp_cob, &resp) {
+                let _ = transport.transmit(&resp_frame);
+            }
+        }
+        if was_full && self.event_queue.is_full() {
+            // Queue was full before and after — if an event was pushed, one was dropped
+            self.event_overflow_count = self.event_overflow_count.saturating_add(1);
+        }
+        // Resync runtime services whose config lives in the OD. Signalled
+        // directly by the SDO server rather than via the event queue: an
+        // overflowing queue must not be able to swallow a config change.
+        let committed = match sel {
+            SdoServerSel::Default => self.sdo_server.take_committed_write(),
+            SdoServerSel::Extra(i) => self.extra_sdo[i].take_committed_write(),
+        };
+        if let Some((index, _)) = committed {
+            if (0x1400..=0x1BFF).contains(&index) {
+                self.sync_pdo_from_od();
+            }
+            if index == 0x1016 || index == 0x1017 {
+                self.sync_heartbeat_from_od(true);
+            }
+        }
+    }
+
     fn dispatch_frame(
         &mut self,
         frame: &CanFrame,
@@ -672,6 +835,16 @@ impl<
         let Some(cob) = CobId::new(frame.raw_id()) else {
             return;
         };
+
+        // Additional SDO servers (0x1201+) match by their configured rx COB-ID,
+        // which is arbitrary and need not fall in the default SDO request range.
+        // Check them first; the default server is handled in the parse below.
+        for i in 0..SDO {
+            if self.extra_sdo_rx[i] == frame.raw_id() {
+                self.handle_sdo_request(SdoServerSel::Extra(i), frame, transport, now);
+                return;
+            }
+        }
 
         match cob.parse() {
             ParsedCobId::Nmt => {
@@ -685,7 +858,7 @@ impl<
                                 // The application should handle resetting OD values
                                 // to defaults via the event queue or other mechanism.
                                 self.booted = false;
-                                self.sdo_server.abort_transfer();
+                                self.abort_all_sdo_transfers();
                                 self.sync_pdo_from_od();
                                 self.sync_heartbeat_from_od(false);
                             }
@@ -693,7 +866,7 @@ impl<
                                 // Reset only communication parameters (PDO, heartbeat).
                                 // Application data in the OD is preserved.
                                 self.booted = false;
-                                self.sdo_server.abort_transfer();
+                                self.abort_all_sdo_transfers();
                                 self.sync_pdo_from_od();
                                 self.sync_heartbeat_from_od(false);
                             }
@@ -704,44 +877,7 @@ impl<
             }
 
             ParsedCobId::SdoRequest(node) if node == self.node_id => {
-                if frame.raw_dlc() >= 8 {
-                    let req: [u8; 8] = frame.data().try_into().unwrap();
-                    let mut resp = [0u8; 8];
-                    let was_full = self.event_queue.is_full();
-                    if self
-                        .sdo_server
-                        .process(
-                            &req,
-                            &mut self.od,
-                            &mut resp,
-                            &mut self.event_queue,
-                            self.nmt.state(),
-                            now,
-                        )
-                        .is_ok()
-                    {
-                        let resp_cob = CobId::sdo_tx(self.node_id);
-                        if let Some(resp_frame) = CanFrame::new(resp_cob.raw(), &resp) {
-                            let _ = transport.transmit(&resp_frame);
-                        }
-                    }
-                    if was_full && self.event_queue.is_full() {
-                        // Queue was full before and after — if an event was pushed, one was dropped
-                        self.event_overflow_count = self.event_overflow_count.saturating_add(1);
-                    }
-                    // Resync runtime services whose config lives in the OD.
-                    // Signalled directly by the SDO server rather than via the
-                    // event queue: an overflowing queue must not be able to
-                    // swallow a config change.
-                    if let Some((index, _)) = self.sdo_server.take_committed_write() {
-                        if (0x1400..=0x1BFF).contains(&index) {
-                            self.sync_pdo_from_od();
-                        }
-                        if index == 0x1016 || index == 0x1017 {
-                            self.sync_heartbeat_from_od(true);
-                        }
-                    }
-                }
+                self.handle_sdo_request(SdoServerSel::Default, frame, transport, now);
             }
 
             ParsedCobId::Sync => {
@@ -811,10 +947,11 @@ pub struct OdGuard<
     OD: ObjectDictionary + Clone,
     const TPDO: usize,
     const RPDO: usize,
+    const SDO: usize,
     const EVT_QUEUE: usize,
     const DIRTY_SET: usize,
 > {
-    node: &'a mut Node<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>,
+    node: &'a mut Node<OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>,
     snapshot: OD,
 }
 
@@ -822,9 +959,10 @@ impl<
         OD: ObjectDictionary + Clone,
         const TPDO: usize,
         const RPDO: usize,
+        const SDO: usize,
         const EVT_QUEUE: usize,
         const DIRTY_SET: usize,
-    > core::ops::Deref for OdGuard<'_, OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+    > core::ops::Deref for OdGuard<'_, OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>
 {
     type Target = OD;
     fn deref(&self) -> &OD {
@@ -836,9 +974,10 @@ impl<
         OD: ObjectDictionary + Clone,
         const TPDO: usize,
         const RPDO: usize,
+        const SDO: usize,
         const EVT_QUEUE: usize,
         const DIRTY_SET: usize,
-    > core::ops::DerefMut for OdGuard<'_, OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+    > core::ops::DerefMut for OdGuard<'_, OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>
 {
     fn deref_mut(&mut self) -> &mut OD {
         &mut self.node.od
@@ -849,9 +988,10 @@ impl<
         OD: ObjectDictionary + Clone,
         const TPDO: usize,
         const RPDO: usize,
+        const SDO: usize,
         const EVT_QUEUE: usize,
         const DIRTY_SET: usize,
-    > Drop for OdGuard<'_, OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+    > Drop for OdGuard<'_, OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>
 {
     fn drop(&mut self) {
         // Collect changed (index, subindex) pairs first to avoid borrow conflict
@@ -919,12 +1059,13 @@ pub struct SharedNode<
     OD: ObjectDictionary,
     const TPDO: usize = 4,
     const RPDO: usize = 4,
+    const SDO: usize = 0,
     const EVT_QUEUE: usize = 16,
     const DIRTY_SET: usize = 8,
 > {
     inner: embassy_sync::blocking_mutex::Mutex<
         embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-        core::cell::RefCell<Option<Node<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>>>,
+        core::cell::RefCell<Option<Node<OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>>>,
     >,
     event_signal: OdEventSignal,
 }
@@ -934,9 +1075,10 @@ impl<
         OD: ObjectDictionary,
         const TPDO: usize,
         const RPDO: usize,
+        const SDO: usize,
         const EVT_QUEUE: usize,
         const DIRTY_SET: usize,
-    > SharedNode<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+    > SharedNode<OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>
 {
     pub const fn new() -> Self {
         Self {
@@ -950,7 +1092,7 @@ impl<
     /// `SharedNode` installs its internal OD event signal before storing the
     /// node, so application code can await [`wait_for_change`](Self::wait_for_change)
     /// without wiring a separate static signal by hand.
-    pub fn init(&'static self, mut node: Node<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>) {
+    pub fn init(&'static self, mut node: Node<OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>) {
         node.set_event_signal(&self.event_signal);
         self.inner.lock(|cell| {
             cell.borrow_mut().replace(node);
@@ -973,7 +1115,7 @@ impl<
     /// Panics if called before [`init`](Self::init).
     pub fn with<R>(
         &self,
-        f: impl FnOnce(&mut Node<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>) -> R,
+        f: impl FnOnce(&mut Node<OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>) -> R,
     ) -> R {
         self.inner.lock(|cell| {
             let mut borrow = cell.borrow_mut();
@@ -990,9 +1132,10 @@ impl<
         OD: ObjectDictionary,
         const TPDO: usize,
         const RPDO: usize,
+        const SDO: usize,
         const EVT_QUEUE: usize,
         const DIRTY_SET: usize,
-    > Default for SharedNode<OD, TPDO, RPDO, EVT_QUEUE, DIRTY_SET>
+    > Default for SharedNode<OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>
 {
     fn default() -> Self {
         Self::new()
@@ -1076,6 +1219,7 @@ mod tests {
             auto_start: false,
             tpdo: [TpdoConfig::default()],
             rpdo: [RpdoConfig::default()],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         let od = MinimalOd {
@@ -1103,6 +1247,7 @@ mod tests {
             auto_start: false,
             tpdo: [TpdoConfig::default()],
             rpdo: [RpdoConfig::default()],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         let od = MinimalOd {
@@ -1274,6 +1419,7 @@ mod tests {
                 mappings: rpdo_mappings,
                 enabled: true,
             }],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         let od = EventTestOd {
@@ -1358,6 +1504,7 @@ mod tests {
                 mappings: rpdo_mappings,
                 enabled: true,
             }],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         let od = EventTestOd {
@@ -1402,6 +1549,7 @@ mod tests {
                 },
                 RpdoConfig::default(),
             ],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         let od = EventTestOd {
@@ -1563,6 +1711,7 @@ mod tests {
             auto_start: true,
             tpdo: [],
             rpdo,
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
 
@@ -1624,6 +1773,7 @@ mod tests {
                 mappings: rpdo_mappings,
                 enabled: true,
             }],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         let od = EventTestOd {
@@ -1633,7 +1783,7 @@ mod tests {
             input1: 0,
         };
         // EVT_QUEUE = 2, so two RPDO events will fill it, then SDO will overflow
-        let mut node: Node<EventTestOd, 1, 1, 2, 8> = Node::new(config, od);
+        let mut node: Node<EventTestOd, 1, 1, 0, 2, 8> = Node::new(config, od);
         let mut transport = MailboxTransport::<32, 32>::new();
 
         node.process(&mut transport, &TestClock(0));
@@ -1693,6 +1843,7 @@ mod tests {
                 mappings: rpdo_mappings,
                 enabled: true,
             }],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         let od = EventTestOd {
@@ -1701,7 +1852,7 @@ mod tests {
             output2: 0,
             input1: 0,
         };
-        let mut node: Node<EventTestOd, 1, 1, 1, 8> = Node::new(config, od);
+        let mut node: Node<EventTestOd, 1, 1, 0, 1, 8> = Node::new(config, od);
         let mut transport = MailboxTransport::<32, 32>::new();
 
         node.process(&mut transport, &TestClock(0));
@@ -1757,6 +1908,7 @@ mod tests {
                 enabled: true,
             }],
             rpdo: [RpdoConfig::default()],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         let od = EventTestOd {
@@ -1816,6 +1968,7 @@ mod tests {
                 enabled: true,
             }],
             rpdo: [RpdoConfig::default()],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         let od = EventTestOd {
@@ -1876,6 +2029,7 @@ mod tests {
             auto_start: false,
             tpdo: [TpdoConfig::default()],
             rpdo: [RpdoConfig::default()],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         let od = MinimalOd {
@@ -2021,6 +2175,7 @@ mod tests {
             auto_start: false,
             tpdo: [TpdoConfig::default()],
             rpdo: [RpdoConfig::default()],
+            sdo_servers: [],
             identity: LssIdentity::default(),
         };
         (Node::new(config, od), MailboxTransport::<32, 32>::new())

@@ -18,6 +18,9 @@ pub struct OdDefinition {
     pub name: Ident,
     pub entries: Vec<OdEntry>,
     pub pdos: Vec<PdoDef>,
+    /// Additional SDO server declarations (`sdo_server[N](...)`). The default
+    /// server (number 1, 0x1200) is always implicit and not listed here.
+    pub sdo_servers: Vec<SdoServerDef>,
     /// If set, export the OD as an EDS file to this path (relative to CARGO_MANIFEST_DIR or absolute).
     pub export_eds_path: Option<String>,
     /// If true, use `alloc::string::String` / `alloc::vec::Vec<u8>` instead of heapless for
@@ -146,6 +149,24 @@ pub enum PdoDirection {
     Rpdo,
 }
 
+/// An additional SDO server parameter record, parsed from
+/// `sdo_server[N](cob_rx = ..., cob_tx = ...);`.
+///
+/// SDO server COB-IDs are a device design decision fixed at build time — the
+/// generated OD records are `const` (read-only) and never remappable at runtime
+/// (the CiA 302 SDO Manager is the only spec use for writable COB-IDs and is out
+/// of scope). See `_Tasks/additional-sdo-servers.md`.
+#[derive(Debug, Clone)]
+pub struct SdoServerDef {
+    /// 1-indexed server number. Number 1 is the implicit default (0x1200);
+    /// declarations here are 2..=128, mapping to OD record `0x1200 + (N - 1)`.
+    pub number: u16,
+    /// COB-ID client→server (the request/rx COB-ID), OD sub 1.
+    pub cob_rx: CobIdSpec,
+    /// COB-ID server→client (the response/tx COB-ID), OD sub 2.
+    pub cob_tx: CobIdSpec,
+}
+
 impl Parse for OdDefinition {
     fn parse(input: ParseStream) -> Result<Self> {
         // Parse optional attributes: #[export_eds(path = "...")], #[use_alloc]
@@ -207,11 +228,17 @@ impl Parse for OdDefinition {
 
         let mut entries = Vec::new();
         let mut pdos = Vec::new();
+        let mut sdo_servers = Vec::new();
         while !content.is_empty() {
-            // PDO definitions start with an ident (tpdo/rpdo),
-            // regular OD entries start with [0xINDEX]
+            // PDO / SDO-server definitions start with an ident (tpdo/rpdo/
+            // sdo_server); regular OD entries start with [0xINDEX].
             if content.peek(Ident) {
-                pdos.push(content.call(parse_pdo_def)?);
+                let ident: Ident = content.fork().parse()?;
+                if ident == "sdo_server" {
+                    sdo_servers.push(content.call(parse_sdo_server_def)?);
+                } else {
+                    pdos.push(content.call(parse_pdo_def)?);
+                }
             } else {
                 entries.push(content.call(parse_entry)?);
             }
@@ -222,6 +249,7 @@ impl Parse for OdDefinition {
             name,
             entries,
             pdos,
+            sdo_servers,
             export_eds_path,
             use_alloc,
             validate_write_fn,
@@ -399,38 +427,7 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
             params.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "cob_id" => {
-                    if params.peek(Ident) {
-                        // node-relative: `cob_id = node_id + 0x1B0`
-                        let ident: Ident = params.parse()?;
-                        if ident != "node_id" {
-                            return Err(syn::Error::new(
-                                ident.span(),
-                                "expected `node_id + <base>` or a literal COB-ID",
-                            ));
-                        }
-                        params.parse::<Token![+]>()?;
-                        let val: LitInt = params.parse()?;
-                        let base: u32 = val.base10_parse()?;
-                        // Node IDs go up to 127; base + node_id must stay 11-bit
-                        if base == 0 || base + 127 > 0x7FF {
-                            return Err(syn::Error::new(
-                                val.span(),
-                                "node-relative cob_id base must be 0x001-0x780 \
-                                 (base + node_id must fit an 11-bit CAN ID)",
-                            ));
-                        }
-                        cob_id = Some(CobIdSpec::NodeRelative(base));
-                    } else {
-                        let val: LitInt = params.parse()?;
-                        let raw: u32 = val.base10_parse()?;
-                        if raw == 0 || raw > 0x7FF {
-                            return Err(syn::Error::new(
-                                val.span(),
-                                "cob_id must be an 11-bit CAN ID (0x001-0x7FF)",
-                            ));
-                        }
-                        cob_id = Some(CobIdSpec::Absolute(raw));
-                    }
+                    cob_id = Some(parse_cob_id_spec(&params)?);
                 }
                 "transmission_type" => {
                     transmission_type = parse_transmission_type(&params)?;
@@ -555,6 +552,102 @@ fn parse_pdo_def(input: ParseStream) -> Result<PdoDef> {
         event_timer,
         mapping,
         mappings,
+    })
+}
+
+/// Parse a COB-ID spec: either a literal 11-bit COB-ID (`0x640`) or a
+/// node-relative expression (`node_id + 0x40`). Shared by PDO `cob_id` and SDO
+/// server `cob_rx`/`cob_tx`.
+fn parse_cob_id_spec(input: ParseStream) -> Result<CobIdSpec> {
+    if input.peek(Ident) {
+        // node-relative: `node_id + 0x40`
+        let ident: Ident = input.parse()?;
+        if ident != "node_id" {
+            return Err(syn::Error::new(
+                ident.span(),
+                "expected `node_id + <base>` or a literal COB-ID",
+            ));
+        }
+        input.parse::<Token![+]>()?;
+        let val: LitInt = input.parse()?;
+        let base: u32 = val.base10_parse()?;
+        // Node IDs go up to 127; base + node_id must stay 11-bit.
+        if base == 0 || base + 127 > 0x7FF {
+            return Err(syn::Error::new(
+                val.span(),
+                "node-relative base must be 0x001-0x780 \
+                 (base + node_id must fit an 11-bit CAN ID)",
+            ));
+        }
+        Ok(CobIdSpec::NodeRelative(base))
+    } else {
+        let val: LitInt = input.parse()?;
+        let raw: u32 = val.base10_parse()?;
+        if raw == 0 || raw > 0x7FF {
+            return Err(syn::Error::new(
+                val.span(),
+                "COB-ID must be an 11-bit CAN ID (0x001-0x7FF)",
+            ));
+        }
+        Ok(CobIdSpec::Absolute(raw))
+    }
+}
+
+/// Parse `sdo_server[2](cob_rx = 0x640, cob_tx = 0x5C0);`.
+fn parse_sdo_server_def(input: ParseStream) -> Result<SdoServerDef> {
+    let kw: Ident = input.parse()?; // `sdo_server`
+
+    // Parse [N] — 1-indexed server number (2..=128; 1 is the implicit default).
+    let num_content;
+    bracketed!(num_content in input);
+    let num_lit: LitInt = num_content.parse()?;
+    let number: u16 = num_lit
+        .base10_parse()
+        .map_err(|_| syn::Error::new(num_lit.span(), "expected SDO server number 2-128"))?;
+    if number < 2 || number > 128 {
+        return Err(syn::Error::new(
+            num_lit.span(),
+            "SDO server number must be 2-128; server 1 is the implicit default \
+             (0x1200, predefined COB-IDs 0x600/0x580 + node_id)",
+        ));
+    }
+
+    let params;
+    parenthesized!(params in input);
+    let mut cob_rx = None;
+    let mut cob_tx = None;
+    while !params.is_empty() {
+        let key: Ident = params.parse()?;
+        params.parse::<Token![=]>()?;
+        match key.to_string().as_str() {
+            "cob_rx" => cob_rx = Some(parse_cob_id_spec(&params)?),
+            "cob_tx" => cob_tx = Some(parse_cob_id_spec(&params)?),
+            other => {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!("unknown sdo_server parameter `{other}`, expected `cob_rx` or `cob_tx`"),
+                ));
+            }
+        }
+        if params.peek(Token![,]) {
+            params.parse::<Token![,]>()?;
+        }
+    }
+    input.parse::<Token![;]>()?;
+
+    let cob_rx = cob_rx
+        .ok_or_else(|| syn::Error::new(kw.span(), "sdo_server requires `cob_rx = ...`"))?;
+    let cob_tx = cob_tx
+        .ok_or_else(|| syn::Error::new(kw.span(), "sdo_server requires `cob_tx = ...`"))?;
+
+    // COB-ID uniqueness (rx vs tx, cross-server, and vs the default server) is
+    // checked comprehensively in codegen, where every server is visible and the
+    // default server's node-relative COB-IDs can be compared too.
+
+    Ok(SdoServerDef {
+        number,
+        cob_rx,
+        cob_tx,
     })
 }
 

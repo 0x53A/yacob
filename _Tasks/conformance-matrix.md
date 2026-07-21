@@ -28,7 +28,8 @@ Big gaps not fully captured by the current known-issues list:
 - TIME object/service is absent.
 - EMCY producer exists, but pre-defined error field 0x1003 and inhibit time
   0x1015 are absent or not integrated.
-- Additional SDO channels are absent.
+- Additional SDO channels (0x1201+) are implemented via the DSL; EDS *import*
+  of them is still pending.
 - Node guarding/life guarding is absent.
 - LSS slave is partial; LSS master and FastScan are absent.
 - CiA 302 features are mostly out of scope except application examples.
@@ -64,8 +65,8 @@ Big gaps not fully captured by the current known-issues list:
 | Heartbeat consumer | 0x1016 Consumer heartbeat time | Yes | OD-integrated `HeartbeatMonitor` per entry (up to 8); typed events (started/state-change/remote-reset/timeout/recovery); SDO validation (invalid node id 0x0609_0030, duplicate producer 0x0604_0043). Unit + interop tests. |
 | Store params | 0x1010 Store parameters | No | No generic storage object. |
 | Restore params | 0x1011 Restore default parameters | No | No generic restore/default storage. |
-| SDO server params | 0x1200 default SDO server | Partial | Default channel implemented; OD comm object not modelled by stack. |
-| Extra SDO server | 0x1201+ additional SDO servers | No | Tracked in `known-issues.md` as configurable/additional SDO channels. |
+| SDO server params | 0x1200 default SDO server | Partial | Default channel implemented; 0x1200 record kept implicit (predefined COB-IDs, not modelled as an OD object). |
+| Extra SDO server | 0x1201+ additional SDO servers | Yes | DSL `sdo_server[N](cob_rx=, cob_tx=)`; independent transfer state per channel; OD records read-only (const, non-remappable — CiA 302 SDO Manager remap intentionally out of scope). Unit + interop tests. EDS export yes; EDS import pending. See `_Tasks/additional-sdo-servers.md`. |
 | SDO client params | 0x1280+ SDO client objects | No | Client exists, but no OD-managed SDO client channels. |
 
 ## NMT / Boot-up / Error Control
@@ -97,7 +98,7 @@ Big gaps not fully captured by the current known-issues list:
 | SDO client timeout | Partial | `SdoDriver` timed APIs; low-level `SdoClient` has no timeout. |
 | Abort-code mapping | Partial | Much improved; audit all state/protocol paths. |
 | Busy-channel / collision behavior | Partial | Known issue; focused tests still missing. |
-| Multiple SDO channels | No | Known ergonomic/conformance gap. |
+| Multiple SDO channels | Yes | Additional SDO servers (0x1201+) via DSL `sdo_server[N]`; independent transfer state, dispatched by configured COB-ID. |
 | SDO via non-CAN mappings (CiA 309/J1939 mapping) | N/A | Outside core scope. |
 
 ## PDO / SYNC
@@ -234,7 +235,9 @@ bug-level backlog:
 7. Decide whether node guarding/life guarding is in scope; if not, document it
    as intentionally unsupported.
 8. Add TIME object/service or document as unsupported.
-9. Add additional/configurable SDO channels.
+9. ~~Add additional/configurable SDO channels.~~ Done 2026-07 (0x1201+ via DSL,
+   const/non-remappable; EDS import still pending). See
+   `_Tasks/additional-sdo-servers.md`.
 10. Add LSS FastScan and/or explicitly mark unsupported.
 11. Add SDO client block transfer if master-side large transfers matter.
 12. Build a CANopenNode/Lely interop test harness for behavioral comparison.

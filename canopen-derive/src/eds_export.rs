@@ -138,12 +138,21 @@ pub fn generate_eds(od: &OdDefinition) -> String {
     pdo_indices.sort();
     pdo_indices.dedup();
 
+    // Additional SDO server records (0x1201+).
+    let mut sdo_indices: Vec<u16> = od
+        .sdo_servers
+        .iter()
+        .map(|s| 0x1200 + (s.number - 1))
+        .collect();
+    sdo_indices.sort();
+    sdo_indices.dedup();
+
     let mandatory: Vec<u16> = user_indices
         .iter()
         .copied()
         .filter(|i| *i < 0x2000)
         .collect();
-    let optional: Vec<u16> = pdo_indices;
+    let optional: Vec<u16> = pdo_indices.iter().copied().chain(sdo_indices.clone()).collect();
     let manufacturer: Vec<u16> = user_indices
         .iter()
         .copied()
@@ -244,7 +253,45 @@ pub fn generate_eds(od: &OdDefinition) -> String {
         write_pdo_eds(&mut out, pdo, &mappings);
     }
 
+    for s in &od.sdo_servers {
+        write_sdo_server_eds(&mut out, s);
+    }
+
     out
+}
+
+/// Resolved-COB-ID default-value string for an EDS entry.
+fn cob_id_spec_eds(spec: CobIdSpec) -> String {
+    match spec {
+        CobIdSpec::Absolute(id) => format!("0x{id:X}"),
+        CobIdSpec::NodeRelative(base) => format!("$NODEID+0x{base:X}"),
+    }
+}
+
+/// Write an additional SDO server parameter record (0x1201+). COB-IDs are
+/// `ro` — const, non-remappable at runtime (see `_Tasks/additional-sdo-servers.md`).
+fn write_sdo_server_eds(out: &mut String, s: &crate::dsl::SdoServerDef) {
+    let idx = 0x1200 + (s.number - 1);
+    write_record_header(out, idx, "SDO Server Parameter", 3);
+    write_pdo_sub(out, idx, 0, "Highest sub-index supported", 0x0005, "ro", "2");
+    write_pdo_sub(
+        out,
+        idx,
+        1,
+        "COB-ID Client to Server (Receive SDO)",
+        0x0007,
+        "ro",
+        &cob_id_spec_eds(s.cob_rx),
+    );
+    write_pdo_sub(
+        out,
+        idx,
+        2,
+        "COB-ID Server to Client (Transmit SDO)",
+        0x0007,
+        "ro",
+        &cob_id_spec_eds(s.cob_tx),
+    );
 }
 
 fn write_index_list(out: &mut String, section: &str, indices: &[u16]) {
