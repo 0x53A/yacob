@@ -52,6 +52,20 @@ object_dictionary! {
         [0x6201] outputs2: record {
             [1] output3: u16 = 0, rw, pdo;
         };
+        // Bit-granular mapping fixture: the Python interop suite remaps RPDO5
+        // to all nine entries to exercise mappings beyond the historic
+        // eight-entry limit.
+        [0x6300] bit_outputs: record {
+            [1] bit_output1: bool = false, rw, pdo;
+            [2] bit_output2: bool = false, rw, pdo;
+            [3] bit_output3: bool = false, rw, pdo;
+            [4] bit_output4: bool = false, rw, pdo;
+            [5] bit_output5: bool = false, rw, pdo;
+            [6] bit_output6: bool = false, rw, pdo;
+            [7] bit_output7: bool = false, rw, pdo;
+            [8] bit_output8: bool = false, rw, pdo;
+            [9] bit_output9: bool = false, rw, pdo;
+        };
 
         // TPDO1: send input1 + input2 on event (0x181 for node 1)
         tpdo[1](transmission_type = 255, inhibit_time = 0, event_timer = 500) {

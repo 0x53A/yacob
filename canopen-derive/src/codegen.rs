@@ -1600,7 +1600,27 @@ pub fn generate(od: OdDefinition) -> TokenStream {
     // ---- Assemble output ----
     let meta_len = all_meta_entries.len();
 
+    // The proc macro checks mapping counts and payload budgets against its own
+    // copies of these constants (it cannot see canopen-core's values at
+    // expansion time). Emit a static assertion so the two copies drifting apart
+    // is a compile error in the user's crate rather than silently truncated
+    // mappings at runtime.
+    let dsl_max_mappings = crate::dsl::PDO_MAX_MAPPINGS;
+    let dsl_max_payload_bits = crate::dsl::PDO_MAX_PAYLOAD_BITS;
+    let limit_assertions = quote! {
+        const _: () = ::core::assert!(
+            canopen_core::pdo::PDO_MAX_MAPPINGS == #dsl_max_mappings,
+            "canopen-derive and canopen-core disagree on PDO_MAX_MAPPINGS"
+        );
+        const _: () = ::core::assert!(
+            canopen_core::pdo::PDO_MAX_PAYLOAD_BITS == #dsl_max_payload_bits,
+            "canopen-derive and canopen-core disagree on PDO_MAX_PAYLOAD_BITS"
+        );
+    };
+
     quote! {
+        #limit_assertions
+
         #[derive(Clone)]
         #vis struct #name {
             #(#struct_fields,)*

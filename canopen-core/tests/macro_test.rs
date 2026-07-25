@@ -352,6 +352,17 @@ object_dictionary! {
     }
 }
 
+object_dictionary! {
+    pub struct MutableRpdoOd {
+        [0x1000] device_type: u32 = 0x0000_0191, ro;
+        [0x2002] command: bool = false, rw, pdo;
+
+        rpdo[1](transmission_type = event_driven, mapping = mutable) {
+            command,
+        };
+    }
+}
+
 #[test]
 fn dsl_bool_pdo_mappings_are_one_bit() {
     let od = BoolPdoTestOd::new();
@@ -1642,4 +1653,312 @@ fn sdo_server_no_collision_at_other_node_id() {
         ..NodeConfig::from_od(&od, node_id)
     };
     let _node: Node<CollideOd, 0, 0, 1> = Node::new(config, od);
+}
+
+/// The static half of the COB-ID invariant: a PDO configured onto the
+/// diagnostics channel's rx COB-ID is caught by `Node::new`. The runtime half
+/// (an SDO client remapping the PDO there later) is covered by
+/// `sdo_server_cob_id_rejects_runtime_pdo_remap`.
+#[test]
+#[should_panic(expected = "configured CANopen service")]
+fn sdo_server_collision_with_pdo_cob_id_panics() {
+    use canopen_core::node::{Node, NodeConfig};
+    use canopen_core::pdo::{RpdoConfig, PDO_MAX_MAPPINGS};
+
+    let od = DiagOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+    let config = NodeConfig::<0, 1, 1> {
+        node_id,
+        heartbeat_interval_ms: 0,
+        auto_start: false,
+        tpdo: [],
+        rpdo: [RpdoConfig::<PDO_MAX_MAPPINGS> {
+            cob_id: 0x645,
+            enabled: true,
+            ..RpdoConfig::default()
+        }],
+        sdo_servers: od.sdo_server_configs(node_id),
+        identity: canopen_core::lss::LssIdentity::default(),
+    };
+    let _node: Node<DiagOd, 0, 1, 1> = Node::new(config, od);
+}
+
+/// A PDO parked on an SDO channel by `Node::new` panics; the same collision is
+/// also rejected when a *disabled* PDO sits there, because a later write to the
+/// COB-ID's valid bit would bring it to life without touching the COB-ID.
+#[test]
+#[should_panic(expected = "configured CANopen service")]
+fn sdo_server_collision_with_disabled_pdo_cob_id_panics() {
+    use canopen_core::node::{Node, NodeConfig};
+    use canopen_core::pdo::{RpdoConfig, PDO_MAX_MAPPINGS};
+
+    let od = DiagOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+    let config = NodeConfig::<0, 1, 1> {
+        node_id,
+        heartbeat_interval_ms: 0,
+        auto_start: false,
+        tpdo: [],
+        rpdo: [RpdoConfig::<PDO_MAX_MAPPINGS> {
+            cob_id: 0x645,
+            enabled: false,
+            ..RpdoConfig::default()
+        }],
+        sdo_servers: od.sdo_server_configs(node_id),
+        identity: canopen_core::lss::LssIdentity::default(),
+    };
+    let _node: Node<DiagOd, 0, 1, 1> = Node::new(config, od);
+}
+
+// DiagPdoOd: a diagnostics SDO channel next to a real, OD-backed PDO pair —
+// the fixture for the runtime half of the COB-ID uniqueness invariant.
+object_dictionary! {
+    pub struct DiagPdoOd {
+        [0x1000] device_type: u32 = 0x0000_0191, ro;
+        [0x6200] outputs: record {
+            [1] led: u8 = 0, rw, pdo;
+        };
+
+        rpdo[1](transmission_type = 255) {
+            led,
+        };
+
+        sdo_server[2](cob_rx = node_id + 0x640, cob_tx = node_id + 0x5C0);
+    }
+}
+
+/// CiA 301 lets a client rewrite an RPDO's COB-ID in Pre-Operational. Moving it
+/// onto an SDO channel is rejected (0x0604_0043) instead of producing a PDO the
+/// dispatcher would hand to the SDO server: the node matches SDO channels first,
+/// so such an RPDO would never reach the PDO engine.
+#[test]
+fn sdo_server_cob_id_rejects_runtime_pdo_remap() {
+    use canopen_core::node::{Node, NodeConfig};
+    use canopen_core::pdo::PdoNumber;
+    use canopen_core::transport::{CanFrame, MailboxTransport};
+
+    let od = DiagPdoOd::new();
+    // node 5: default SDO 0x605/0x585, diagnostics channel 0x645/0x5C5.
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+    let config = NodeConfig {
+        auto_start: false, // stay Pre-Operational: PDO config is writable
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let mut node: Node<DiagPdoOd, 0, 1, 1> = Node::new(config, od);
+    let mut transport = MailboxTransport::<32, 32>::new();
+    node.process(&mut transport, &FixedClock(0));
+    drain(&mut transport);
+
+    let rpdo1 = PdoNumber::of::<1>();
+    assert_eq!(node.rpdo_cob_id(rpdo1).unwrap().raw(), 0x205);
+
+    // Expedited download of 0x1400:1 = 0x645 (the diagnostics rx COB-ID).
+    transport
+        .store_received(
+            CanFrame::new(0x605, &[0x23, 0x00, 0x14, 0x01, 0x45, 0x06, 0x00, 0x00]).unwrap(),
+        )
+        .unwrap();
+    node.process(&mut transport, &FixedClock(1_000));
+    let resp = drain(&mut transport)
+        .into_iter()
+        .find(|f| f.raw_id() == 0x585)
+        .expect("SDO response");
+    assert_eq!(resp.data()[0], 0x80, "abort");
+    assert_eq!(
+        u32::from_le_bytes(resp.data()[4..8].try_into().unwrap()),
+        0x0604_0043,
+        "general parameter incompatibility"
+    );
+    // The write never reached the OD, so the engine still has the old COB-ID.
+    assert_eq!(node.rpdo_cob_id(rpdo1).unwrap().raw(), 0x205);
+
+    // Same COB-ID with the valid bit set — a "parked" PDO — is rejected too:
+    // enabling it later needs no second COB-ID write.
+    transport
+        .store_received(
+            CanFrame::new(0x605, &[0x23, 0x00, 0x14, 0x01, 0x45, 0x06, 0x00, 0x80]).unwrap(),
+        )
+        .unwrap();
+    node.process(&mut transport, &FixedClock(2_000));
+    let resp = drain(&mut transport)
+        .into_iter()
+        .find(|f| f.raw_id() == 0x585)
+        .expect("SDO response");
+    assert_eq!(resp.data()[0], 0x80, "abort");
+
+    // A free COB-ID is still accepted — the guard is not a blanket ban.
+    transport
+        .store_received(
+            CanFrame::new(0x605, &[0x23, 0x00, 0x14, 0x01, 0x00, 0x03, 0x00, 0x00]).unwrap(),
+        )
+        .unwrap();
+    node.process(&mut transport, &FixedClock(3_000));
+    let resp = drain(&mut transport)
+        .into_iter()
+        .find(|f| f.raw_id() == 0x585)
+        .expect("SDO response");
+    assert_eq!(resp.data()[0], 0x60, "download acknowledged");
+    assert_eq!(node.rpdo_cob_id(rpdo1).unwrap().raw(), 0x300);
+}
+
+/// The default SDO channel is protected the same way as the extra ones — a PDO
+/// on `0x600 + node_id` would be eaten by the default server.
+#[test]
+fn default_sdo_server_cob_id_rejects_runtime_pdo_remap() {
+    use canopen_core::node::{Node, NodeConfig};
+    use canopen_core::transport::{CanFrame, MailboxTransport};
+
+    let od = DiagPdoOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(5).unwrap();
+    let config = NodeConfig {
+        auto_start: false,
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let mut node: Node<DiagPdoOd, 0, 1, 1> = Node::new(config, od);
+    let mut transport = MailboxTransport::<32, 32>::new();
+    node.process(&mut transport, &FixedClock(0));
+    drain(&mut transport);
+
+    // 0x1400:1 = 0x605 (own default SDO request COB-ID).
+    transport
+        .store_received(
+            CanFrame::new(0x605, &[0x23, 0x00, 0x14, 0x01, 0x05, 0x06, 0x00, 0x00]).unwrap(),
+        )
+        .unwrap();
+    node.process(&mut transport, &FixedClock(1_000));
+    let resp = drain(&mut transport)
+        .into_iter()
+        .find(|f| f.raw_id() == 0x585)
+        .expect("SDO response");
+    assert_eq!(resp.data()[0], 0x80, "abort");
+    assert_eq!(
+        u32::from_le_bytes(resp.data()[4..8].try_into().unwrap()),
+        0x0604_0043
+    );
+}
+
+/// The construction-time half protects the default SDO channel even when the
+/// node has no additional servers. A parked PDO is included because clearing
+/// its valid bit later would enable it without changing the COB-ID.
+#[test]
+#[should_panic(expected = "SDO server COB-IDs")]
+fn default_sdo_server_collision_with_initial_disabled_pdo_panics() {
+    use canopen_core::node::{Node, NodeConfig};
+
+    let od = PdoTestOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(1).unwrap();
+    let mut config = NodeConfig::from_od(&od, node_id);
+    config.rpdo[0].cob_id = 0x601;
+    config.rpdo[0].enabled = false;
+
+    let _node: Node<PdoTestOd, 1, 1> = Node::new(config, od);
+}
+
+/// A PDO resync must carry every mapping entry the OD holds, not the first
+/// eight: with bit-granular mappings a PDO may legitimately have up to
+/// `PDO_MAX_MAPPINGS` of them. Guards the same truncation the Python interop
+/// suite covers end-to-end, in the fast test suite.
+#[test]
+fn tpdo_resync_keeps_more_than_eight_mappings() {
+    use canopen_core::node::{Node, NodeConfig};
+    use canopen_core::pdo::PdoNumber;
+    use canopen_core::transport::{CanFrame, MailboxTransport};
+
+    let od = BoolPdoTestOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(1).unwrap();
+    let config = NodeConfig {
+        auto_start: false, // Pre-Operational: PDO comm params are writable
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let mut node: Node<BoolPdoTestOd, 1, 1> = Node::new(config, od);
+    let mut transport = MailboxTransport::<32, 32>::new();
+    node.process(&mut transport, &FixedClock(0));
+    drain(&mut transport);
+
+    let tpdo1 = PdoNumber::of::<1>();
+    assert_eq!(
+        node.tpdo_engine().config(tpdo1).unwrap().mappings.len(),
+        9,
+        "static config carries all nine one-bit mappings"
+    );
+
+    // Any committed write to a PDO parameter triggers a full resync from the
+    // OD. Transmission type 254 on 0x1800:2 is the cheapest one.
+    transport
+        .store_received(
+            CanFrame::new(0x601, &[0x2F, 0x00, 0x18, 0x02, 0xFE, 0x00, 0x00, 0x00]).unwrap(),
+        )
+        .unwrap();
+    node.process(&mut transport, &FixedClock(1_000));
+    let resp = drain(&mut transport)
+        .into_iter()
+        .find(|f| f.raw_id() == 0x581)
+        .expect("SDO response");
+    assert_eq!(resp.data()[0], 0x60, "download acknowledged");
+
+    let config = node.tpdo_engine().config(tpdo1).unwrap();
+    assert_eq!(config.transmission_type, 254, "resync ran");
+    assert_eq!(
+        config.mappings.len(),
+        9,
+        "resync must not truncate the mapping list"
+    );
+    assert_eq!(config.mappings[8].index, 0x2000);
+    assert_eq!(config.mappings[8].subindex, 9);
+    assert_eq!(config.mappings[8].bit_length, 1);
+}
+
+/// Exercise the independent RPDO resync loop with the full CiA 301 unlock,
+/// rewrite, and relock sequence over SDO. A regression to the old hardcoded
+/// eight-entry limit in that branch must fail this test.
+#[test]
+fn rpdo_resync_keeps_more_than_eight_mutable_mappings() {
+    use canopen_core::node::{Node, NodeConfig};
+    use canopen_core::pdo::PdoNumber;
+    use canopen_core::transport::{CanFrame, MailboxTransport};
+
+    let od = MutableRpdoOd::new();
+    let node_id = canopen_core::cobid::NodeId::new(1).unwrap();
+    let config = NodeConfig {
+        auto_start: false,
+        heartbeat_interval_ms: 0,
+        ..NodeConfig::from_od(&od, node_id)
+    };
+    let mut node: Node<MutableRpdoOd, 0, 1> = Node::new(config, od);
+    let mut transport = MailboxTransport::<32, 32>::new();
+    node.process(&mut transport, &FixedClock(0));
+    drain(&mut transport);
+
+    let mut download = |node: &mut Node<MutableRpdoOd, 0, 1>, request: [u8; 8], now: u64| {
+        transport
+            .store_received(CanFrame::new(0x601, &request).unwrap())
+            .unwrap();
+        node.process(&mut transport, &FixedClock(now));
+        let response = drain(&mut transport)
+            .into_iter()
+            .find(|frame| frame.raw_id() == 0x581)
+            .expect("SDO response");
+        assert_eq!(response.data()[0], 0x60, "download acknowledged");
+    };
+
+    // Unlock 0x1600, program nine one-bit entries, then restore the count.
+    download(&mut node, [0x2F, 0x00, 0x16, 0x00, 0, 0, 0, 0], 1_000);
+    for subindex in 1u8..=9 {
+        let mut request = [0x23, 0x00, 0x16, subindex, 0, 0, 0, 0];
+        request[4..8].copy_from_slice(&0x2002_0001u32.to_le_bytes());
+        download(&mut node, request, 1_000 + subindex as u64);
+    }
+    download(&mut node, [0x2F, 0x00, 0x16, 0x00, 9, 0, 0, 0], 2_000);
+
+    let config = node
+        .rpdo_engine()
+        .config(PdoNumber::of::<1>())
+        .expect("RPDO1");
+    assert_eq!(config.mappings.len(), 9);
+    assert!(config.mappings.iter().all(|mapping| {
+        mapping.index == 0x2002 && mapping.subindex == 0 && mapping.bit_length == 1
+    }));
 }

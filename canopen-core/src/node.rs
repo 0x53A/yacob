@@ -9,8 +9,10 @@ use crate::od::ObjectDictionary;
 use crate::od::OdEvent;
 #[cfg(feature = "embassy")]
 use crate::od::OdEventSignal;
-use crate::pdo::{PdoMapping, PdoNumber, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine};
-use crate::sdo::{SdoServer, SdoServerConfig};
+use crate::pdo::{
+    PdoMapping, PdoNumber, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine, PDO_MAX_MAPPINGS,
+};
+use crate::sdo::{SdoCobIds, SdoContext, SdoServer, SdoServerConfig};
 use crate::time::Clock;
 use crate::transport::CanFrame;
 use heapless::{Deque, Vec};
@@ -188,36 +190,62 @@ impl<
         // Mirror resolved additional-SDO-server COB-IDs into the OD (0x1201+)
         // so SDO reads return real values (node-relative resolved).
         node.od.store_sdo_server_cob_ids(config.node_id);
+        node.sync_heartbeat_from_od(false);
         // A hard invariant, not a debug-only check: colliding COB-IDs make the
         // dispatcher steal frames from the default server (extras are matched
         // first) or answer on the wrong COB-ID. The config is fixed at build
         // time, so a violation is a deterministic programming error — fail fast
         // in every build rather than silently misroute SDO traffic in release.
-        // Most cases are already rejected at compile time by the macro; this
-        // catches the node-id-dependent residue (an absolute COB-ID that lands
-        // on the default or another server for this particular node id).
+        // SDO-vs-SDO collisions are mostly rejected at compile time by the
+        // macro; this catches the node-id-dependent residue (an absolute COB-ID
+        // landing on the default or another server for this particular node id)
+        // plus everything the macro cannot see at all: PDO COB-IDs and
+        // heartbeat consumers come from the OD and are only known here.
         assert!(
-            node.extra_sdo_cob_ids_are_unique(),
-            "additional SDO server COB-IDs collide with the default server, \
-             each other, or are zero (for node id {})",
+            node.sdo_cob_ids_are_unique(),
+            "SDO server COB-IDs collide with another configured \
+             CANopen service or are zero (for node id {})",
             config.node_id.raw()
         );
-        node.sync_heartbeat_from_od(false);
         node
     }
 
-    /// Additional SDO server rx/tx COB-IDs must be non-zero, distinct from each
-    /// other, and distinct from the default SDO server's `0x600/0x580 +
-    /// node_id`. Enforced by an assert in [`Node::new`] (see there).
-    fn extra_sdo_cob_ids_are_unique(&self) -> bool {
+    /// Every SDO server rx/tx COB-ID must be distinct from every COB-ID another
+    /// configured service on this node already uses: NMT, SYNC, EMCY, own and
+    /// monitored heartbeats, LSS, and the declared PDOs. Additional SDO server
+    /// IDs must also be non-zero and distinct from the default and each other.
+    /// Enforced by an assert in [`Node::new`] (see there).
+    ///
+    /// This is the static half of the invariant; the runtime half lives in the
+    /// SDO server's download validation (see [`SdoCobIds`]), which stops a
+    /// client from moving a PDO or heartbeat consumer onto an SDO channel after
+    /// boot. Disabled PDOs are checked too — a COB-ID that is merely parked
+    /// today can be enabled by a later write to sub 1.
+    fn sdo_cob_ids_are_unique(&self) -> bool {
         let def_rx = CobId::sdo_rx(self.node_id).raw();
         let def_tx = CobId::sdo_tx(self.node_id).raw();
+        let sdo_cobs = SdoCobIds {
+            default_rx: def_rx,
+            default_tx: def_tx,
+            extra_rx: &self.extra_sdo_rx,
+            extra_tx: &self.extra_sdo_tx,
+        };
+        let fixed = [
+            CobId::nmt().raw(),
+            CobId::sync().raw(),
+            CobId::emergency(self.node_id).raw(),
+            def_rx,
+            def_tx,
+            CobId::heartbeat(self.node_id).raw(),
+            crate::lss::LSS_REQUEST_COB,
+            crate::lss::LSS_RESPONSE_COB,
+        ];
         for i in 0..SDO {
             let (rx, tx) = (self.extra_sdo_rx[i], self.extra_sdo_tx[i]);
             if rx == 0 || tx == 0 || rx == tx {
                 return false;
             }
-            if rx == def_rx || rx == def_tx || tx == def_rx || tx == def_tx {
+            if fixed.contains(&rx) || fixed.contains(&tx) {
                 return false;
             }
             for j in (i + 1)..SDO {
@@ -225,6 +253,25 @@ impl<
                 if rx == orx || rx == otx || tx == orx || tx == otx {
                     return false;
                 }
+            }
+        }
+        for slot in 0..TPDO {
+            if let Some(config) = self.tpdo.config_slot(slot) {
+                if sdo_cobs.claims(config.cob_id) {
+                    return false;
+                }
+            }
+        }
+        for slot in 0..RPDO {
+            if let Some(config) = self.rpdo.config_slot(slot) {
+                if sdo_cobs.claims(config.cob_id) {
+                    return false;
+                }
+            }
+        }
+        for monitor in self.hb_monitors.iter().flatten() {
+            if sdo_cobs.claims(CobId::heartbeat(monitor.node_id()).raw()) {
+                return false;
             }
         }
         true
@@ -709,7 +756,7 @@ impl<
                 // Read mapping count, then mapping entries
                 config.mappings.clear();
                 if self.od.read(map_idx, 0, &mut buf4).is_ok() {
-                    let count = buf4[0].min(8);
+                    let count = buf4[0].min(PDO_MAX_MAPPINGS as u8);
                     for sub in 1..=count {
                         if self.od.read(map_idx, sub, &mut buf4).is_ok() {
                             let _ = config
@@ -741,7 +788,7 @@ impl<
 
                 config.mappings.clear();
                 if self.od.read(map_idx, 0, &mut buf4).is_ok() {
-                    let count = buf4[0].min(8);
+                    let count = buf4[0].min(PDO_MAX_MAPPINGS as u8);
                     for sub in 1..=count {
                         if self.od.read(map_idx, sub, &mut buf4).is_ok() {
                             let _ = config
@@ -782,6 +829,26 @@ impl<
         let mut resp = [0u8; 8];
         let state = self.nmt.state();
         let was_full = self.event_queue.is_full();
+        let heartbeat_consumer_count = self
+            .od
+            .sub_count(0x1016)
+            .unwrap_or(0)
+            .min(MAX_HEARTBEAT_MONITORS as u8);
+
+        // The COB-ID plan every server validates config downloads against, so a
+        // client cannot park a PDO or a heartbeat producer on an SDO channel
+        // (`Node::new` enforces the same invariant for the static config).
+        let ctx = SdoContext {
+            nmt_state: state,
+            now_us: now,
+            heartbeat_consumer_count,
+            cob_ids: SdoCobIds {
+                default_rx: CobId::sdo_rx(self.node_id).raw(),
+                default_tx: CobId::sdo_tx(self.node_id).raw(),
+                extra_rx: &self.extra_sdo_rx,
+                extra_tx: &self.extra_sdo_tx,
+            },
+        };
 
         // Disjoint field borrows: the selected server plus `self.od` /
         // `self.event_queue`. Kept in per-arm expressions so the borrow checker
@@ -789,10 +856,10 @@ impl<
         let ok = match sel {
             SdoServerSel::Default => self
                 .sdo_server
-                .process(&req, &mut self.od, &mut resp, &mut self.event_queue, state, now)
+                .process_with_context(&req, &mut self.od, &mut resp, &mut self.event_queue, ctx)
                 .is_ok(),
             SdoServerSel::Extra(i) => self.extra_sdo[i]
-                .process(&req, &mut self.od, &mut resp, &mut self.event_queue, state, now)
+                .process_with_context(&req, &mut self.od, &mut resp, &mut self.event_queue, ctx)
                 .is_ok(),
         };
 
@@ -805,10 +872,6 @@ impl<
                 let _ = transport.transmit(&resp_frame);
             }
         }
-        if was_full && self.event_queue.is_full() {
-            // Queue was full before and after — if an event was pushed, one was dropped
-            self.event_overflow_count = self.event_overflow_count.saturating_add(1);
-        }
         // Resync runtime services whose config lives in the OD. Signalled
         // directly by the SDO server rather than via the event queue: an
         // overflowing queue must not be able to swallow a config change.
@@ -816,6 +879,12 @@ impl<
             SdoServerSel::Default => self.sdo_server.take_committed_write(),
             SdoServerSel::Extra(i) => self.extra_sdo[i].take_committed_write(),
         };
+        // Every committed download emits one OD event. An upload or rejected
+        // download emits none, so queue fullness alone is not evidence that an
+        // event was dropped.
+        if was_full && committed.is_some() {
+            self.event_overflow_count = self.event_overflow_count.saturating_add(1);
+        }
         if let Some((index, _)) = committed {
             if (0x1400..=0x1BFF).contains(&index) {
                 self.sync_pdo_from_od();
@@ -823,6 +892,15 @@ impl<
             if index == 0x1016 || index == 0x1017 {
                 self.sync_heartbeat_from_od(true);
             }
+        }
+    }
+
+    fn process_rpdo_frame(&mut self, frame: &CanFrame, now: u64) {
+        if self.nmt.state() == NmtState::Operational {
+            let (_, dropped) =
+                self.rpdo
+                    .process_with_drop_count(frame, &mut self.od, &mut self.event_queue, now);
+            self.event_overflow_count = self.event_overflow_count.saturating_add(dropped);
         }
     }
 
@@ -893,15 +971,7 @@ impl<
             ParsedCobId::Rpdo { .. } | ParsedCobId::Tpdo { .. } => {
                 // For RPDO: we receive on RPDO COB-IDs (which are the remote's TPDO)
                 // The RPDO engine matches on COB-ID, so just feed it the frame
-                if self.nmt.state() == NmtState::Operational {
-                    let (_, dropped) = self.rpdo.process_with_drop_count(
-                        frame,
-                        &mut self.od,
-                        &mut self.event_queue,
-                        now,
-                    );
-                    self.event_overflow_count = self.event_overflow_count.saturating_add(dropped);
-                }
+                self.process_rpdo_frame(frame, now);
             }
 
             ParsedCobId::Heartbeat(remote) => {
@@ -930,6 +1000,11 @@ impl<
                     if let Some(resp) = self.lss.process(frame) {
                         let _ = transport.transmit(&resp);
                     }
+                } else {
+                    // Custom RPDO COB-IDs may be outside the pre-defined
+                    // connection set. Once node-owned protocols have had
+                    // priority, let the RPDO engine match the exact ID.
+                    self.process_rpdo_frame(frame, now);
                 }
             }
         }
@@ -1481,6 +1556,22 @@ mod tests {
         assert_eq!(node.od().output2, 0xBB);
     }
 
+    #[test]
+    fn custom_rpdo_cob_id_outside_predefined_ranges_is_dispatched() {
+        let (mut node, mut transport) = make_event_node();
+        node.rpdo_engine_mut()
+            .config_mut(PdoNumber::of::<1>())
+            .unwrap()
+            .cob_id = 0x123;
+
+        let rpdo_frame = CanFrame::new(0x123, &[0xAA, 0xBB]).unwrap();
+        transport.store_received(rpdo_frame).unwrap();
+        node.process(&mut transport, &TestClock(1000));
+
+        assert_eq!(node.od().output1, 0xAA);
+        assert_eq!(node.od().output2, 0xBB);
+    }
+
     fn make_deadline_node() -> (Node<EventTestOd, 1, 1>, MailboxTransport<32, 32>) {
         let mut rpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         rpdo_mappings
@@ -1863,6 +1954,14 @@ mod tests {
         node.process(&mut transport, &TestClock(1000));
 
         assert_eq!(node.events_dropped(), 1);
+
+        // A read-only SDO upload does not enqueue an OD event. It must not be
+        // counted as another drop merely because the queue remains full.
+        transport
+            .store_received(CanFrame::new(0x601, &[0x40, 0x00, 0x10, 0x00, 0, 0, 0, 0]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(2_000));
+        assert_eq!(node.events_dropped(), 1);
     }
 
     #[test]
@@ -2168,6 +2267,47 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct WideHbOd {
+        consumer: [u32; 9],
+    }
+
+    impl ObjectDictionary for WideHbOd {
+        fn lookup(&self, _index: u16, _subindex: u8) -> Option<&'static OdEntryMeta> {
+            None
+        }
+
+        fn read(&self, index: u16, subindex: u8, buf: &mut [u8]) -> Result<usize, OdError> {
+            match (index, subindex) {
+                (0x1016, 0) => {
+                    buf[0] = 9;
+                    Ok(1)
+                }
+                (0x1016, sub @ 1..=9) => {
+                    buf[..4].copy_from_slice(&self.consumer[(sub as usize) - 1].to_le_bytes());
+                    Ok(4)
+                }
+                _ => Err(OdError::NotFound),
+            }
+        }
+
+        fn write(&mut self, index: u16, subindex: u8, data: &[u8]) -> Result<(), OdError> {
+            match (index, subindex) {
+                (0x1016, sub @ 1..=9) if data.len() == 4 => {
+                    self.consumer[(sub as usize) - 1] =
+                        u32::from_le_bytes(data.try_into().unwrap());
+                    Ok(())
+                }
+                (0x1016, _) => Err(OdError::DataTypeMismatch),
+                _ => Err(OdError::NotFound),
+            }
+        }
+
+        fn sub_count(&self, index: u16) -> Option<u8> {
+            (index == 0x1016).then_some(9)
+        }
+    }
+
     fn make_hb_node(od: HbOd) -> (Node<HbOd, 1, 1>, MailboxTransport<32, 32>) {
         let config = NodeConfig::<1, 1> {
             node_id: NodeId::new(1).unwrap(),
@@ -2431,6 +2571,109 @@ mod tests {
         expect_1016_abort(0x0100_0000, 1, [0; 3], 0x0609_0030);
         // Same node monitored by another active entry
         expect_1016_abort((5 << 16) | 300, 2, [(5 << 16) | 200, 0, 0], 0x0604_0043);
+    }
+
+    /// The runtime half of the COB-ID uniqueness invariant on the heartbeat
+    /// side: a consumer entry whose producer heartbeats on a COB-ID an SDO
+    /// server occupies is rejected. Those frames are dispatched to the SDO
+    /// server, so the monitor could never see them.
+    #[test]
+    fn consumer_entry_on_sdo_channel_cob_id_aborts() {
+        // Diagnostics channel parked in the heartbeat range: 0x710/0x711 are
+        // the heartbeat COB-IDs of nodes 16 and 17.
+        let config = NodeConfig::<1, 1, 1> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            auto_start: false,
+            tpdo: [TpdoConfig::default()],
+            rpdo: [RpdoConfig::default()],
+            sdo_servers: [SdoServerConfig {
+                number: 2,
+                cob_rx: 0x710,
+                cob_tx: 0x711,
+            }],
+            identity: LssIdentity::default(),
+        };
+        let mut node: Node<HbOd, 1, 1, 1> = Node::new(
+            config,
+            HbOd {
+                producer_time: 0,
+                consumer: [0; 3],
+            },
+        );
+        let mut transport = MailboxTransport::<32, 32>::new();
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+
+        let mut write_1016 = |node: &mut Node<HbOd, 1, 1, 1>, value: u32, at: u64| {
+            let mut req = [0x23, 0x16, 0x10, 0x01, 0, 0, 0, 0];
+            req[4..8].copy_from_slice(&value.to_le_bytes());
+            transport
+                .store_received(CanFrame::new(0x601, &req).unwrap())
+                .unwrap();
+            node.process(&mut transport, &TestClock(at));
+            let resp = transport.next_to_transmit().unwrap();
+            while transport.next_to_transmit().is_some() {}
+            resp
+        };
+
+        // Node 16 heartbeats on 0x710 = the diagnostics rx COB-ID.
+        let resp = write_1016(&mut node, (16 << 16) | 100, 10_000);
+        assert_eq!(resp.data()[0], 0x80, "abort");
+        assert_eq!(
+            u32::from_le_bytes(resp.data()[4..8].try_into().unwrap()),
+            0x0604_0043
+        );
+        // Node 17 heartbeats on 0x711 = the diagnostics tx COB-ID.
+        let resp = write_1016(&mut node, (17 << 16) | 100, 20_000);
+        assert_eq!(resp.data()[0], 0x80, "abort");
+        // Node 18 (0x712) is free — the guard is not a blanket ban.
+        let resp = write_1016(&mut node, (18 << 16) | 100, 30_000);
+        assert_eq!(resp.data()[0], 0x60, "download acknowledged");
+        assert_eq!(
+            node.heartbeat_status(NodeId::new(18).unwrap()),
+            HeartbeatMonitorState::Waiting
+        );
+    }
+
+    #[test]
+    fn unmonitored_consumer_entry_may_share_sdo_channel_cob_id() {
+        let config = NodeConfig::<0, 0, 1> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            auto_start: false,
+            tpdo: [],
+            rpdo: [],
+            sdo_servers: [SdoServerConfig {
+                number: 2,
+                cob_rx: 0x710,
+                cob_tx: 0x711,
+            }],
+            identity: LssIdentity::default(),
+        };
+        let mut node: Node<WideHbOd, 0, 0, 1> = Node::new(config, WideHbOd { consumer: [0; 9] });
+        let mut transport = MailboxTransport::<32, 32>::new();
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+
+        // Subindex 9 is stored in the OD but lies beyond the node's eight
+        // HeartbeatMonitor slots. It therefore cannot create a dispatch
+        // collision even though node 16 heartbeats on the diagnostics rx ID.
+        let value = (16u32 << 16) | 100;
+        let mut req = [0x23, 0x16, 0x10, 0x09, 0, 0, 0, 0];
+        req[4..8].copy_from_slice(&value.to_le_bytes());
+        transport
+            .store_received(CanFrame::new(0x601, &req).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(10_000));
+
+        let resp = transport.next_to_transmit().unwrap();
+        assert_eq!(resp.data()[0], 0x60, "download acknowledged");
+        assert_eq!(node.od().consumer[8], value);
+        assert_eq!(
+            node.heartbeat_status(NodeId::new(16).unwrap()),
+            HeartbeatMonitorState::Disabled
+        );
     }
 
     #[test]

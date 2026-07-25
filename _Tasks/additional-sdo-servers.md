@@ -23,8 +23,18 @@ a diagnostics transfer never disturbs an in-flight normal-ops transfer.
   decision baked into the firmware, not something a master renegotiates at
   runtime. All SDO server parameter entries export as `ro`/`const`; COB-IDs are
   fixed at `Node::new`. Mirrors the "PDO mappings immutable by default"
-  precedent. No NMT-state gating, no write→dispatcher resync, no runtime
-  COB-ID-collision validation.
+  precedent. No NMT-state gating, no write→dispatcher resync.
+  - This makes the SDO side of a COB-ID collision immutable, but **not** the
+    other side: PDO COB-IDs (`0x140N`/`0x180N` sub 1) and heartbeat consumer
+    entries (0x1016) *are* writable at runtime, so a client could still park
+    them on an SDO channel. Since the dispatcher matches SDO channels first,
+    such a frame would be swallowed. The SDO server therefore validates those
+    two download families against the node's SDO COB-ID plan
+    (`SdoContext`/`SdoCobIds`) and aborts with 0x0604_0043. The context bounds
+    the heartbeat check to the 0x1016 entries for which the node actually has
+    monitor slots; later OD entries remain writable but deliberately
+    unmonitored. The PDO check ignores the COB-ID valid bit — a parked PDO can
+    be enabled later without rewriting the COB-ID.
   - The **only** legitimate reason the spec makes 0x1200+ COB-IDs writable is
     the CiA 302 **SDO Manager** (dynamic SDO connection allocation on managed
     networks) — exotic, out of scope, and would be its own large feature, not a
@@ -39,6 +49,9 @@ a diagnostics transfer never disturbs an in-flight normal-ops transfer.
 - **Codegen-time uniqueness check.** Because COB-IDs are compile-time known,
   reject at build time if any SDO-server rx/tx COB-ID collides with another
   SDO-server or (ideally) a PDO COB-ID, instead of silently shadowing a channel.
+  What the macro cannot decide statically (node-id-dependent collisions, and
+  PDO/heartbeat COB-IDs that come from the OD) is asserted in `Node::new`; the
+  runtime writes above are the third layer.
 
 ## DSL
 

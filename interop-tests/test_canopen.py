@@ -374,6 +374,24 @@ class TestExtendedPdo:
         assert node.rpdo[5].cob_id == 0x231
         assert node.tpdo[1].cob_id == 0x181
 
+    def test_python_canopen_transmits_rpdo5_on_arbitrary_cob_id(self, network, node):
+        """A custom RPDO COB-ID outside the pre-defined connection set must
+        still be routed to the RPDO engine."""
+        rpdo5 = node.rpdo[5]
+        rpdo5.read()
+        rpdo5.cob_id = 0x123
+        rpdo5.save()
+        assert node.sdo[0x1404][1].raw & 0x7FF == 0x123
+
+        node.nmt.state = "OPERATIONAL"
+        time.sleep(0.2)
+
+        rpdo5[0].raw = 0xA55A
+        rpdo5.transmit()
+        time.sleep(0.2)
+
+        assert node.sdo[0x6201][1].raw == 0xA55A
+
 
 # ---------------------------------------------------------------------------
 # EMCY
@@ -676,6 +694,29 @@ class TestPdoMapping:
         assert node.sdo[0x6200][1].raw == 0x77
         # The previously mapped object was not written
         assert node.sdo[0x6201][1].raw == 0
+
+    def test_remap_rpdo_with_more_than_eight_bit_mappings(self, network, node):
+        """A runtime resync must retain all 64 supported mapping entries."""
+        node.sdo.download(0x1604, 0, bytes([0]))
+        for subindex in range(1, 10):
+            mapping = (0x6300 << 16) | (subindex << 8) | 1
+            node.sdo.download(0x1604, subindex, struct.pack("<I", mapping))
+        node.sdo.download(0x1604, 0, bytes([9]))
+
+        node.nmt.state = "OPERATIONAL"
+        time.sleep(0.2)
+
+        # Bits 0 and 8 set. If resync truncates the mapping list to eight,
+        # bit_output9 remains false.
+        network.bus.send(can.Message(
+            arbitration_id=0x231,
+            data=bytes([0x01, 0x01]),
+            is_extended_id=False,
+        ))
+        time.sleep(0.2)
+
+        assert node.sdo[0x6300][1].raw is True
+        assert node.sdo[0x6300][9].raw is True
 
 
 # ---------------------------------------------------------------------------

@@ -81,6 +81,60 @@ impl TransferState {
     }
 }
 
+/// The COB-IDs this node's SDO servers occupy — the default 0x1200 channel
+/// plus every additional 0x1201+ channel, already resolved against the node id.
+///
+/// Config downloads that would move another service onto one of these are
+/// rejected: [`Node::dispatch_frame`](crate::node::Node) matches SDO channels
+/// first, so a colliding PDO would be silently swallowed by an SDO server.
+/// `Node::new` enforces the same invariant for the static config; this carries
+/// it into the runtime, where CiA 301 lets a client rewrite PDO COB-IDs and
+/// heartbeat consumer entries in Pre-Operational.
+///
+/// The default (all zero, no extras) claims nothing — a standalone `SdoServer`
+/// with no node around it has no COB-ID plan to protect.
+#[derive(Clone, Copy, Default)]
+pub struct SdoCobIds<'a> {
+    /// Default server request COB-ID (`0x600 + node_id`).
+    pub default_rx: u16,
+    /// Default server response COB-ID (`0x580 + node_id`).
+    pub default_tx: u16,
+    /// Request COB-IDs of the additional servers (0x1201+).
+    pub extra_rx: &'a [u16],
+    /// Response COB-IDs of the additional servers (0x1201+).
+    pub extra_tx: &'a [u16],
+}
+
+impl SdoCobIds<'_> {
+    /// True if an SDO server listens on or answers with `cob`. COB-ID 0 is
+    /// never claimed — it is the "unresolved" placeholder, not a real ID.
+    pub fn claims(&self, cob: u16) -> bool {
+        cob != 0
+            && (cob == self.default_rx
+                || cob == self.default_tx
+                || self.extra_rx.contains(&cob)
+                || self.extra_tx.contains(&cob))
+    }
+}
+
+/// Per-request context for [`SdoServer::process_with_context`]: everything the
+/// server needs beyond the request frame and the OD itself.
+#[derive(Clone, Copy)]
+pub struct SdoContext<'a> {
+    /// PDO communication/mapping parameters (0x1400-0x1BFF) are locked while
+    /// Operational (CiA 301).
+    pub nmt_state: NmtState,
+    /// Current time in microseconds, for segmented/block transfer timeouts.
+    pub now_us: u64,
+    /// Number of 0x1016 consumer-heartbeat subindices the owning node actively
+    /// monitors. Entries above this remain writable but cannot collide with a
+    /// monitor that does not exist.
+    pub heartbeat_consumer_count: u8,
+    /// COB-IDs the node's SDO servers occupy; config downloads may not steal
+    /// them. Default (nothing claimed) skips the check.
+    pub cob_ids: SdoCobIds<'a>,
+}
+
 /// SDO server state machine. Handles one transfer at a time.
 pub struct SdoServer {
     transfer: Option<TransferState>,
@@ -179,6 +233,11 @@ impl SdoServer {
     ///
     /// Returns `Ok(())` if a response was written to `response`.
     /// Returns `Err(())` if the frame was malformed and no response should be sent.
+    ///
+    /// Downloads are validated against the OD only. Use
+    /// [`process_with_context`](Self::process_with_context) to also reject
+    /// config writes that would park another service on an SDO channel;
+    /// [`Node`](crate::node::Node) does that for its servers.
     pub fn process<OD: ObjectDictionary, const EVT_QUEUE: usize>(
         &mut self,
         request: &[u8; 8],
@@ -188,6 +247,29 @@ impl SdoServer {
         nmt_state: NmtState,
         now_us: u64,
     ) -> Result<(), ()> {
+        let ctx = SdoContext {
+            nmt_state,
+            now_us,
+            heartbeat_consumer_count: 0,
+            cob_ids: SdoCobIds::default(),
+        };
+        self.process_with_context(request, od, response, events, ctx)
+    }
+
+    /// [`process`](Self::process) with the node's SDO COB-ID plan in the
+    /// context, so a download that would move a PDO or a heartbeat consumer
+    /// onto one of this node's SDO channels is aborted with 0x0604_0043
+    /// instead of silently creating a frame the dispatcher misroutes.
+    /// See [`SdoCobIds`].
+    pub fn process_with_context<OD: ObjectDictionary, const EVT_QUEUE: usize>(
+        &mut self,
+        request: &[u8; 8],
+        od: &mut OD,
+        response: &mut [u8; 8],
+        events: &mut Deque<OdEvent, EVT_QUEUE>,
+        ctx: SdoContext<'_>,
+    ) -> Result<(), ()> {
+        let now_us = ctx.now_us;
         // While receiving block download sub-blocks, byte 0 carries a sequence
         // number (1..=127, bit 7 set on the final segment), so it aliases every
         // command specifier. Per CiA 301 the only non-segment frame in this
@@ -210,16 +292,16 @@ impl SdoServer {
                 self.handle_upload_segment(request, response, now_us)
             }
             cs if cs == Ccs::InitiateDownload as u8 => {
-                self.handle_initiate_download(request, od, response, events, nmt_state, now_us)
+                self.handle_initiate_download(request, od, response, events, ctx)
             }
             cs if cs == Ccs::DownloadSegment as u8 => {
-                self.handle_download_segment(request, od, response, events, nmt_state, now_us)
+                self.handle_download_segment(request, od, response, events, ctx)
             }
             cs if cs == Ccs::BlockUpload as u8 => {
                 self.handle_block_upload(request, od, response, now_us)
             }
             cs if cs == Ccs::BlockDownload as u8 => {
-                self.handle_block_download(request, od, response, events, nmt_state, now_us)
+                self.handle_block_download(request, od, response, events, ctx)
             }
             cs if cs == Ccs::AbortTransfer as u8 => {
                 self.transfer = None;
@@ -320,9 +402,14 @@ impl SdoServer {
         od: &mut OD,
         response: &mut [u8; 8],
         events: &mut Deque<OdEvent, EVT_QUEUE>,
-        nmt_state: NmtState,
-        now_us: u64,
+        ctx: SdoContext<'_>,
     ) -> Result<(), ()> {
+        let SdoContext {
+            nmt_state,
+            now_us,
+            heartbeat_consumer_count,
+            cob_ids: sdo_cobs,
+        } = ctx;
         let (index, subindex) = parse_index_sub(request);
 
         if nmt_state == NmtState::Operational && is_pdo_config_index(index) {
@@ -345,7 +432,14 @@ impl SdoServer {
             };
             let data = &request[4..4 + data_len];
 
-            if let Err(code) = validate_download(od, index, subindex, data) {
+            if let Err(code) = validate_download(
+                od,
+                sdo_cobs,
+                heartbeat_consumer_count,
+                index,
+                subindex,
+                data,
+            ) {
                 *response = encode_abort(index, subindex, code);
                 self.transfer = None;
                 return Ok(());
@@ -402,9 +496,14 @@ impl SdoServer {
         od: &mut OD,
         response: &mut [u8; 8],
         events: &mut Deque<OdEvent, EVT_QUEUE>,
-        _nmt_state: NmtState,
-        now_us: u64,
+        ctx: SdoContext<'_>,
     ) -> Result<(), ()> {
+        let SdoContext {
+            now_us,
+            heartbeat_consumer_count,
+            cob_ids: sdo_cobs,
+            ..
+        } = ctx;
         let transfer = match &mut self.transfer {
             Some(TransferState::Segmented(t)) if t.direction == Direction::Download => t,
             _ => {
@@ -449,7 +548,14 @@ impl SdoServer {
             write_buf[..data_len].copy_from_slice(&transfer.buf[..data_len]);
             self.transfer = None;
 
-            if let Err(code) = validate_download(od, index, subindex, &write_buf[..data_len]) {
+            if let Err(code) = validate_download(
+                od,
+                sdo_cobs,
+                heartbeat_consumer_count,
+                index,
+                subindex,
+                &write_buf[..data_len],
+            ) {
                 *response = encode_abort(index, subindex, code);
                 return Ok(());
             }
@@ -599,9 +705,14 @@ impl SdoServer {
         od: &mut OD,
         response: &mut [u8; 8],
         events: &mut Deque<OdEvent, EVT_QUEUE>,
-        nmt_state: NmtState,
-        now_us: u64,
+        ctx: SdoContext<'_>,
     ) -> Result<(), ()> {
+        let SdoContext {
+            nmt_state,
+            now_us,
+            heartbeat_consumer_count,
+            cob_ids: sdo_cobs,
+        } = ctx;
         let sub_cmd = request[0] & 0x01;
 
         match sub_cmd {
@@ -701,9 +812,14 @@ impl SdoServer {
                         *response = [0; 8];
                         response[0] = (5 << 5) | 0x01;
 
-                        if let Err(code) =
-                            validate_download(od, index, subindex, &write_buf[..data_len])
-                        {
+                        if let Err(code) = validate_download(
+                            od,
+                            sdo_cobs,
+                            heartbeat_consumer_count,
+                            index,
+                            subindex,
+                            &write_buf[..data_len],
+                        ) {
                             *response = encode_abort(index, subindex, code);
                             return Ok(());
                         }
@@ -830,21 +946,62 @@ fn push_event<const N: usize>(events: &mut Deque<OdEvent, N>, event: OdEvent) {
 /// then the OD's application-level `validate_write` hook.
 fn validate_download<OD: ObjectDictionary>(
     od: &OD,
+    sdo_cobs: SdoCobIds<'_>,
+    heartbeat_consumer_count: u8,
     index: u16,
     subindex: u8,
     data: &[u8],
 ) -> Result<(), AbortCode> {
-    validate_heartbeat_consumer_write(od, index, subindex, data)?;
+    validate_heartbeat_consumer_write(
+        od,
+        sdo_cobs,
+        heartbeat_consumer_count,
+        index,
+        subindex,
+        data,
+    )?;
+    validate_pdo_cob_id_write(sdo_cobs, index, subindex, data)?;
     od.validate_write(index, subindex, data)
         .map_err(od_error_to_abort)
+}
+
+/// A PDO must not be parked on a COB-ID an SDO server occupies: the node
+/// dispatches SDO channels first, so such a PDO would never reach the PDO
+/// engine (and an SDO request could be answered on the PDO's COB-ID).
+/// Rejected with 0x0604_0043, as for the duplicate heartbeat producer.
+///
+/// The valid bit (31) is deliberately ignored: a disabled PDO can be enabled
+/// later by a write that carries no COB-ID, so the collision has to be caught
+/// when the COB-ID is written, not when it goes live. Only the 11-bit ID is
+/// compared, matching `Node::sync_pdo_from_od` — the stack has no extended-ID
+/// PDOs, so the frame-type bit does not make a colliding ID distinct.
+fn validate_pdo_cob_id_write(
+    sdo_cobs: SdoCobIds<'_>,
+    index: u16,
+    subindex: u8,
+    data: &[u8],
+) -> Result<(), AbortCode> {
+    let is_comm_param = (0x1400..=0x15FF).contains(&index) || (0x1800..=0x19FF).contains(&index);
+    if !is_comm_param || subindex != 1 || data.len() != 4 {
+        return Ok(());
+    }
+    let raw = u32::from_le_bytes(data.try_into().unwrap());
+    if sdo_cobs.claims((raw & 0x7FF) as u16) {
+        return Err(AbortCode::ParameterIncompatibility);
+    }
+    Ok(())
 }
 
 /// CiA 301 rules for 0x1016 (Consumer heartbeat time) entries: reserved bits
 /// 24..32 must always be zero; a non-disabled entry (consumer time != 0) must
 /// additionally carry a valid producer node id (1..=127), and no two entries
-/// may monitor the same node (abort 0x0604_0043).
+/// may monitor the same node (abort 0x0604_0043). The producer's heartbeat
+/// COB-ID must also not be one an SDO server occupies, for the same reason a
+/// PDO may not be parked there (see [`validate_pdo_cob_id_write`]).
 fn validate_heartbeat_consumer_write<OD: ObjectDictionary>(
     od: &OD,
+    sdo_cobs: SdoCobIds<'_>,
+    heartbeat_consumer_count: u8,
     index: u16,
     subindex: u8,
     data: &[u8],
@@ -863,6 +1020,10 @@ fn validate_heartbeat_consumer_write<OD: ObjectDictionary>(
     let node = (raw >> 16) & 0xFF;
     if node == 0 || node > 127 {
         return Err(AbortCode::ValueRangeExceeded);
+    }
+
+    if subindex <= heartbeat_consumer_count && sdo_cobs.claims(0x700 + node as u16) {
+        return Err(AbortCode::ParameterIncompatibility);
     }
     // The same producer must not be monitored by two active entries.
     let count = od.sub_count(index).unwrap_or(0);
