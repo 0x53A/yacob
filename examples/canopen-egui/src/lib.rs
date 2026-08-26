@@ -1,5 +1,12 @@
-mod app;
-mod can_bus;
+pub mod app;
+pub mod can_bus;
+pub mod device;
+pub mod sdo;
+
+pub use app::{App, NodeInfo};
+pub use can_bus::{Backend, Command, ConnectionTarget, Event};
+pub use device::{BusCtx, DevicePanel, NoPanel, SdoRequestId};
+pub use sdo::{SdoOutcome, SdoRequest};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;

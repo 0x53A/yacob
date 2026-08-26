@@ -1,3 +1,4 @@
+use crate::sdo::{SdoOutcome, SdoRequest};
 use canopen_core::transport::CanFrame;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub enum ConnectionTarget {
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub enum Command {
     Nmt { node_id: u8, command: u8 },
+    Sdo { request: SdoRequest, priority: bool },
+    CancelSdo { node_id: u8 },
     Disconnect,
 }
 
@@ -38,17 +41,21 @@ pub enum Event {
     Disconnected,
     Error(String),
     Frame(CanFrame),
+    Sdo(SdoOutcome),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::{Command, ConnectionTarget, Event};
+    use crate::sdo::SdoEngine;
     use canopen_core::transport::{CanError, CanFrame};
     use canopen_linux::slcan::{self, SlcanBitrate, SlcanTransport};
     use canopen_linux::{SocketcanTransport, WebSocketTransport};
     use embedded_can::nb::Can;
+    use std::collections::VecDeque;
     use std::sync::mpsc;
     use std::time::Duration;
+    use web_time::Instant;
 
     pub struct CanConnection {
         cmd_tx: mpsc::Sender<Command>,
@@ -75,7 +82,10 @@ mod native {
             }
         }
 
-        pub fn send_cmd(&self, cmd: Command) {
+        // `&mut self` is not needed here (the channel is fine with `&self`),
+        // but the wasm backend steps its SDO engine in-place and does need it.
+        // Keeping the signatures identical keeps the app code target-agnostic.
+        pub fn send_cmd(&mut self, cmd: Command) {
             let _ = self.cmd_tx.send(cmd);
         }
 
@@ -91,7 +101,7 @@ mod native {
     }
 
     enum Transport {
-        Slcan(SlcanTransport),
+        Slcan(Box<SlcanTransport>),
         Socketcan(SocketcanTransport),
         Canwsd(WebSocketTransport),
     }
@@ -99,9 +109,9 @@ mod native {
     impl Transport {
         fn open(target: &ConnectionTarget) -> Result<Self, String> {
             match target {
-                ConnectionTarget::Slcan { device } => {
-                    slcan::open(device, SlcanBitrate::S6).map(Self::Slcan)
-                }
+                ConnectionTarget::Slcan { device } => slcan::open(device, SlcanBitrate::S6)
+                    .map(Box::new)
+                    .map(Self::Slcan),
                 ConnectionTarget::Socketcan { interface } => SocketcanTransport::open(interface)
                     .map(Self::Socketcan)
                     .map_err(|e| e.to_string()),
@@ -158,6 +168,9 @@ mod native {
 
             let _ = event_tx.send(Event::Connected);
 
+            let mut sdo = SdoEngine::new();
+            let mut tx_pending = VecDeque::new();
+
             loop {
                 match cmd_rx.try_recv() {
                     Ok(Command::Disconnect) => {
@@ -167,23 +180,65 @@ mod native {
                     }
                     Ok(Command::Nmt { node_id, command }) => {
                         if let Some(frame) = CanFrame::new(0x000, &[command, node_id]) {
-                            let _ = transport.transmit(&frame);
+                            tx_pending.push_back(frame);
                         }
                     }
+                    Ok(Command::Sdo { request, priority }) => {
+                        if priority {
+                            sdo.submit_priority(request);
+                        } else {
+                            sdo.submit(request);
+                        }
+                    }
+                    Ok(Command::CancelSdo { node_id }) => sdo.cancel_queued(node_id),
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => return,
                 }
 
-                match transport.receive() {
+                let idle = match transport.receive() {
                     Ok(frame) => {
+                        sdo.on_frame(&frame);
                         let _ = event_tx.send(Event::Frame(frame));
+                        false
                     }
-                    Err(nb::Error::WouldBlock) => {
-                        std::thread::sleep(Duration::from_micros(500));
+                    Err(nb::Error::WouldBlock) => true,
+                    Err(nb::Error::Other(error)) => {
+                        transport.close();
+                        let _ =
+                            event_tx.send(Event::Error(format!("CAN receive error: {error:?}")));
+                        return;
                     }
-                    Err(nb::Error::Other(_)) => {
-                        std::thread::sleep(Duration::from_millis(10));
+                };
+
+                // After `on_frame`, so a response received this iteration
+                // produces its follow-up frame without waiting for the next.
+                sdo.tick(Instant::now());
+                while let Some(frame) = sdo.next_tx() {
+                    tx_pending.push_back(frame);
+                }
+                while let Some(frame) = tx_pending.front() {
+                    match transport.transmit(frame) {
+                        Ok(displaced) => {
+                            tx_pending.pop_front();
+                            if let Some(displaced) = displaced {
+                                tx_pending.push_front(displaced);
+                            }
+                        }
+                        Err(nb::Error::WouldBlock) => break,
+                        Err(nb::Error::Other(error)) => {
+                            transport.close();
+                            let _ = event_tx
+                                .send(Event::Error(format!("CAN transmit error: {error:?}")));
+                            return;
+                        }
                     }
+                }
+                while let Some(outcome) = sdo.next_done() {
+                    let _ = event_tx.send(Event::Sdo(outcome));
+                }
+
+                if idle {
+                    std::thread::sleep(Duration::from_micros(500));
                 }
             }
         })
@@ -193,15 +248,17 @@ mod native {
 #[cfg(target_arch = "wasm32")]
 mod web {
     use super::{Command, ConnectionTarget, Event};
+    use crate::sdo::SdoEngine;
     use canopen_core::transport::CanFrame;
     use canopen_web::transport::{
+        CanEvent, CanTransport,
         canwsd::{self, CanwsdTransport},
         slcan::SlcanTransport,
-        CanEvent, CanTransport,
     };
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use wasm_bindgen_futures::spawn_local;
+    use web_time::Instant;
 
     thread_local! {
         static NETWORK_RESULTS: RefCell<VecDeque<Result<Vec<String>, String>>> = RefCell::new(VecDeque::new());
@@ -210,6 +267,7 @@ mod web {
     pub struct CanConnection {
         transport: Option<Box<dyn CanTransport>>,
         local_events: VecDeque<Event>,
+        sdo: SdoEngine,
     }
 
     impl CanConnection {
@@ -232,6 +290,7 @@ mod web {
             Self {
                 transport,
                 local_events,
+                sdo: SdoEngine::new(),
             }
         }
 
@@ -240,9 +299,10 @@ mod web {
                 transport.disconnect();
             }
             self.transport = None;
+            self.sdo.clear();
         }
 
-        pub fn send_cmd(&self, cmd: Command) {
+        pub fn send_cmd(&mut self, cmd: Command) {
             match cmd {
                 Command::Nmt { node_id, command } => {
                     if let Some(frame) = CanFrame::new(0x000, &[command, node_id]) {
@@ -251,6 +311,14 @@ mod web {
                         }
                     }
                 }
+                Command::Sdo { request, priority } => {
+                    if priority {
+                        self.sdo.submit_priority(request);
+                    } else {
+                        self.sdo.submit(request);
+                    }
+                }
+                Command::CancelSdo { node_id } => self.sdo.cancel_queued(node_id),
                 Command::Disconnect => {}
             }
         }
@@ -260,7 +328,8 @@ mod web {
                 return Some(event);
             }
 
-            self.transport
+            let event = self
+                .transport
                 .as_mut()
                 .and_then(|transport| transport.poll_event())
                 .map(|event| match event {
@@ -268,7 +337,29 @@ mod web {
                     CanEvent::Disconnected => Event::Disconnected,
                     CanEvent::Error(e) => Event::Error(e),
                     CanEvent::Frame(frame) => Event::Frame(frame),
-                })
+                });
+
+            // There is no CAN thread on wasm: the engine is stepped here,
+            // which the app drains in a loop until it returns `None`. Every
+            // SDO response arrives as a `Frame` event and keeps that loop
+            // going, so transfers progress at frame rate, not repaint rate.
+            match &event {
+                Some(Event::Frame(frame)) => self.sdo.on_frame(frame),
+                Some(Event::Disconnected) | Some(Event::Error(_)) => self.sdo.clear(),
+                _ => {}
+            }
+
+            self.sdo.tick(Instant::now());
+            if let Some(transport) = &self.transport {
+                while let Some(frame) = self.sdo.next_tx() {
+                    transport.send(frame);
+                }
+            }
+            while let Some(outcome) = self.sdo.next_done() {
+                self.local_events.push_back(Event::Sdo(outcome));
+            }
+
+            event.or_else(|| self.local_events.pop_front())
         }
     }
 
@@ -294,4 +385,4 @@ mod web {
 pub use native::CanConnection;
 
 #[cfg(target_arch = "wasm32")]
-pub use web::{fetch_canwsd_networks_async, try_recv_canwsd_networks, CanConnection};
+pub use web::{CanConnection, fetch_canwsd_networks_async, try_recv_canwsd_networks};

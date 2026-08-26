@@ -12,8 +12,11 @@ CANopen protocol stack for embedded Rust. `no_std`, `no_alloc`, uses `embedded-c
 - `tools/canwsd-dump/` — a minimal `candump` for canwsd networks: listens to one remote network over WebSocket and prints frames (no vcan, no root). See `tools/canwsd-dump/CLAUDE.md`
 - `hil-tests/` — hardware-in-the-loop test harness
 - `interop-tests/` — python-canopen interop tests over UDP multicast (no root needed)
+- `examples/canopen-egui/` — generic CANopen monitor UI (native + wasm) over SLCAN / SocketCAN / canwsd. Also a **library**: see "Embedding the monitor" below
 - `examples/stm32-node/` — Embassy firmware for Nucleo-G431KB (excluded from workspace, cross-compiled)
-- `examples/stm32-fwupdate/` — Embassy firmware with CiA 302 firmware update over CANopen
+- `examples/stm32-fwupdate/` — Embassy firmware with CiA 302 firmware update over CANopen (protocol skeleton only: flash operations are stubbed)
+- `examples/emdm-fwupdate/` — **working** power-fail-safe updater for the FROST EMDM board (STM32G431CB): immutable bootloader + demo app + append-only metadata log, verified on hardware. Separate workspace. See `examples/emdm-fwupdate/CLAUDE.md`
+- `tools/canopen-fwupdate/` — host side of the above: CiA 302 download over socketcan
 
 ## Build & Test
 
@@ -170,6 +173,62 @@ let val = sdo.read_u32(0x1000, 0, &mut port).await?;
 // Non-SDO frames buffered in demux:
 while let Some(hb) = demux.try_recv_heartbeat() { ... }
 ```
+
+## Embedding the monitor (`examples/canopen-egui`)
+
+The monitor is a library as well as a binary, so device-specific tools reuse its
+connection bar, node list, per-node NMT and frame table instead of forking it
+(which is how `frost/nanotec_canopen_test` ended up 16 commits behind).
+
+```rust
+App::with_panel(cc, MyDevicePanel::new()).with_builtin_style(false)
+```
+
+- `DevicePanel` (`src/device.rs`) is the seam: `title`, `ui(&mut egui::Ui, &mut BusCtx)`,
+  `preferred_height` (return `0.0` for none). `App<NoPanel>` is the standalone binary.
+- `BusCtx` exposes the selected node + `nodes`, and collects `sdo_read` / `sdo_write` /
+  `nmt` into an outbox flushed *after* the UI, so a panel can hold a borrow of node
+  state while issuing commands. SDO calls return request IDs for exact result
+  correlation; control paths can use `sdo_write_priority` and `cancel_sdo`. Results
+  reach the panel through `next_result()` only — the monitor never interprets them.
+- `with_builtin_style(false)` suppresses `style_ui` so the host installs its own theme.
+
+**Profile knowledge stays out of this crate.** CiA 402, drilling units etc. belong in
+the embedding app's panel.
+
+### SDO in the UI is `SdoClient`, not `bus::SharedCanBus`
+
+`src/sdo.rs` wraps the sans-IO poll-based `SdoClient` with a request queue, a 500 ms
+timeout and in/out frame buffers. This is deliberate and must stay that way: the wasm
+backend (`can_bus.rs::web`) is single-threaded and callback-driven — frames only
+surface through `poll_event()` — while `canopen-core/src/bus.rs` is `#[cfg(feature =
+"std")]` and thread/waker-backed. There is no thread to pump a bus in the browser.
+The engine touches no transport; native feeds it from the CAN thread, wasm steps it
+inside `try_recv_event`.
+
+Consequences worth knowing:
+
+- `CanConnection::send_cmd` takes `&mut self` on **both** targets (wasm needs it; native
+  is uniform for the sake of target-agnostic app code).
+- Only one transfer is in flight at a time — a panel polling six objects per tick
+  relies on the queue, not on racing them.
+- Priority transfers remain FIFO with one another and run before ordinary polling.
+  Cancelling a node drops its queued work but lets its active protocol transfer finish,
+  so a late response cannot be consumed by a different request.
+- The timeout clock resets on segmented progress, so it only catches a *silent* server.
+
+### No runtime EDS parser yet
+
+`canopen-core/src/dcf.rs` parses DCF **value** entries only (index/sub/value) — no
+names, data types or access flags. The full parser is `canopen-derive/src/eds_parser.rs`,
+inside the proc-macro crate and coupled to `syn` (defaults become `syn::Expr`). Its core
+`parse_eds_content_with_overrides(&str)` is already string-in/data-out, but `OdEntry`
+carries syn types.
+
+So a **generic, EDS-driven OD browser is not currently possible at runtime**. Device
+panels use compile-time `sdo_client_from_eds!` plus a hand-curated object list. Extracting
+"EDS → neutral object model" from "neutral model → tokens" is the prerequisite for a
+generic browser panel; it is a known follow-up, not done.
 
 ## Features (canopen-core)
 

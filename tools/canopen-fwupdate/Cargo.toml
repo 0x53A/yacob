@@ -1,0 +1,12 @@
+[package]
+name = "canopen-fwupdate"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Host-side CiA 302 firmware download over CANopen SDO"
+
+[dependencies]
+canopen-core = { path = "../../canopen-core", features = ["std"] }
+canopen-linux = { path = "../../canopen-linux" }
+clap = { version = "4.6.3", features = ["derive"] }
+crc = "3"

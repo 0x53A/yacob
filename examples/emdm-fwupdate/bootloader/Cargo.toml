@@ -1,0 +1,29 @@
+[package]
+name = "emdm-fwupdate-bootloader"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "emdm-fwupdate-bootloader"
+test = false
+bench = false
+
+[dependencies]
+emdm-fwupdate-common = { workspace = true, features = ["hal"] }
+canopen-core.workspace = true
+canopen-derive.workspace = true
+embassy-executor.workspace = true
+embassy-futures.workspace = true
+embassy-stm32.workspace = true
+embassy-sync.workspace = true
+embassy-time.workspace = true
+cortex-m.workspace = true
+cortex-m-rt.workspace = true
+defmt.workspace = true
+defmt-rtt.workspace = true
+embedded-can.workspace = true
+nb.workspace = true
+static_cell.workspace = true
+panic-probe = { version = "1", features = ["print-defmt"] }

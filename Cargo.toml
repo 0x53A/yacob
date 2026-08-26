@@ -8,12 +8,14 @@ members = [
     "canwsd-proto",
     "examples/canopen-egui",
     "hil-tests",
+    "tools/canopen-fwupdate",
     "tools/canwsd",
     "tools/canwsd-dump",
 ]
 exclude = [
     "examples/stm32-node",
     "examples/stm32-fwupdate",
+    "examples/emdm-fwupdate",
 ]
 
 [workspace.package]

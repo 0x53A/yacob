@@ -1,15 +1,17 @@
 use crate::can_bus::{Backend, CanConnection, Command, ConnectionTarget, Event};
+use crate::device::{BusCtx, DevicePanel, NoPanel, SdoRequestId};
+use crate::sdo::SdoOutcome;
 use canopen_core::cobid::{CobId, ParsedCobId};
 use canopen_core::emcy::EmcyMessage;
 use canopen_core::nmt::NmtState;
 use canopen_core::transport::CanFrame;
 use eframe::egui;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::{Read, Write};
 use web_time::{Duration, Instant};
 
-pub struct App {
+pub struct App<P: DevicePanel = NoPanel> {
     connection: Option<CanConnection>,
 
     backend: Backend,
@@ -26,22 +28,33 @@ pub struct App {
     nodes: BTreeMap<u8, NodeInfo>,
     messages: BTreeMap<u16, MessageEntry>,
     selected_node: Option<u8>,
+
+    panel: P,
+    /// Commands a `DevicePanel` produced this frame, flushed after the UI so
+    /// the panel can hold a borrow of node state while it builds them.
+    outbox: Vec<Command>,
+    /// SDO results waiting to be handed to the panel.
+    sdo_inbox: VecDeque<SdoOutcome>,
+    next_sdo_request_id: SdoRequestId,
+    /// Whether to install the built-in monitor style. An embedding app that
+    /// brings its own theme turns this off.
+    apply_style: bool,
 }
 
 #[derive(Default)]
-struct NodeInfo {
-    state: Option<NmtState>,
-    last_seen: Option<Instant>,
-    last_heartbeat: Option<Instant>,
-    heartbeat_count: u64,
-    emcy_count: u64,
-    tpdo_count: [u64; 4],
-    rpdo_count: [u64; 4],
-    last_emcy: Option<EmcyMessage>,
+pub struct NodeInfo {
+    pub state: Option<NmtState>,
+    pub last_seen: Option<Instant>,
+    pub last_heartbeat: Option<Instant>,
+    pub heartbeat_count: u64,
+    pub emcy_count: u64,
+    pub tpdo_count: [u64; 4],
+    pub rpdo_count: [u64; 4],
+    pub last_emcy: Option<EmcyMessage>,
 }
 
 impl NodeInfo {
-    fn is_online(&self) -> bool {
+    pub fn is_online(&self) -> bool {
         self.last_heartbeat
             .map(|t| t.elapsed() < Duration::from_secs(3))
             .unwrap_or(false)
@@ -55,8 +68,15 @@ struct MessageEntry {
     last_seen: Instant,
 }
 
-impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+impl App<NoPanel> {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_panel(cc, NoPanel)
+    }
+}
+
+impl<P: DevicePanel> App<P> {
+    /// Build the monitor around a device-specific panel.
+    pub fn with_panel(_cc: &eframe::CreationContext<'_>, panel: P) -> Self {
         Self {
             connection: None,
             backend: Backend::Slcan,
@@ -72,7 +92,22 @@ impl App {
             nodes: BTreeMap::new(),
             messages: BTreeMap::new(),
             selected_node: None,
+            panel,
+            outbox: Vec::new(),
+            sdo_inbox: VecDeque::new(),
+            next_sdo_request_id: 1,
+            apply_style: true,
         }
+    }
+
+    /// Suppress the built-in style so an embedding app can install its own.
+    pub fn with_builtin_style(mut self, enabled: bool) -> Self {
+        self.apply_style = enabled;
+        self
+    }
+
+    pub fn panel_mut(&mut self) -> &mut P {
+        &mut self.panel
     }
 
     fn connect(&mut self) {
@@ -94,6 +129,8 @@ impl App {
         }
         self.connection = None;
         self.connected = false;
+        self.outbox.clear();
+        self.sdo_inbox.clear();
     }
 
     fn connection_target(&self) -> Result<ConnectionTarget, String> {
@@ -128,12 +165,15 @@ impl App {
                 }
                 Event::Disconnected => {
                     self.connected = false;
+                    self.sdo_inbox.clear();
                 }
                 Event::Error(e) => {
                     self.connection_error = Some(e);
                     self.connected = false;
+                    self.sdo_inbox.clear();
                 }
                 Event::Frame(frame) => self.process_frame(frame),
+                Event::Sdo(outcome) => self.sdo_inbox.push_back(outcome),
             }
         }
 
@@ -212,14 +252,14 @@ impl App {
         }
     }
 
-    fn send_nmt(&self, node_id: u8, command: u8) {
-        if let Some(connection) = &self.connection {
+    fn send_nmt(&mut self, node_id: u8, command: u8) {
+        if let Some(connection) = &mut self.connection {
             connection.send_cmd(Command::Nmt { node_id, command });
         }
     }
 }
 
-impl eframe::App for App {
+impl<P: DevicePanel> eframe::App for App<P> {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_events();
 
@@ -229,7 +269,9 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        style_ui(ui.ctx());
+        if self.apply_style {
+            style_ui(ui.ctx());
+        }
 
         egui::Panel::top("connection").show_inside(ui, |ui| {
             self.render_connection(ui);
@@ -239,13 +281,49 @@ impl eframe::App for App {
             .default_size(260.0)
             .show_inside(ui, |ui| self.render_nodes(ui));
 
+        let panel_height = self.panel.preferred_height();
+        if panel_height > 0.0 {
+            egui::Panel::top("device")
+                .resizable(true)
+                .default_size(panel_height)
+                .show_inside(ui, |ui| self.render_device_panel(ui));
+        }
+
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.render_bus(ui);
         });
+
+        self.flush_outbox();
     }
 }
 
-impl App {
+impl<P: DevicePanel> App<P> {
+    fn render_device_panel(&mut self, ui: &mut egui::Ui) {
+        let mut bus = BusCtx::new(
+            self.selected_node,
+            self.connected,
+            &self.nodes,
+            &mut self.outbox,
+            &mut self.sdo_inbox,
+            &mut self.next_sdo_request_id,
+        );
+        self.panel.ui(ui, &mut bus);
+    }
+
+    fn flush_outbox(&mut self) {
+        if self.outbox.is_empty() {
+            return;
+        }
+        let commands = std::mem::take(&mut self.outbox);
+        if let Some(connection) = &mut self.connection {
+            for command in commands {
+                connection.send_cmd(command);
+            }
+        }
+    }
+}
+
+impl<P: DevicePanel> App<P> {
     fn render_connection(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Backend");
@@ -442,6 +520,7 @@ impl App {
         ui.heading(kind.title());
         ui.separator();
         egui::ScrollArea::vertical()
+            .id_salt(kind.title())
             .max_height(160.0)
             .show(ui, |ui| {
                 for (&node_id, info) in &self.nodes {
