@@ -913,3 +913,234 @@ class TestAdditionalSdoServer:
         )
         assert seg is not None, "default segmented transfer continued"
         assert seg.data[0] == 0x20, "download segment acknowledged (not aborted)"
+
+
+# ---------------------------------------------------------------------------
+# SYNC — 0x1005 / 0x1006 / 0x1007 / 0x1019, synchronous PDO semantics
+# ---------------------------------------------------------------------------
+
+
+class TestSync:
+    """python-canopen drives the SYNC pulse; the node must obey CiA 301
+    synchronous PDO semantics (buffer RPDOs until SYNC, transmit TPDOs on it).
+    """
+
+    SYNC_COB = 0x080
+    RPDO1_COB = 0x201
+    TPDO1_COB = 0x181
+
+    @staticmethod
+    def _send_sync(bus, cob_id=0x080, data=b""):
+        bus.send(
+            can.Message(arbitration_id=cob_id, data=data, is_extended_id=False)
+        )
+
+    @staticmethod
+    def _recv_id(bus, cob_id, timeout=2.0):
+        """First frame seen with `cob_id`, or None."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = bus.recv(timeout=0.2)
+            if msg and msg.arbitration_id == cob_id:
+                return msg
+        return None
+
+    def test_synchronous_rpdo_is_buffered_until_sync(self, network, node):
+        """Transmission type 1: the RPDO frame must not reach the OD until the
+        next SYNC, then commit in full."""
+        # PDO comm params are writable in Pre-Operational only.
+        node.sdo[0x1400][2].raw = 1
+        node.nmt.state = "OPERATIONAL"
+        time.sleep(0.2)
+
+        network.bus.send(
+            can.Message(
+                arbitration_id=self.RPDO1_COB,
+                data=struct.pack("<BH", 0xAA, 0x1234),
+                is_extended_id=False,
+            )
+        )
+        time.sleep(0.3)
+        assert node.sdo[0x6200][1].raw == 0x00, "committed before the SYNC"
+        assert node.sdo[0x6200][2].raw == 0x0000
+
+        self._send_sync(network.bus)
+        time.sleep(0.3)
+        assert node.sdo[0x6200][1].raw == 0xAA
+        assert node.sdo[0x6200][2].raw == 0x1234
+
+    def test_synchronous_rpdo_keeps_only_the_last_frame(self, network, node):
+        node.sdo[0x1400][2].raw = 1
+        node.nmt.state = "OPERATIONAL"
+        time.sleep(0.2)
+
+        for value in (0x11, 0x22, 0x33):
+            network.bus.send(
+                can.Message(
+                    arbitration_id=self.RPDO1_COB,
+                    data=struct.pack("<BH", value, value),
+                    is_extended_id=False,
+                )
+            )
+        time.sleep(0.2)
+        self._send_sync(network.bus)
+        time.sleep(0.3)
+
+        assert node.sdo[0x6200][1].raw == 0x33
+
+    def test_synchronous_tpdo_transmits_on_the_pulse(self, node, raw_bus):
+        """Transmission type 1: one TPDO per SYNC, and none in between."""
+        node.sdo[0x1800][2].raw = 1
+        # Silence the event timer so only SYNC can trigger a transmission.
+        node.sdo[0x1800][5].raw = 0
+        node.nmt.state = "OPERATIONAL"
+        time.sleep(0.3)
+
+        # Drain whatever is queued, then confirm the TPDO has gone quiet.
+        deadline = time.time() + 0.5
+        while time.time() < deadline:
+            raw_bus.recv(timeout=0.1)
+        assert self._recv_id(raw_bus, self.TPDO1_COB, timeout=0.5) is None
+
+        self._send_sync(raw_bus)
+        assert self._recv_id(raw_bus, self.TPDO1_COB) is not None, (
+            "no TPDO on the SYNC pulse"
+        )
+
+    def test_sync_counter_byte_is_accepted(self, network, node):
+        """A SYNC with a counter byte (0x1019 in use on the master) is still a
+        SYNC; a longer frame is not."""
+        node.sdo[0x1400][2].raw = 1
+        node.nmt.state = "OPERATIONAL"
+        time.sleep(0.2)
+
+        network.bus.send(
+            can.Message(
+                arbitration_id=self.RPDO1_COB,
+                data=struct.pack("<BH", 0x5A, 0x0000),
+                is_extended_id=False,
+            )
+        )
+        time.sleep(0.2)
+
+        # Malformed (2 bytes): must not be taken for a SYNC.
+        self._send_sync(network.bus, data=bytes([1, 2]))
+        time.sleep(0.3)
+        assert node.sdo[0x6200][1].raw == 0x00
+
+        self._send_sync(network.bus, data=bytes([7]))
+        time.sleep(0.3)
+        assert node.sdo[0x6200][1].raw == 0x5A
+
+    def test_sync_cob_id_can_be_relocated(self, network, node):
+        """Writing 0x1005 moves the pulse; 0x080 then means nothing."""
+        node.sdo[0x1400][2].raw = 1
+        node.sdo[0x1005].raw = 0x123
+        assert node.sdo[0x1005].raw == 0x123
+        node.nmt.state = "OPERATIONAL"
+        time.sleep(0.2)
+
+        network.bus.send(
+            can.Message(
+                arbitration_id=self.RPDO1_COB,
+                data=struct.pack("<BH", 0x77, 0x0000),
+                is_extended_id=False,
+            )
+        )
+        time.sleep(0.2)
+
+        self._send_sync(network.bus, cob_id=0x080)
+        time.sleep(0.3)
+        assert node.sdo[0x6200][1].raw == 0x00, "old COB-ID still pulsing"
+
+        self._send_sync(network.bus, cob_id=0x123)
+        time.sleep(0.3)
+        assert node.sdo[0x6200][1].raw == 0x77
+
+    def test_sync_cob_id_rejects_unsupported_values(self, node):
+        """29-bit SYNC is not implemented and COB-ID 0 is the NMT ID — both
+        must abort rather than silently disable the SYNC object."""
+        for value in (1 << 29 | 0x080, 0x00000000, 0x80000000):
+            with pytest.raises(canopen.SdoAbortedError):
+                node.sdo[0x1005].raw = value
+        assert node.sdo[0x1005].raw == 0x080, "SYNC moved despite the abort"
+
+    def test_sync_counter_overflow_rejects_reserved_values(self, node):
+        """0 disables the counter and 2..=240 are legal; 1 and values above
+        240 must abort rather than changing producer behavior."""
+        for value in (1, 241, 255):
+            with pytest.raises(canopen.SdoAbortedError):
+                node.sdo[0x1019].raw = value
+        assert node.sdo[0x1019].raw == 0
+
+    def test_synchronous_window_is_live_and_uses_microseconds(self, node):
+        """0x1007 is a live u32 communication parameter; zero disables the
+        limit and nonzero values are synchronous-window microseconds."""
+        assert node.sdo[0x1007].raw == 0
+        node.sdo[0x1007].raw = 750
+        assert node.sdo[0x1007].raw == 750
+        node.sdo[0x1007].raw = 0
+
+    def test_other_services_cannot_move_onto_sync(self, node):
+        """The collision invariant is symmetric: configuring SYNC first must
+        not let a later PDO or heartbeat-consumer write steal its COB-ID."""
+        with pytest.raises(canopen.SdoAbortedError):
+            node.sdo[0x1400][1].raw = self.SYNC_COB
+
+        node.sdo[0x1005].raw = 0x705
+        with pytest.raises(canopen.SdoAbortedError):
+            node.sdo[0x1016][1].raw = (5 << 16) | 100
+
+    # The producer tests observe on `raw_bus`, not `network.bus`: the network
+    # fixture runs a can.Notifier thread that consumes from its own bus, so a
+    # test reading `network.bus` directly races it and sees only a fraction of
+    # the frames. `raw_bus` is a second bus on the same segment, uncontended.
+
+    def test_node_produces_sync_when_configured_as_generator(self, node, raw_bus):
+        """0x1005 bit 30 + 0x1006 make the node the SYNC master."""
+        node.sdo[0x1006].raw = 50_000  # 50 ms
+        node.sdo[0x1005].raw = (1 << 30) | 0x080
+
+        timestamps = []
+        deadline = time.time() + 3.0
+        while time.time() < deadline and len(timestamps) < 4:
+            msg = raw_bus.recv(timeout=1.0)
+            if msg and msg.arbitration_id == self.SYNC_COB:
+                assert len(msg.data) == 0, "no counter byte without 0x1019"
+                timestamps.append(msg.timestamp)
+
+        assert len(timestamps) >= 3, f"only {len(timestamps)} SYNCs produced"
+        for dt in (
+            timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)
+        ):
+            assert 0.025 < dt < 0.1, f"SYNC interval {dt:.3f}s out of range"
+
+    def test_produced_sync_carries_counter_when_1019_set(self, node, raw_bus):
+        node.sdo[0x1019].raw = 3
+        node.sdo[0x1006].raw = 50_000
+        node.sdo[0x1005].raw = (1 << 30) | 0x080
+
+        counters = []
+        deadline = time.time() + 3.0
+        while time.time() < deadline and len(counters) < 5:
+            msg = raw_bus.recv(timeout=1.0)
+            if msg and msg.arbitration_id == self.SYNC_COB:
+                assert len(msg.data) == 1
+                counters.append(msg.data[0])
+
+        assert len(counters) >= 4, f"only {len(counters)} SYNCs produced"
+        # The counter runs 1..=3 and wraps; we may join mid-cycle.
+        for prev, cur in zip(counters, counters[1:]):
+            expected = 1 if prev >= 3 else prev + 1
+            assert cur == expected, f"counter sequence broke: {counters}"
+
+    def test_cycle_period_alone_does_not_make_a_producer(self, node, raw_bus):
+        """0x1006 without 0x1005 bit 30 is informational only."""
+        node.sdo[0x1006].raw = 20_000
+
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            msg = raw_bus.recv(timeout=0.3)
+            assert not (msg and msg.arbitration_id == self.SYNC_COB), (
+                "node produced SYNC without the generator bit"
+            )

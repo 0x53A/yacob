@@ -27,6 +27,16 @@ object_dictionary! {
     pub struct DemoOd {
         [0x1000] device_type: u32 = 0x0000_0191, ro;
         [0x1001] error_register: u8 = 0x00, ro;
+        // SYNC objects. Declaring them live-wires the stack's SYNC handling:
+        // 0x1005 carries the COB-ID plus bit 30 ("this node generates SYNC"),
+        // 0x1006 the communication cycle period in µs, 0x1007 the synchronous
+        // TPDO window in µs (0 = unlimited), and 0x1019 the counter overflow
+        // value. Defaults are the CiA 301 pre-defined SYNC on 0x080, consumed
+        // but not produced — a master drives the pulse.
+        [0x1005] cob_id_sync: u32 = 0x0000_0080, rw;
+        [0x1006] communication_cycle_period: u32 = 0, rw;
+        [0x1007] synchronous_window_length: u32 = 0, rw;
+        [0x1019] sync_counter_overflow: u8 = 0, rw;
         [0x1017] heartbeat_time: u16 = 500, rw;
         // Consumer heartbeat: up to 4 monitored producers, configured via SDO
         // ((node_id << 16) | timeout_ms). All disabled by default.

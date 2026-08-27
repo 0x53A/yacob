@@ -117,6 +117,37 @@ impl SdoCobIds<'_> {
     }
 }
 
+/// COB-IDs services *other than* SDO occupy on the owning node: every declared
+/// PDO (parked ones included — a disabled PDO can be enabled later without its
+/// COB-ID being rewritten), EMCY, this node's own heartbeat, the heartbeat
+/// producers it monitors, and LSS.
+///
+/// Used to reject a config download that would move the SYNC object onto one
+/// of them. `Node::dispatch_frame` matches SYNC ahead of all of these and
+/// returns unconditionally, so such a relocation silently mutes the other
+/// service — the same failure the SDO-channel checks exist to prevent.
+///
+/// The default (empty, not truncated) claims nothing: a standalone
+/// [`SdoServer`] has no node around it and no COB-ID plan to protect.
+#[derive(Clone, Copy, Default)]
+pub struct ReservedCobIds<'a> {
+    /// The occupied COB-IDs. 0 is never claimed — it is the "unresolved"
+    /// placeholder, not a real ID.
+    pub ids: &'a [u16],
+    /// Set when the node uses more COB-IDs than the list could hold. The
+    /// remaining ones are unknown here, so a relocation that cannot be proved
+    /// safe is rejected rather than allowed through unchecked.
+    pub truncated: bool,
+}
+
+impl ReservedCobIds<'_> {
+    /// True if another service occupies `cob`, or if the list is truncated and
+    /// therefore cannot rule it out.
+    pub fn claims(&self, cob: u16) -> bool {
+        cob != 0 && (self.truncated || self.ids.contains(&cob))
+    }
+}
+
 /// Per-request context for [`SdoServer::process_with_context`]: everything the
 /// server needs beyond the request frame and the OD itself.
 #[derive(Clone, Copy)]
@@ -133,6 +164,12 @@ pub struct SdoContext<'a> {
     /// COB-IDs the node's SDO servers occupy; config downloads may not steal
     /// them. Default (nothing claimed) skips the check.
     pub cob_ids: SdoCobIds<'a>,
+    /// COB-IDs the node's non-SDO services occupy; a 0x1005 download may not
+    /// move SYNC onto them. See [`ReservedCobIds`].
+    pub reserved_cob_ids: ReservedCobIds<'a>,
+    /// Current SYNC COB-ID, or 0 when the node has no usable SYNC object.
+    /// PDO and monitored-heartbeat downloads may not move onto it.
+    pub sync_cob_id: u16,
 }
 
 /// SDO server state machine. Handles one transfer at a time.
@@ -252,15 +289,17 @@ impl SdoServer {
             now_us,
             heartbeat_consumer_count: 0,
             cob_ids: SdoCobIds::default(),
+            reserved_cob_ids: ReservedCobIds::default(),
+            sync_cob_id: 0,
         };
         self.process_with_context(request, od, response, events, ctx)
     }
 
-    /// [`process`](Self::process) with the node's SDO COB-ID plan in the
-    /// context, so a download that would move a PDO or a heartbeat consumer
-    /// onto one of this node's SDO channels is aborted with 0x0604_0043
-    /// instead of silently creating a frame the dispatcher misroutes.
-    /// See [`SdoCobIds`].
+    /// [`process`](Self::process) with the owning node's COB-ID plan, so
+    /// configuration downloads cannot create collisions involving SYNC or an
+    /// SDO channel. A collision aborts with 0x0604_0043 instead of silently
+    /// creating a frame the dispatcher misroutes. See [`SdoCobIds`] and
+    /// [`ReservedCobIds`].
     pub fn process_with_context<OD: ObjectDictionary, const EVT_QUEUE: usize>(
         &mut self,
         request: &[u8; 8],
@@ -404,11 +443,9 @@ impl SdoServer {
         events: &mut Deque<OdEvent, EVT_QUEUE>,
         ctx: SdoContext<'_>,
     ) -> Result<(), ()> {
+        let validation_ctx = ctx;
         let SdoContext {
-            nmt_state,
-            now_us,
-            heartbeat_consumer_count,
-            cob_ids: sdo_cobs,
+            nmt_state, now_us, ..
         } = ctx;
         let (index, subindex) = parse_index_sub(request);
 
@@ -432,14 +469,7 @@ impl SdoServer {
             };
             let data = &request[4..4 + data_len];
 
-            if let Err(code) = validate_download(
-                od,
-                sdo_cobs,
-                heartbeat_consumer_count,
-                index,
-                subindex,
-                data,
-            ) {
+            if let Err(code) = validate_download(od, validation_ctx, index, subindex, data) {
                 *response = encode_abort(index, subindex, code);
                 self.transfer = None;
                 return Ok(());
@@ -498,12 +528,8 @@ impl SdoServer {
         events: &mut Deque<OdEvent, EVT_QUEUE>,
         ctx: SdoContext<'_>,
     ) -> Result<(), ()> {
-        let SdoContext {
-            now_us,
-            heartbeat_consumer_count,
-            cob_ids: sdo_cobs,
-            ..
-        } = ctx;
+        let validation_ctx = ctx;
+        let now_us = ctx.now_us;
         let transfer = match &mut self.transfer {
             Some(TransferState::Segmented(t)) if t.direction == Direction::Download => t,
             _ => {
@@ -548,14 +574,9 @@ impl SdoServer {
             write_buf[..data_len].copy_from_slice(&transfer.buf[..data_len]);
             self.transfer = None;
 
-            if let Err(code) = validate_download(
-                od,
-                sdo_cobs,
-                heartbeat_consumer_count,
-                index,
-                subindex,
-                &write_buf[..data_len],
-            ) {
+            if let Err(code) =
+                validate_download(od, validation_ctx, index, subindex, &write_buf[..data_len])
+            {
                 *response = encode_abort(index, subindex, code);
                 return Ok(());
             }
@@ -707,11 +728,9 @@ impl SdoServer {
         events: &mut Deque<OdEvent, EVT_QUEUE>,
         ctx: SdoContext<'_>,
     ) -> Result<(), ()> {
+        let validation_ctx = ctx;
         let SdoContext {
-            nmt_state,
-            now_us,
-            heartbeat_consumer_count,
-            cob_ids: sdo_cobs,
+            nmt_state, now_us, ..
         } = ctx;
         let sub_cmd = request[0] & 0x01;
 
@@ -814,8 +833,7 @@ impl SdoServer {
 
                         if let Err(code) = validate_download(
                             od,
-                            sdo_cobs,
-                            heartbeat_consumer_count,
+                            validation_ctx,
                             index,
                             subindex,
                             &write_buf[..data_len],
@@ -946,28 +964,86 @@ fn push_event<const N: usize>(events: &mut Deque<OdEvent, N>, event: OdEvent) {
 /// then the OD's application-level `validate_write` hook.
 fn validate_download<OD: ObjectDictionary>(
     od: &OD,
-    sdo_cobs: SdoCobIds<'_>,
-    heartbeat_consumer_count: u8,
+    ctx: SdoContext<'_>,
     index: u16,
     subindex: u8,
     data: &[u8],
 ) -> Result<(), AbortCode> {
     validate_heartbeat_consumer_write(
         od,
-        sdo_cobs,
-        heartbeat_consumer_count,
+        ctx.cob_ids,
+        ctx.sync_cob_id,
+        ctx.heartbeat_consumer_count,
         index,
         subindex,
         data,
     )?;
-    validate_pdo_cob_id_write(sdo_cobs, index, subindex, data)?;
+    validate_pdo_cob_id_write(ctx.cob_ids, ctx.sync_cob_id, index, subindex, data)?;
+    validate_sync_cob_id_write(ctx.cob_ids, ctx.reserved_cob_ids, index, subindex, data)?;
+    validate_sync_counter_overflow_write(index, subindex, data)?;
     od.validate_write(index, subindex, data)
         .map_err(od_error_to_abort)
 }
 
-/// A PDO must not be parked on a COB-ID an SDO server occupies: the node
-/// dispatches SDO channels first, so such a PDO would never reach the PDO
-/// engine (and an SDO request could be answered on the PDO's COB-ID).
+/// CiA 301 rules for 0x1005 (COB-ID SYNC message).
+///
+/// Malformed values abort with 0x0609_0030 rather than being accepted and
+/// masked away, so a master learns the SYNC object did not move where it
+/// asked: bit 29 selects 29-bit SYNC frames (not implemented here), COB-ID 0
+/// is the NMT COB-ID and never a SYNC object, and the reserved bits (31 and
+/// 11..=28 — 0x1005 has no valid/invalid bit, unlike a PDO COB-ID) must be
+/// zero.
+///
+/// SYNC must also not be parked on a COB-ID another service on this node
+/// already occupies. `Node::dispatch_frame` matches SYNC ahead of everything
+/// but the SDO channels and returns unconditionally, so a collision mutes the
+/// other service outright: an RPDO would stop being received, a monitored
+/// heartbeat would look like a timeout, LSS would go deaf. Rejected with
+/// 0x0604_0043, as for a PDO parked on an SDO channel
+/// (see [`validate_pdo_cob_id_write`]).
+fn validate_sync_cob_id_write(
+    sdo_cobs: SdoCobIds<'_>,
+    reserved_cobs: ReservedCobIds<'_>,
+    index: u16,
+    subindex: u8,
+    data: &[u8],
+) -> Result<(), AbortCode> {
+    if index != 0x1005 || subindex != 0 || data.len() != 4 {
+        return Ok(());
+    }
+    let raw = u32::from_le_bytes(data.try_into().unwrap());
+    if !crate::sync::is_supported_sync_cob_id(raw) {
+        return Err(AbortCode::ValueRangeExceeded);
+    }
+    let cob = (raw & 0x7FF) as u16;
+    if sdo_cobs.claims(cob) || reserved_cobs.claims(cob) {
+        return Err(AbortCode::ParameterIncompatibility);
+    }
+    Ok(())
+}
+
+/// CiA 301 rules for 0x1019 (synchronous counter overflow value): 0 disables
+/// the SYNC counter, and 2..=240 selects the value it wraps at. 1 is not a
+/// legal value, and neither is anything above 240 — accepting either would
+/// leave the producer emitting counters the spec has no meaning for, or
+/// silently treating the entry as disabled.
+fn validate_sync_counter_overflow_write(
+    index: u16,
+    subindex: u8,
+    data: &[u8],
+) -> Result<(), AbortCode> {
+    if index != 0x1019 || subindex != 0 || data.is_empty() {
+        return Ok(());
+    }
+    if !crate::sync::is_valid_sync_counter_overflow(data[0]) {
+        return Err(AbortCode::ValueRangeExceeded);
+    }
+    Ok(())
+}
+
+/// A PDO must not be parked on a COB-ID an SDO server or the SYNC object
+/// occupies: those services dispatch first, so such a PDO would never reach
+/// the PDO engine (and an SDO request could be answered on the PDO's COB-ID).
 /// Rejected with 0x0604_0043, as for the duplicate heartbeat producer.
 ///
 /// The valid bit (31) is deliberately ignored: a disabled PDO can be enabled
@@ -977,6 +1053,7 @@ fn validate_download<OD: ObjectDictionary>(
 /// PDOs, so the frame-type bit does not make a colliding ID distinct.
 fn validate_pdo_cob_id_write(
     sdo_cobs: SdoCobIds<'_>,
+    sync_cob_id: u16,
     index: u16,
     subindex: u8,
     data: &[u8],
@@ -986,7 +1063,8 @@ fn validate_pdo_cob_id_write(
         return Ok(());
     }
     let raw = u32::from_le_bytes(data.try_into().unwrap());
-    if sdo_cobs.claims((raw & 0x7FF) as u16) {
+    let cob = (raw & 0x7FF) as u16;
+    if sdo_cobs.claims(cob) || (cob != 0 && cob == sync_cob_id) {
         return Err(AbortCode::ParameterIncompatibility);
     }
     Ok(())
@@ -997,10 +1075,13 @@ fn validate_pdo_cob_id_write(
 /// additionally carry a valid producer node id (1..=127), and no two entries
 /// may monitor the same node (abort 0x0604_0043). The producer's heartbeat
 /// COB-ID must also not be one an SDO server occupies, for the same reason a
-/// PDO may not be parked there (see [`validate_pdo_cob_id_write`]).
+/// PDO may not be parked there (see [`validate_pdo_cob_id_write`]). The same
+/// rule protects the current SYNC COB-ID: configuration order must not decide
+/// whether a collision is accepted.
 fn validate_heartbeat_consumer_write<OD: ObjectDictionary>(
     od: &OD,
     sdo_cobs: SdoCobIds<'_>,
+    sync_cob_id: u16,
     heartbeat_consumer_count: u8,
     index: u16,
     subindex: u8,
@@ -1022,8 +1103,11 @@ fn validate_heartbeat_consumer_write<OD: ObjectDictionary>(
         return Err(AbortCode::ValueRangeExceeded);
     }
 
-    if subindex <= heartbeat_consumer_count && sdo_cobs.claims(0x700 + node as u16) {
-        return Err(AbortCode::ParameterIncompatibility);
+    if subindex <= heartbeat_consumer_count {
+        let cob = 0x700 + node as u16;
+        if sdo_cobs.claims(cob) || cob == sync_cob_id {
+            return Err(AbortCode::ParameterIncompatibility);
+        }
     }
     // The same producer must not be monitored by two active entries.
     let count = od.sub_count(index).unwrap_or(0);
@@ -1828,5 +1912,48 @@ mod tests {
             .unwrap();
         assert_eq!(resp[0], 0x60, "download response, got {:#04x}", resp[0]);
         assert_eq!(od.writable_u16, 0xBEEF);
+    }
+
+    #[test]
+    fn pdo_cob_id_cannot_be_moved_onto_sync() {
+        let raw = 0x123u32.to_le_bytes();
+        assert_eq!(
+            validate_pdo_cob_id_write(SdoCobIds::default(), 0x123, 0x1400, 1, &raw),
+            Err(AbortCode::ParameterIncompatibility)
+        );
+        assert_eq!(
+            validate_pdo_cob_id_write(SdoCobIds::default(), 0x080, 0x1400, 1, &raw),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn monitored_heartbeat_cannot_be_moved_onto_sync() {
+        let od = TestOd::new();
+        let entry = ((5u32 << 16) | 100).to_le_bytes();
+        assert_eq!(
+            validate_heartbeat_consumer_write(
+                &od,
+                SdoCobIds::default(),
+                0x705,
+                1,
+                0x1016,
+                1,
+                &entry,
+            ),
+            Err(AbortCode::ParameterIncompatibility)
+        );
+        assert_eq!(
+            validate_heartbeat_consumer_write(
+                &od,
+                SdoCobIds::default(),
+                0x706,
+                1,
+                0x1016,
+                1,
+                &entry,
+            ),
+            Ok(())
+        );
     }
 }

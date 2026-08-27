@@ -1,4 +1,5 @@
 mod bridge;
+mod drop_buffer;
 mod socketcan_wire;
 
 use axum::{
@@ -11,18 +12,22 @@ use axum::{
 };
 use canwsd_proto::{
     ERRORS_QUERY_PARAM, FILTER_QUERY_PARAM, NETWORK_WS_ROUTE, NETWORKS_PATH, NetworkInfo,
-    NetworkStatus, WireFrame,
+    NetworkStatus, ServerStatus, WireFrame,
 };
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use socketcan::tokio::CanSocket;
+use socketcan::{CanFrame, tokio::CanSocket};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use bridge::BridgeHub;
-use socketcan_wire::{can_frame_from_wire, wire_from_can_frame};
+use drop_buffer::{BufferEvent, DropBuffer};
+use socketcan_wire::can_frame_from_wire;
+
+const ATTACH_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(about = "CAN WebSocket daemon — bridges socketCAN interfaces over WebSocket")]
@@ -213,60 +218,129 @@ async fn expose(args: ExposeArgs) -> Result<(), String> {
 
 async fn attach(args: AttachArgs) -> Result<(), String> {
     let remote = remote_url_with_params(&args.remote, args.filter.as_deref(), args.errors)?;
-    let local = CanSocket::open(&args.local_interface)
-        .map_err(|e| format!("open {}: {e}", args.local_interface))?;
+    let local = Arc::new(
+        CanSocket::open(&args.local_interface)
+            .map_err(|e| format!("open {}: {e}", args.local_interface))?,
+    );
     let (ws, _) = connect_async(&remote)
         .await
         .map_err(|e| format!("connect {remote}: {e}"))?;
     log::info!("attached {remote} to {}", args.local_interface);
 
     let (mut ws_tx, mut ws_rx) = ws.split();
-    loop {
-        tokio::select! {
-            frame = local.read_frame() => {
-                let frame = frame.map_err(|e| format!("read {}: {e}", args.local_interface))?;
-                let Some(wire) = wire_from_can_frame(&frame) else {
-                    continue;
-                };
-                let (buf, len) = wire.encode();
-                ws_tx
-                    .send(Message::Binary(buf[..len].to_vec().into()))
-                    .await
-                    .map_err(|e| format!("send websocket frame: {e}"))?;
-            }
+    let outbound = Arc::new(DropBuffer::new(bridge::FRAME_BUFFER));
+    let inbound: Arc<DropBuffer<CanFrame>> = Arc::new(DropBuffer::new(bridge::FRAME_BUFFER));
 
-            msg = ws_rx.next() => {
-                let Some(msg) = msg else {
-                    return Err("remote websocket closed".into());
-                };
-                match msg.map_err(|e| format!("receive websocket frame: {e}"))? {
-                    Message::Binary(data) => {
-                        let wire = WireFrame::decode(&data)
-                            .map_err(|e| format!("decode websocket frame: {e}"))?;
-                        let Some(frame) = can_frame_from_wire(&wire) else {
-                            log::debug!(
-                                "ignoring non-transmittable remote frame: id_word={:#x} dlc={}",
-                                wire.id_word(),
-                                wire.dlc()
-                            );
-                            continue;
-                        };
-                        local
-                            .write_frame(frame)
-                            .await
-                            .map_err(|e| format!("write {}: {e}", args.local_interface))?;
-                    }
-                    Message::Text(text) => {
-                        log::info!("remote status: {text}");
-                    }
-                    Message::Close(close) => {
-                        return Err(format!("remote websocket closed: {close:?}"));
-                    }
-                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+    // Drain local SocketCAN independently of a slow WebSocket. This uses the
+    // same clear-on-overflow semantics as expose: retain fresh diagnostics and
+    // report the exact discarded backlog.
+    let local_reader = tokio::spawn(bridge::reader_task(local.clone(), outbound.clone()));
+
+    let local_name = args.local_interface.clone();
+    let send_remote = async {
+        loop {
+            match outbound.next().await {
+                BufferEvent::Item(wire) => {
+                    let (buf, len) = wire.encode();
+                    tokio::time::timeout(
+                        ATTACH_WRITE_TIMEOUT,
+                        ws_tx.send(Message::Binary(buf[..len].to_vec().into())),
+                    )
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "websocket write blocked for {}s",
+                            ATTACH_WRITE_TIMEOUT.as_secs()
+                        )
+                    })?
+                    .map_err(|e| format!("send websocket frame: {e}"))?;
+                }
+                BufferEvent::Overflow(dropped) => {
+                    log::warn!(
+                        "{local_name} -> remote: outbound buffer overflow, {dropped} frames dropped"
+                    );
+                }
+                BufferEvent::Closed(error) => {
+                    return Err(format!("read {local_name}: {error}"));
                 }
             }
         }
-    }
+    };
+
+    let receive_remote = async {
+        loop {
+            let Some(msg) = ws_rx.next().await else {
+                return Err("remote websocket closed".into());
+            };
+            match msg.map_err(|e| format!("receive websocket frame: {e}"))? {
+                Message::Binary(data) => {
+                    let wire = match WireFrame::decode(&data) {
+                        Ok(wire) => wire,
+                        Err(e) => {
+                            log::debug!("ignoring invalid remote binary frame: {e}");
+                            continue;
+                        }
+                    };
+                    let Some(frame) = can_frame_from_wire(&wire) else {
+                        log::debug!(
+                            "ignoring non-transmittable remote frame: id_word={:#x} dlc={}",
+                            wire.id_word(),
+                            wire.dlc()
+                        );
+                        continue;
+                    };
+                    inbound.push(frame);
+                }
+                Message::Text(text) => match serde_json::from_str::<ServerStatus>(&text) {
+                    Ok(ServerStatus::Overflow { dropped }) => {
+                        log::warn!("remote receive buffer overflow, {dropped} frames dropped");
+                    }
+                    Ok(ServerStatus::BusError { error }) => {
+                        log::warn!("remote bus error: {error}");
+                    }
+                    Err(_) => log::info!("remote status: {text}"),
+                },
+                Message::Close(close) => {
+                    return Err(format!("remote websocket closed: {close:?}"));
+                }
+                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+            }
+        }
+    };
+
+    let write_local = async {
+        loop {
+            match inbound.next().await {
+                BufferEvent::Item(frame) => {
+                    match tokio::time::timeout(ATTACH_WRITE_TIMEOUT, local.write_frame(frame)).await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => log::warn!("write {local_name}: {e}; frame dropped"),
+                        Err(_) => {
+                            return Err(format!(
+                                "write {local_name} blocked for {}s",
+                                ATTACH_WRITE_TIMEOUT.as_secs()
+                            ));
+                        }
+                    }
+                }
+                BufferEvent::Overflow(dropped) => {
+                    log::warn!(
+                        "remote -> {local_name}: inbound buffer overflow, {dropped} frames dropped"
+                    );
+                }
+                BufferEvent::Closed(error) => return Err(error),
+            }
+        }
+    };
+
+    let result = tokio::select! {
+        result = send_remote => result,
+        result = receive_remote => result,
+        result = write_local => result,
+    };
+    local_reader.abort();
+    result
 }
 
 async fn list(args: ListArgs) -> Result<(), String> {

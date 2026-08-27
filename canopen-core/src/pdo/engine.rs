@@ -103,6 +103,12 @@ pub const fn sync_cyclic(n: u8) -> u8 {
     n
 }
 
+/// [`TransmissionType::is_synchronous`] on the raw wire value, for the engines
+/// (which store transmission types as the `u8` the OD holds).
+const fn raw_is_synchronous(raw: u8) -> bool {
+    raw <= 240
+}
+
 /// PDO transmission type (CiA 301 §7.5.2.31).
 ///
 /// Typed view of the raw `u8` transmission type. Both forms are accepted
@@ -139,6 +145,13 @@ impl TransmissionType {
             Self::EventDrivenManufacturer => EVENT_DRIVEN_MANUFACTURER,
             Self::EventDriven => EVENT_DRIVEN,
         }
+    }
+
+    /// True for the synchronous types (0..=240), which are the ones tied to
+    /// the SYNC pulse: a TPDO transmits on it, an RPDO buffers received data
+    /// until it. Everything else is event-driven or RTR.
+    pub const fn is_synchronous(self) -> bool {
+        matches!(self, Self::SyncAcyclic | Self::SyncCyclic(_))
     }
 
     /// Decode a raw CiA 301 value. Returns `None` for the reserved
@@ -341,6 +354,14 @@ pub struct TpdoEngine<const N: usize = 4> {
     pdos: [TpdoConfig; N],
     sync_counter: [u8; N],
     last_send_us: [u64; N],
+    /// Application event latched for a synchronous acyclic TPDO (type 0),
+    /// waiting for the SYNC that will transmit it.
+    ///
+    /// CiA 301 transmits type 0 on the SYNC *following* an application event,
+    /// which is generally not the same processing cycle: the caller's dirty
+    /// set is rebuilt and cleared every cycle, so the trigger has to be
+    /// latched here or it is lost between pulses.
+    event_pending: [bool; N],
 }
 
 impl<const N: usize> TpdoEngine<N> {
@@ -349,6 +370,7 @@ impl<const N: usize> TpdoEngine<N> {
             pdos,
             sync_counter: [0; N],
             last_send_us: [0; N],
+            event_pending: [false; N],
         }
     }
 
@@ -377,7 +399,52 @@ impl<const N: usize> TpdoEngine<N> {
         })
     }
 
+    /// Latch application events for synchronous acyclic TPDOs (type 0).
+    ///
+    /// Call once per processing cycle, before any SYNC in that cycle is
+    /// consumed, with the same dirty set [`poll`](Self::poll) gets. The latch
+    /// is what makes type 0 work across cycles: the dirty set is cleared at
+    /// the end of every cycle, but the SYNC that should carry the event may
+    /// be many cycles away. [`on_sync`](Self::on_sync) consumes it.
+    pub fn latch_sync_events<const DIRTY: usize>(&mut self, dirty: &Vec<(u16, u8), DIRTY>) {
+        if dirty.is_empty() {
+            return;
+        }
+        for i in 0..N {
+            if self.pdos[i].enabled
+                && self.pdos[i].transmission_type == 0
+                && self.has_dirty_mapping(i, dirty)
+            {
+                self.event_pending[i] = true;
+            }
+        }
+    }
+
+    /// Drop every latched synchronous acyclic trigger.
+    ///
+    /// Called when leaving Operational, where PDOs stop flowing: an event
+    /// that never reached a SYNC must not fire one on re-entry. Companion to
+    /// [`RpdoEngine::discard_pending`].
+    pub fn discard_sync_events(&mut self) {
+        self.event_pending = [false; N];
+    }
+
+    /// Reset all runtime state driven by SYNC without changing PDO config.
+    ///
+    /// NMT reset re-initialises communication objects, so both cyclic TPDO
+    /// divisors and acyclic application-event latches start fresh. Merely
+    /// leaving Operational only discards acyclic latches; it does not imply a
+    /// communication reset.
+    pub(crate) fn reset_sync_state(&mut self) {
+        self.sync_counter = [0; N];
+        self.event_pending = [false; N];
+    }
+
     /// Called on SYNC reception. Returns frames to transmit for sync-triggered PDOs.
+    ///
+    /// Synchronous cyclic PDOs (1..=240) fire on their own SYNC count.
+    /// Synchronous acyclic PDOs (type 0) fire once per application event
+    /// latched by [`latch_sync_events`](Self::latch_sync_events).
     pub fn on_sync<OD: ObjectDictionary>(&mut self, od: &OD, out: &mut Vec<CanFrame, N>) {
         for i in 0..N {
             if !self.pdos[i].enabled {
@@ -385,7 +452,13 @@ impl<const N: usize> TpdoEngine<N> {
             }
             let tt = self.pdos[i].transmission_type;
             if tt == 0 {
-                // Sync acyclic - only send if triggered (TODO: trigger mechanism)
+                // Sync acyclic: one transmission per latched application
+                // event, on the first SYNC after it.
+                if core::mem::take(&mut self.event_pending[i]) {
+                    if let Some(frame) = self.build_pdo_frame(i, od) {
+                        let _ = out.push(frame);
+                    }
+                }
                 continue;
             }
             if tt >= 1 && tt <= 240 {
@@ -400,6 +473,20 @@ impl<const N: usize> TpdoEngine<N> {
             }
             // 254/255 are event-driven, handled by poll()
         }
+    }
+
+    /// Does the dirty set contain any entry this PDO maps?
+    fn has_dirty_mapping<const DIRTY: usize>(
+        &self,
+        pdo_idx: usize,
+        dirty: &Vec<(u16, u8), DIRTY>,
+    ) -> bool {
+        !dirty.is_empty()
+            && self.pdos[pdo_idx].mappings.iter().any(|m| {
+                dirty
+                    .iter()
+                    .any(|&(idx, sub)| idx == m.index && sub == m.subindex)
+            })
     }
 
     /// Called periodically. Checks event timers and dirty entries for event-driven PDOs.
@@ -427,12 +514,7 @@ impl<const N: usize> TpdoEngine<N> {
             let elapsed = now_us.wrapping_sub(self.last_send_us[i]);
 
             // Check if any mapped entry was marked dirty
-            let has_dirty = !dirty.is_empty()
-                && self.pdos[i].mappings.iter().any(|m| {
-                    dirty
-                        .iter()
-                        .any(|&(idx, sub)| idx == m.index && sub == m.subindex)
-                });
+            let has_dirty = self.has_dirty_mapping(i, dirty);
 
             // Send on dirty trigger (respecting inhibit time) or event timer
             let timer_trigger = self.pdos[i].event_timer_ms > 0 && {
@@ -492,15 +574,73 @@ impl<const N: usize> TpdoEngine<N> {
     }
 }
 
+/// Unpack a received RPDO frame into the OD along `pdo`'s mappings, pushing
+/// one `OdEvent` per entry successfully written. Returns the number of events
+/// dropped because the queue was full.
+///
+/// Shared by immediate (event-driven) and deferred (synchronous, applied on
+/// SYNC) commits so both produce identical OD writes and events.
+fn apply_mapped<OD: ObjectDictionary, const EVT_QUEUE: usize>(
+    pdo: &RpdoConfig,
+    data: &[u8],
+    od: &mut OD,
+    events: &mut Deque<OdEvent, EVT_QUEUE>,
+) -> u32 {
+    let mut bit_offset: usize = 0;
+    let mut object_data = [0u8; 8];
+    let mut dropped = 0u32;
+
+    for mapping in &pdo.mappings {
+        let bit_len = mapping.bit_length as usize;
+        let end_bit = bit_offset + bit_len;
+        let object_len = bytes_for_bits(bit_len);
+        if end_bit > data.len() * 8 || object_len > object_data.len() {
+            break;
+        }
+        if is_dummy_mapping_index(mapping.index) {
+            bit_offset = end_bit;
+            continue;
+        }
+        copy_bits(data, bit_offset, &mut object_data, 0, bit_len);
+        if od
+            .write(mapping.index, mapping.subindex, &object_data[..object_len])
+            .is_ok()
+        {
+            if events.is_full() {
+                let _ = events.pop_front();
+                dropped = dropped.saturating_add(1);
+            }
+            let _ = events.push_back(OdEvent {
+                index: mapping.index,
+                subindex: mapping.subindex,
+                source: OdEventSource::Rpdo,
+            });
+        }
+        object_data[..object_len].fill(0);
+        bit_offset = end_bit;
+    }
+    dropped
+}
+
 /// RPDO engine. Manages up to N receive PDOs.
+///
+/// Synchronous RPDOs (transmission type 0..=240) do not write the OD at
+/// reception: their frame is buffered and committed by
+/// [`on_sync`](Self::on_sync), so a set of setpoints spread over several PDOs
+/// becomes visible to the application as one coherent update. Event-driven
+/// types (254/255) commit immediately, at reception.
 ///
 /// Optionally performs deadline monitoring per slot (CiA 301 RPDO event
 /// timer): when [`RpdoConfig::deadline_ms`] is nonzero, monitoring arms on
 /// the first received frame and [`check_deadlines`](Self::check_deadlines)
 /// flags slots whose silence exceeds the deadline. Detection latency equals
-/// the caller's polling period.
+/// the caller's polling period. Monitoring watches the *bus*, so it is
+/// stamped at reception for synchronous RPDOs too, not at SYNC commit.
 pub struct RpdoEngine<const N: usize = 4> {
     pdos: [RpdoConfig; N],
+    /// Frame received by a synchronous RPDO, awaiting the next SYNC. Latest
+    /// frame wins — CiA 301 keeps only the most recent data per PDO.
+    pending: [Option<CanFrame>; N],
     /// Timestamp of the last received frame per slot (valid when `armed`).
     last_rx_us: [u64; N],
     /// Deadline monitoring armed: at least one frame received since
@@ -515,6 +655,7 @@ impl<const N: usize> RpdoEngine<N> {
     pub fn new(pdos: [RpdoConfig; N]) -> Self {
         Self {
             pdos,
+            pending: [None; N],
             last_rx_us: [0; N],
             armed: [false; N],
             expired: [false; N],
@@ -552,6 +693,10 @@ impl<const N: usize> RpdoEngine<N> {
     /// Pushes one `OdEvent` per successfully written mapped entry.
     /// `now_us` stamps the reception time for deadline monitoring; reception
     /// re-arms an expired deadline.
+    ///
+    /// A frame for a *synchronous* RPDO is consumed (returns true) but only
+    /// buffered — it writes the OD and emits its events on the next
+    /// [`on_sync`](Self::on_sync).
     pub fn process<OD: ObjectDictionary, const EVT_QUEUE: usize>(
         &mut self,
         frame: &CanFrame,
@@ -569,52 +714,69 @@ impl<const N: usize> RpdoEngine<N> {
         events: &mut Deque<OdEvent, EVT_QUEUE>,
         now_us: u64,
     ) -> (bool, u32) {
-        for (slot, pdo) in self.pdos.iter().enumerate() {
-            if !pdo.enabled || frame.raw_id() != pdo.cob_id {
-                continue;
-            }
+        let Some(slot) = self
+            .pdos
+            .iter()
+            .position(|pdo| pdo.enabled && frame.raw_id() == pdo.cob_id)
+        else {
+            return (false, 0);
+        };
 
-            self.last_rx_us[slot] = now_us;
-            self.armed[slot] = true;
-            self.expired[slot] = false;
+        // Deadline monitoring watches the bus, so it is stamped here even when
+        // the data itself waits for a SYNC.
+        self.last_rx_us[slot] = now_us;
+        self.armed[slot] = true;
+        self.expired[slot] = false;
 
-            let data = frame.data();
-            let mut bit_offset: usize = 0;
-            let mut object_data = [0u8; 8];
-            let mut dropped = 0u32;
-
-            for mapping in &pdo.mappings {
-                let bit_len = mapping.bit_length as usize;
-                let end_bit = bit_offset + bit_len;
-                let object_len = bytes_for_bits(bit_len);
-                if end_bit > data.len() * 8 || object_len > object_data.len() {
-                    break;
-                }
-                if is_dummy_mapping_index(mapping.index) {
-                    bit_offset = end_bit;
-                    continue;
-                }
-                copy_bits(data, bit_offset, &mut object_data, 0, bit_len);
-                if od
-                    .write(mapping.index, mapping.subindex, &object_data[..object_len])
-                    .is_ok()
-                {
-                    if events.is_full() {
-                        let _ = events.pop_front();
-                        dropped = dropped.saturating_add(1);
-                    }
-                    let _ = events.push_back(OdEvent {
-                        index: mapping.index,
-                        subindex: mapping.subindex,
-                        source: OdEventSource::Rpdo,
-                    });
-                }
-                object_data[..object_len].fill(0);
-                bit_offset = end_bit;
-            }
-            return (true, dropped);
+        if raw_is_synchronous(self.pdos[slot].transmission_type) {
+            self.pending[slot] = Some(*frame);
+            return (true, 0);
         }
-        (false, 0)
+
+        (
+            true,
+            apply_mapped(&self.pdos[slot], frame.data(), od, events),
+        )
+    }
+
+    /// Commit every buffered synchronous RPDO to the OD, in slot order.
+    ///
+    /// Returns the number of `OdEvent`s dropped to queue overflow. Call this
+    /// on the SYNC pulse, *before* sampling synchronous TPDOs, so a TPDO in
+    /// the same pulse sees the post-SYNC state.
+    pub fn on_sync<OD: ObjectDictionary, const EVT_QUEUE: usize>(
+        &mut self,
+        od: &mut OD,
+        events: &mut Deque<OdEvent, EVT_QUEUE>,
+    ) -> u32 {
+        let mut dropped = 0u32;
+        for slot in 0..N {
+            let Some(frame) = self.pending[slot].take() else {
+                continue;
+            };
+            dropped =
+                dropped.saturating_add(apply_mapped(&self.pdos[slot], frame.data(), od, events));
+        }
+        dropped
+    }
+
+    /// Is a frame buffered for the RPDO with the given CANopen number, waiting
+    /// for the next SYNC? Always false for event-driven RPDOs, which never
+    /// buffer.
+    pub fn has_pending(&self, number: PdoNumber) -> bool {
+        match self.slot_for_number(number) {
+            Some(slot) => self.pending[slot].is_some(),
+            None => false,
+        }
+    }
+
+    /// Drop every buffered synchronous RPDO without applying it.
+    ///
+    /// Called when leaving Operational: data that never reached a SYNC has no
+    /// business landing in the OD after the node has stopped processing PDOs.
+    /// Companion to [`reset_deadline_monitoring`](Self::reset_deadline_monitoring).
+    pub fn discard_pending(&mut self) {
+        self.pending = [None; N];
     }
 
     /// Check all RPDOs for expired deadlines. Pushes the CANopen PDO number
@@ -685,6 +847,19 @@ mod tests {
     use super::*;
     use crate::datatypes::DataType;
     use crate::od::*;
+
+    /// An empty dirty set, for TPDO tests that do not exercise the
+    /// application-event trigger (sync-cyclic and event-timer paths).
+    fn no_dirty() -> Vec<(u16, u8), 8> {
+        Vec::new()
+    }
+
+    /// A dirty set naming a single OD entry.
+    fn dirty(index: u16, subindex: u8) -> Vec<(u16, u8), 8> {
+        let mut v = Vec::new();
+        v.push((index, subindex)).unwrap();
+        v
+    }
 
     struct PdoTestOd {
         input1: u8,
@@ -1367,6 +1542,284 @@ mod tests {
         // 200ms - due again
         out.clear();
         engine.poll(&od, 200_000, &dirty, &mut out);
+        assert_eq!(out.len(), 1);
+    }
+
+    // ---- SYNC: synchronous RPDO buffering, synchronous acyclic TPDOs ----
+
+    fn zeroed_od() -> PdoTestOd {
+        PdoTestOd {
+            input1: 0,
+            input2: 0,
+            input_flag1: false,
+            input_flag2: false,
+            output1: 0,
+            output_flag1: false,
+            output_flag2: false,
+        }
+    }
+
+    /// One RPDO on 0x201 mapping 0x6200:1 (u8), with the given transmission
+    /// type and deadline.
+    fn rpdo_on_output1(transmission_type: u8, deadline_ms: u16) -> RpdoEngine<1> {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        RpdoEngine::new([RpdoConfig {
+            od_number: 0,
+            cob_id: 0x201,
+            transmission_type,
+            deadline_ms,
+            mappings,
+            enabled: true,
+        }])
+    }
+
+    #[test]
+    fn rpdo_synchronous_defers_od_write_until_sync() {
+        let mut engine = rpdo_on_output1(SYNC_CYCLIC_1, 0);
+        let mut od = zeroed_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        // The frame is consumed, but nothing reaches the OD yet — and no event
+        // fires, because visibility follows commit time, not arrival time.
+        let frame = CanFrame::new(0x201, &[0xFF]).unwrap();
+        assert!(engine.process(&frame, &mut od, &mut events, 0));
+        assert_eq!(od.output1, 0);
+        assert!(events.is_empty());
+        assert!(engine.has_pending(PdoNumber::of::<1>()));
+
+        assert_eq!(engine.on_sync(&mut od, &mut events), 0);
+        assert_eq!(od.output1, 0xFF);
+        assert_eq!(events.pop_front().unwrap().index, 0x6200);
+        assert!(!engine.has_pending(PdoNumber::of::<1>()));
+
+        // A second SYNC with nothing buffered is a no-op.
+        od.output1 = 0x11;
+        engine.on_sync(&mut od, &mut events);
+        assert_eq!(od.output1, 0x11);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn rpdo_synchronous_keeps_only_the_latest_frame() {
+        let mut engine = rpdo_on_output1(SYNC_ACYCLIC, 0);
+        let mut od = zeroed_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        for value in [0x11u8, 0x22, 0x33] {
+            let frame = CanFrame::new(0x201, &[value]).unwrap();
+            assert!(engine.process(&frame, &mut od, &mut events, 0));
+        }
+        engine.on_sync(&mut od, &mut events);
+
+        assert_eq!(od.output1, 0x33);
+        // One commit, so one event — not one per frame received.
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn rpdo_event_driven_still_commits_immediately() {
+        let mut engine = rpdo_on_output1(EVENT_DRIVEN, 0);
+        let mut od = zeroed_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        let frame = CanFrame::new(0x201, &[0xAB]).unwrap();
+        assert!(engine.process(&frame, &mut od, &mut events, 0));
+        assert_eq!(od.output1, 0xAB);
+        assert!(!engine.has_pending(PdoNumber::of::<1>()));
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn rpdo_discard_pending_drops_uncommitted_data() {
+        let mut engine = rpdo_on_output1(SYNC_CYCLIC_1, 0);
+        let mut od = zeroed_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        let frame = CanFrame::new(0x201, &[0xFF]).unwrap();
+        engine.process(&frame, &mut od, &mut events, 0);
+        engine.discard_pending();
+
+        engine.on_sync(&mut od, &mut events);
+        assert_eq!(od.output1, 0);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn rpdo_deadline_is_stamped_at_reception_not_at_sync() {
+        // Deadline monitoring watches the bus: a synchronous RPDO whose frames
+        // keep arriving is alive even if no SYNC ever commits them.
+        let mut engine = rpdo_on_output1(SYNC_CYCLIC_1, 100);
+        let mut od = zeroed_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        let frame = CanFrame::new(0x201, &[0x01]).unwrap();
+        engine.process(&frame, &mut od, &mut events, 1_000_000);
+
+        let mut expired = Vec::<PdoNumber, 1>::new();
+        engine.check_deadlines(1_050_000, &mut expired);
+        assert!(expired.is_empty());
+        assert!(!engine.deadline_expired(PdoNumber::of::<1>()));
+
+        engine.check_deadlines(1_200_000, &mut expired);
+        assert_eq!(expired.as_slice(), &[PdoNumber::of::<1>()]);
+    }
+
+    #[test]
+    fn tpdo_sync_acyclic_fires_only_after_an_application_event() {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        let mut engine = TpdoEngine::new([TpdoConfig {
+            od_number: 0,
+            cob_id: 0x181,
+            transmission_type: SYNC_ACYCLIC,
+            inhibit_time_100us: 0,
+            event_timer_ms: 0,
+            mappings,
+            enabled: true,
+        }]);
+        let mut od = zeroed_od();
+        od.input1 = 0x42;
+
+        // Nothing changed since the last pulse: type 0 is acyclic, so silence.
+        let mut out = Vec::<CanFrame, 1>::new();
+        engine.latch_sync_events(&no_dirty());
+        engine.on_sync(&od, &mut out);
+        assert!(out.is_empty());
+
+        // A change to a *different* entry is not this PDO's trigger.
+        engine.latch_sync_events(&dirty(0x6000, 2));
+        engine.on_sync(&od, &mut out);
+        assert!(out.is_empty());
+
+        engine.latch_sync_events(&dirty(0x6000, 1));
+        engine.on_sync(&od, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].raw_id(), 0x181);
+        assert_eq!(out[0].data(), &[0x42]);
+
+        // One transmission per event: the next pulse is silent again.
+        out.clear();
+        engine.latch_sync_events(&no_dirty());
+        engine.on_sync(&od, &mut out);
+        assert!(out.is_empty(), "type 0 repeated without a new event");
+    }
+
+    #[test]
+    fn tpdo_sync_acyclic_trigger_survives_cycles_without_a_sync() {
+        // The regression the latch exists for: the caller's dirty set is
+        // cleared every cycle, so an event several cycles before the pulse
+        // must still be transmitted on it.
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        let mut engine = TpdoEngine::new([TpdoConfig {
+            od_number: 0,
+            cob_id: 0x181,
+            transmission_type: SYNC_ACYCLIC,
+            inhibit_time_100us: 0,
+            event_timer_ms: 0,
+            mappings,
+            enabled: true,
+        }]);
+        let mut od = zeroed_od();
+        od.input1 = 0x42;
+
+        // Cycle 1: the application changes a mapped entry, no SYNC arrives.
+        engine.latch_sync_events(&dirty(0x6000, 1));
+
+        // Cycles 2 and 3: nothing dirty any more, still no SYNC.
+        let mut out = Vec::<CanFrame, 1>::new();
+        engine.latch_sync_events(&no_dirty());
+        engine.latch_sync_events(&no_dirty());
+        assert!(out.is_empty());
+
+        // Cycle 4: the pulse finally arrives and must carry the old event.
+        engine.latch_sync_events(&no_dirty());
+        engine.on_sync(&od, &mut out);
+        assert_eq!(out.len(), 1, "trigger lost between pulses");
+        assert_eq!(out[0].data(), &[0x42]);
+    }
+
+    #[test]
+    fn tpdo_discard_sync_events_drops_latched_triggers() {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        let mut engine = TpdoEngine::new([TpdoConfig {
+            od_number: 0,
+            cob_id: 0x181,
+            transmission_type: SYNC_ACYCLIC,
+            inhibit_time_100us: 0,
+            event_timer_ms: 0,
+            mappings,
+            enabled: true,
+        }]);
+        let od = zeroed_od();
+
+        engine.latch_sync_events(&dirty(0x6000, 1));
+        engine.discard_sync_events();
+
+        let mut out = Vec::<CanFrame, 1>::new();
+        engine.on_sync(&od, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tpdo_reset_sync_state_restarts_the_cyclic_divisor() {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        let mut engine = TpdoEngine::new([TpdoConfig {
+            od_number: 0,
+            cob_id: 0x181,
+            transmission_type: 2,
+            inhibit_time_100us: 0,
+            event_timer_ms: 0,
+            mappings,
+            enabled: true,
+        }]);
+        let od = zeroed_od();
+        let mut out = Vec::<CanFrame, 1>::new();
+
+        // One pulse puts the divisor halfway to its transmission.
+        engine.on_sync(&od, &mut out);
+        assert!(out.is_empty());
+
+        engine.reset_sync_state();
+
+        // Reset Communication starts the divisor over; the first post-reset
+        // pulse must not complete the pre-reset count.
+        engine.on_sync(&od, &mut out);
+        assert!(out.is_empty());
+        engine.on_sync(&od, &mut out);
         assert_eq!(out.len(), 1);
     }
 }

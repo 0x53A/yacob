@@ -12,7 +12,8 @@ use crate::od::OdEventSignal;
 use crate::pdo::{
     PdoMapping, PdoNumber, RpdoConfig, RpdoEngine, TpdoConfig, TpdoEngine, PDO_MAX_MAPPINGS,
 };
-use crate::sdo::{SdoCobIds, SdoContext, SdoServer, SdoServerConfig};
+use crate::sdo::{ReservedCobIds, SdoCobIds, SdoContext, SdoServer, SdoServerConfig};
+use crate::sync::{SyncCobId, SyncConsumer, SyncProducer, SyncWindow};
 use crate::time::Clock;
 use crate::transport::CanFrame;
 use heapless::{Deque, Vec};
@@ -65,8 +66,7 @@ impl<const TPDO: usize, const RPDO: usize, const SDO: usize> NodeConfig<TPDO, RP
     /// };
     /// ```
     pub fn from_od(
-        od: &(impl crate::pdo::PdoConfigSource<TPDO, RPDO>
-              + crate::sdo::SdoServerConfigSource<SDO>),
+        od: &(impl crate::pdo::PdoConfigSource<TPDO, RPDO> + crate::sdo::SdoServerConfigSource<SDO>),
         node_id: NodeId,
     ) -> Self {
         Self {
@@ -106,6 +106,18 @@ pub struct Node<
     extra_sdo_tx: [u16; SDO],
     tpdo: TpdoEngine<TPDO>,
     rpdo: RpdoEngine<RPDO>,
+    /// SYNC consumer on the OD 0x1005 COB-ID (0x080 unless relocated).
+    sync: SyncConsumer,
+    /// SYNC producer, active only when 0x1005 bit 30 and 0x1006 say so.
+    sync_producer: SyncProducer,
+    /// OD 0x1007 synchronous-PDO transmission window.
+    sync_window: SyncWindow,
+    /// Synchronous TPDOs refused by a full transport, retained only until the
+    /// current window closes or the next SYNC supersedes them.
+    pending_sync_tpdo: Vec<CanFrame, TPDO>,
+    /// Avoid retrying a refused TPDO twice at the same clock instant (the
+    /// pulse path already made the first attempt).
+    sync_tpdo_last_attempt_us: Option<u64>,
     heartbeat: HeartbeatProducer,
     hb_monitors: [Option<HeartbeatMonitor>; MAX_HEARTBEAT_MONITORS],
     hb_event_queue: Deque<HeartbeatEvent, HB_EVENT_QUEUE>,
@@ -129,6 +141,17 @@ pub const MAX_HEARTBEAT_MONITORS: usize = 8;
 /// [`Node::next_heartbeat_event`]). On overflow the oldest event is evicted
 /// and [`Node::events_dropped`] is incremented.
 const HB_EVENT_QUEUE: usize = 8;
+
+/// Capacity of the reserved-COB-ID list handed to the SDO server so it can
+/// reject a 0x1005 download that would move SYNC onto another service.
+///
+/// Holds EMCY, this node's own heartbeat, LSS request/response, every declared
+/// PDO and every heartbeat consumer — enough for 20 PDOs alongside the full 8
+/// monitors, comfortably past the 4 + 4 of the pre-defined connection set. A
+/// node declaring more than that cannot be fully checked, and the server then
+/// refuses to relocate SYNC at all rather than allow a collision it could not
+/// see (see [`ReservedCobIds::truncated`]).
+const RESERVED_COB_IDS: usize = 32;
 
 /// Selects which SDO server an incoming request is dispatched to.
 #[derive(Clone, Copy)]
@@ -173,6 +196,11 @@ impl<
             extra_sdo_tx,
             tpdo: TpdoEngine::new(config.tpdo),
             rpdo: RpdoEngine::new(config.rpdo),
+            sync: SyncConsumer::default_cob(),
+            sync_producer: SyncProducer::new(),
+            sync_window: SyncWindow::new(),
+            pending_sync_tpdo: Vec::new(),
+            sync_tpdo_last_attempt_us: None,
             heartbeat: HeartbeatProducer::new(config.node_id, config.heartbeat_interval_ms),
             hb_monitors: [const { None }; MAX_HEARTBEAT_MONITORS],
             hb_event_queue: Deque::new(),
@@ -191,6 +219,9 @@ impl<
         // so SDO reads return real values (node-relative resolved).
         node.od.store_sdo_server_cob_ids(config.node_id);
         node.sync_heartbeat_from_od(false);
+        // Before the assert below: the SYNC COB-ID it checks against is the
+        // configured one, not necessarily 0x080.
+        node.sync_config_from_od();
         // A hard invariant, not a debug-only check: colliding COB-IDs make the
         // dispatcher steal frames from the default server (extras are matched
         // first) or answer on the wrong COB-ID. The config is fixed at build
@@ -205,6 +236,15 @@ impl<
             node.sdo_cob_ids_are_unique(),
             "SDO server COB-IDs collide with another configured \
              CANopen service or are zero (for node id {})",
+            config.node_id.raw()
+        );
+        // Same class of invariant, same fail-fast reasoning: SYNC is
+        // dispatched before every service below it, so a collision here would
+        // silently mute a PDO, a heartbeat consumer or LSS.
+        assert!(
+            node.sync_cob_id_is_unique(),
+            "the SYNC COB-ID (OD 0x1005) collides with another configured \
+             CANopen service on this node (node id {})",
             config.node_id.raw()
         );
         node
@@ -232,7 +272,10 @@ impl<
         };
         let fixed = [
             CobId::nmt().raw(),
-            CobId::sync().raw(),
+            // The configured SYNC COB-ID (0x080 by default); 0 when the OD
+            // describes no usable SYNC object, which claims nothing because
+            // the rx/tx != 0 check above already ran.
+            self.sync.cob_id().unwrap_or(0),
             CobId::emergency(self.node_id).raw(),
             def_rx,
             def_tx,
@@ -275,6 +318,94 @@ impl<
             }
         }
         true
+    }
+
+    /// COB-IDs this node's non-SDO services occupy, for the SYNC relocation
+    /// guard. Parked (disabled) PDOs are included: a COB-ID that is merely
+    /// unused today can be enabled later without being rewritten.
+    ///
+    /// The bool is false when the list overflowed [`RESERVED_COB_IDS`] and the
+    /// remaining COB-IDs are therefore unknown.
+    fn reserved_cob_ids(&self) -> (Vec<u16, RESERVED_COB_IDS>, bool) {
+        let fixed = [
+            CobId::emergency(self.node_id).raw(),
+            CobId::heartbeat(self.node_id).raw(),
+            crate::lss::LSS_REQUEST_COB,
+            crate::lss::LSS_RESPONSE_COB,
+        ];
+        let pdos = (0..TPDO)
+            .filter_map(|slot| self.tpdo.config_slot(slot).map(|c| c.cob_id))
+            .chain((0..RPDO).filter_map(|slot| self.rpdo.config_slot(slot).map(|c| c.cob_id)));
+        let monitored = self
+            .hb_monitors
+            .iter()
+            .flatten()
+            .map(|m| CobId::heartbeat(m.node_id()).raw());
+
+        let mut out = Vec::new();
+        let mut complete = true;
+        for cob in fixed.into_iter().chain(pdos).chain(monitored) {
+            if cob != 0 && !out.contains(&cob) && out.push(cob).is_err() {
+                complete = false;
+            }
+        }
+        (out, complete)
+    }
+
+    /// The configured SYNC COB-ID must not be one another CANopen service on
+    /// this node already uses.
+    ///
+    /// [`dispatch_frame`](Self::dispatch_frame) matches SYNC ahead of
+    /// everything but the SDO channels and returns unconditionally, so a
+    /// collision silently mutes the other service. Enforced by an assert in
+    /// [`Node::new`] for the static config; the runtime half is the SDO
+    /// server's 0x1005 download validation, which checks the same list.
+    fn sync_cob_id_is_unique(&self) -> bool {
+        let Some(sync) = self.sync.cob_id() else {
+            return true; // no SYNC object, nothing to collide with
+        };
+        let sdo_cobs = SdoCobIds {
+            default_rx: CobId::sdo_rx(self.node_id).raw(),
+            default_tx: CobId::sdo_tx(self.node_id).raw(),
+            extra_rx: &self.extra_sdo_rx,
+            extra_tx: &self.extra_sdo_tx,
+        };
+        if sync == CobId::nmt().raw() || sdo_cobs.claims(sync) {
+            return false;
+        }
+        // Built directly here rather than via `reserved_cob_ids`: at
+        // construction there is no capacity limit to work around, so the check
+        // is exact however many PDOs the node declares.
+        if sync == CobId::emergency(self.node_id).raw()
+            || sync == CobId::heartbeat(self.node_id).raw()
+            || sync == crate::lss::LSS_REQUEST_COB
+            || sync == crate::lss::LSS_RESPONSE_COB
+        {
+            return false;
+        }
+        for slot in 0..TPDO {
+            if self
+                .tpdo
+                .config_slot(slot)
+                .is_some_and(|c| c.cob_id == sync)
+            {
+                return false;
+            }
+        }
+        for slot in 0..RPDO {
+            if self
+                .rpdo
+                .config_slot(slot)
+                .is_some_and(|c| c.cob_id == sync)
+            {
+                return false;
+            }
+        }
+        !self
+            .hb_monitors
+            .iter()
+            .flatten()
+            .any(|m| CobId::heartbeat(m.node_id()).raw() == sync)
     }
 
     /// Re-read heartbeat configuration from the OD: producer heartbeat time
@@ -326,6 +457,108 @@ impl<
     /// Current producer heartbeat interval in ms (0 = disabled).
     pub fn heartbeat_interval_ms(&self) -> u16 {
         self.heartbeat.interval_ms()
+    }
+
+    /// Re-read the SYNC objects from the OD: 0x1005 (COB-ID SYNC message),
+    /// 0x1006 (communication cycle period, µs), 0x1007 (synchronous window
+    /// length, µs) and 0x1019 (synchronous counter overflow value). Called at
+    /// init, after SDO writes to those entries, and on reset — the same live
+    /// wiring 0x1017 gets.
+    ///
+    /// An OD that declares none of them keeps the CiA 301 defaults: consume
+    /// SYNC on 0x080, produce none. Declaring 0x1006 alone does *not* start
+    /// production — CiA 301 gates that on 0x1005 bit 30, so a node can be told
+    /// the cycle period (to size its own timing) without becoming the master.
+    /// Invalid or unsupported static 0x1005 values and invalid static 0x1019
+    /// values are programming errors and panic, matching the hard COB-ID
+    /// invariants checked by [`Node::new`]. SDO writes are aborted before they
+    /// can place such values in the OD.
+    fn sync_config_from_od(&mut self) {
+        let mut buf4 = [0u8; 4];
+
+        let sync_obj = if self.od.read(0x1005, 0, &mut buf4).is_ok() {
+            let raw = u32::from_le_bytes(buf4);
+            assert!(
+                crate::sync::is_supported_sync_cob_id(raw),
+                "OD 0x1005 contains an invalid or unsupported SYNC COB-ID value ({raw:#010X})"
+            );
+            // Checked above; keep the decoder fallible for callers that parse
+            // untrusted values outside Node construction.
+            SyncCobId::from_raw(raw)
+        } else {
+            Some(SyncCobId::DEFAULT)
+        };
+        // The configured value was checked above; only a missing object takes
+        // the default path.
+        let (cob_id, produce) = match sync_obj {
+            Some(s) => (s.cob_id, s.produce),
+            None => unreachable!(),
+        };
+        self.sync.set_cob_id(cob_id);
+
+        let period_us = if self.od.read(0x1006, 0, &mut buf4).is_ok() {
+            u32::from_le_bytes(buf4) as u64
+        } else {
+            0
+        };
+        let window_us = if self.od.read(0x1007, 0, &mut buf4).is_ok() {
+            u32::from_le_bytes(buf4) as u64
+        } else {
+            0
+        };
+        self.sync_window.configure(window_us);
+        let mut buf1 = [0u8; 1];
+        let overflow = if self.od.read(0x1019, 0, &mut buf1).is_ok() {
+            buf1[0]
+        } else {
+            0
+        };
+        assert!(
+            crate::sync::is_valid_sync_counter_overflow(overflow),
+            "OD 0x1019 contains an invalid SYNC counter overflow value ({overflow})"
+        );
+        self.sync_producer
+            .configure(if produce { cob_id } else { 0 }, period_us, overflow);
+    }
+
+    /// Re-initialise everything SYNC-related that a CANopen reset touches:
+    /// the configuration (0x1005/0x1006/0x1007/0x1019) and the runtime state
+    /// built on top of it.
+    ///
+    /// The runtime reset is separate from `sync_config_from_od` on purpose.
+    /// Reconfiguration deliberately preserves the cycle phase and counters
+    /// when the OD values did not change, so an unrelated SDO write cannot
+    /// shift the SYNC phase — but a reset re-initialises communication
+    /// objects, so the phase, the counters and any PDO data still waiting for
+    /// a pulse must not survive it.
+    fn reset_sync_state(&mut self) {
+        self.sync_config_from_od();
+        self.sync.reset();
+        self.sync_producer.reset();
+        self.sync_window.reset();
+        self.pending_sync_tpdo.clear();
+        self.sync_tpdo_last_attempt_us = None;
+        self.rpdo.discard_pending();
+        self.tpdo.reset_sync_state();
+    }
+
+    /// COB-ID this node consumes SYNC on (OD 0x1005). A missing object uses
+    /// 0x080; construction rejects invalid or unsupported declared values.
+    /// The `Option` mirrors [`SyncConsumer::cob_id`](crate::sync::SyncConsumer::cob_id).
+    pub fn sync_cob_id(&self) -> Option<u16> {
+        self.sync.cob_id()
+    }
+
+    /// SYNC production period in µs (OD 0x1006), or 0 when this node is not
+    /// the SYNC producer.
+    pub fn sync_period_us(&self) -> u64 {
+        self.sync_producer.interval_us()
+    }
+
+    /// OD 0x1007 synchronous window length in µs. Zero means no window
+    /// limit. A missing object has the same zero default.
+    pub fn sync_window_us(&self) -> u64 {
+        self.sync_window.length_us()
     }
 
     /// Mirror the resolved PDO COB-IDs into the OD comm-param entries.
@@ -550,6 +783,7 @@ impl<
         self.abort_all_sdo_transfers();
         self.sync_pdo_from_od();
         self.sync_heartbeat_from_od(false);
+        self.reset_sync_state();
         match reset_type {
             ResetType::Application => {
                 self.nmt = NmtHandler::new();
@@ -620,6 +854,13 @@ impl<
             }
         }
 
+        // Latch application events for synchronous acyclic TPDOs before any
+        // SYNC in this cycle is consumed. `dirty_set` is cleared at the end of
+        // every cycle, but the SYNC that should carry an event is usually in a
+        // later one — without the latch the trigger would only ever survive
+        // when the change and the pulse landed in the same call.
+        self.tpdo.latch_sync_events(&self.dirty_set);
+
         // Drain incoming frames
         loop {
             match transport.receive() {
@@ -659,6 +900,33 @@ impl<
             }
         }
 
+        // SYNC production (OD 0x1005 bit 30 + 0x1006). A producing node also
+        // applies the pulse to itself: the transports here do not loop TX back
+        // to RX, so waiting to receive our own SYNC would mean never seeing
+        // one. Stopped takes no part in bus traffic beyond NMT and error
+        // control, so no SYNC is generated there.
+        // The local pulse is applied only once the transport has accepted the
+        // frame. Dropping it silently — as the heartbeat and PDO paths do —
+        // would be worse here than a missing frame: the bus would never see
+        // the pulse while this node committed its synchronous RPDOs and
+        // advanced its TPDO cycle, leaving the two disagreeing about which
+        // pulse is which. On refusal the producer keeps the pulse and offers
+        // it again next cycle.
+        if self.booted && self.nmt.state() != NmtState::Stopped {
+            if let Some(sync_frame) = self.sync_producer.poll(now) {
+                if transport.transmit(&sync_frame).is_ok() {
+                    self.sync_producer.confirm_sent(now);
+                    self.handle_sync(transport, now);
+                }
+            }
+        }
+
+        // A synchronous TPDO refused by a full transport remains eligible
+        // only inside OD 0x1007's window. The pulse path already made one
+        // attempt at `now`, so this is a no-op in that same call and becomes a
+        // retry on a later processing tick.
+        self.retry_pending_sync_tpdo(transport, now);
+
         // RPDO deadline monitoring (CiA 301 event timer, comm param sub 5).
         // Only meaningful in Operational — outside it, PDO traffic
         // legitimately stops, so the monitoring state is discarded and
@@ -679,6 +947,15 @@ impl<
             }
         } else {
             self.rpdo.reset_deadline_monitoring();
+            // PDO data that never reached a SYNC must not act after the node
+            // has stopped processing PDOs: buffered RPDO frames would land in
+            // the OD, and a latched type-0 trigger would fire a TPDO, on the
+            // first pulse after returning to Operational.
+            self.rpdo.discard_pending();
+            self.tpdo.discard_sync_events();
+            self.sync_window.reset();
+            self.pending_sync_tpdo.clear();
+            self.sync_tpdo_last_attempt_us = None;
         }
 
         // Heartbeat production
@@ -836,8 +1113,10 @@ impl<
             .min(MAX_HEARTBEAT_MONITORS as u8);
 
         // The COB-ID plan every server validates config downloads against, so a
-        // client cannot park a PDO or a heartbeat producer on an SDO channel
-        // (`Node::new` enforces the same invariant for the static config).
+        // client cannot park a PDO or a heartbeat producer on an SDO channel,
+        // nor move SYNC onto any other service
+        // (`Node::new` enforces the same invariants for the static config).
+        let (reserved, reserved_complete) = self.reserved_cob_ids();
         let ctx = SdoContext {
             nmt_state: state,
             now_us: now,
@@ -848,6 +1127,11 @@ impl<
                 extra_rx: &self.extra_sdo_rx,
                 extra_tx: &self.extra_sdo_tx,
             },
+            reserved_cob_ids: ReservedCobIds {
+                ids: &reserved,
+                truncated: !reserved_complete,
+            },
+            sync_cob_id: self.sync.cob_id().unwrap_or(0),
         };
 
         // Disjoint field borrows: the selected server plus `self.od` /
@@ -892,6 +1176,87 @@ impl<
             if index == 0x1016 || index == 0x1017 {
                 self.sync_heartbeat_from_od(true);
             }
+            if index == 0x1005 || index == 0x1006 || index == 0x1007 || index == 0x1019 {
+                self.sync_config_from_od();
+            }
+        }
+    }
+
+    /// Retry synchronous TPDOs which the transport refused on the pulse.
+    ///
+    /// The generic `embedded_can::nb::Can` boundary can tell us a frame was
+    /// refused, but has no operation for recalling a frame after the driver
+    /// accepted it. We therefore enforce 0x1007 on every stack-owned pending
+    /// frame; transports should keep accepted synchronous traffic prompt (as
+    /// CAN priority normally does) because the stack cannot cancel their
+    /// private hardware queue after the window closes.
+    fn retry_pending_sync_tpdo(
+        &mut self,
+        transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
+        now: u64,
+    ) {
+        if self.pending_sync_tpdo.is_empty() {
+            return;
+        }
+        if self.nmt.state() != NmtState::Operational || !self.sync_window.allows_transmit(now) {
+            self.pending_sync_tpdo.clear();
+            self.sync_tpdo_last_attempt_us = None;
+            return;
+        }
+        if self.sync_tpdo_last_attempt_us == Some(now) {
+            return;
+        }
+        self.sync_tpdo_last_attempt_us = Some(now);
+
+        let mut refused = Vec::<CanFrame, TPDO>::new();
+        for frame in &self.pending_sync_tpdo {
+            if transport.transmit(frame).is_err() {
+                let _ = refused.push(*frame);
+            }
+        }
+        self.pending_sync_tpdo = refused;
+        if self.pending_sync_tpdo.is_empty() {
+            self.sync_tpdo_last_attempt_us = None;
+        }
+    }
+
+    /// One SYNC pulse: commit buffered synchronous RPDOs, then sample and send
+    /// synchronous TPDOs.
+    ///
+    /// The order is the point of SYNC. Setpoints received since the last pulse
+    /// land in the OD first, as one coherent update, so a TPDO sampled in the
+    /// same pulse reports the post-SYNC state rather than a mix of both sides.
+    ///
+    /// Gated on Operational: PDOs do not flow in any other NMT state, and
+    /// `process()` discards buffered RPDO data on the way out of it.
+    fn handle_sync(
+        &mut self,
+        transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
+        now: u64,
+    ) {
+        if self.nmt.state() != NmtState::Operational {
+            return;
+        }
+
+        // A new pulse supersedes any TPDO the previous cycle never placed in
+        // the transport. Open the new 0x1007 window before making this pulse's
+        // transmit attempts.
+        self.pending_sync_tpdo.clear();
+        self.sync_window.open(now);
+        self.sync_tpdo_last_attempt_us = Some(now);
+
+        let dropped = self.rpdo.on_sync(&mut self.od, &mut self.event_queue);
+        self.event_overflow_count = self.event_overflow_count.saturating_add(dropped);
+
+        let mut out = Vec::<CanFrame, TPDO>::new();
+        self.tpdo.on_sync(&self.od, &mut out);
+        for f in &out {
+            if transport.transmit(f).is_err() {
+                let _ = self.pending_sync_tpdo.push(*f);
+            }
+        }
+        if self.pending_sync_tpdo.is_empty() {
+            self.sync_tpdo_last_attempt_us = None;
         }
     }
 
@@ -924,6 +1289,17 @@ impl<
             }
         }
 
+        // SYNC, on the OD 0x1005 COB-ID — configurable, so it cannot be left
+        // to the pre-defined-connection-set parse below. The COB-ID is
+        // node-owned: a frame on it is never offered to another service, even
+        // when it is malformed (DLC > 1) and `process` rejects it.
+        if self.sync.cob_id() == Some(frame.raw_id()) {
+            if self.sync.process(frame).is_some() {
+                self.handle_sync(transport, now);
+            }
+            return;
+        }
+
         match cob.parse() {
             ParsedCobId::Nmt => {
                 if frame.raw_dlc() >= 2 {
@@ -939,6 +1315,7 @@ impl<
                                 self.abort_all_sdo_transfers();
                                 self.sync_pdo_from_od();
                                 self.sync_heartbeat_from_od(false);
+                                self.reset_sync_state();
                             }
                             NmtTransition::ResetCommunication => {
                                 // Reset only communication parameters (PDO, heartbeat).
@@ -947,6 +1324,7 @@ impl<
                                 self.abort_all_sdo_transfers();
                                 self.sync_pdo_from_od();
                                 self.sync_heartbeat_from_od(false);
+                                self.reset_sync_state();
                             }
                             _ => {}
                         }
@@ -958,16 +1336,10 @@ impl<
                 self.handle_sdo_request(SdoServerSel::Default, frame, transport, now);
             }
 
-            ParsedCobId::Sync => {
-                if self.nmt.state() == NmtState::Operational {
-                    let mut out = Vec::<CanFrame, TPDO>::new();
-                    self.tpdo.on_sync(&self.od, &mut out);
-                    for f in &out {
-                        let _ = transport.transmit(f);
-                    }
-                }
-            }
-
+            // No `ParsedCobId::Sync` arm: SYNC is matched by COB-ID above. A
+            // frame on 0x080 only reaches here when 0x1005 moved SYNC
+            // elsewhere (or disabled it), and 0x080 is then just another
+            // COB-ID — so it falls through to the RPDO engine like any other.
             ParsedCobId::Rpdo { .. } | ParsedCobId::Tpdo { .. } => {
                 // For RPDO: we receive on RPDO COB-IDs (which are the remote's TPDO)
                 // The RPDO engine matches on COB-ID, so just feed it the frame
@@ -2773,5 +3145,735 @@ mod tests {
                 "timeout fired from pre-reset monitor state"
             );
         }
+    }
+
+    // ---- SYNC (0x1005 / 0x1006 / 0x1007 / 0x1019) ----
+
+    /// Sets a slot's transmission type in the engine, as an SDO write to the
+    /// comm parameter would.
+    fn set_rpdo_tx_type(node: &mut Node<EventTestOd, 1, 1>, tt: u8) {
+        node.rpdo_engine_mut()
+            .config_mut(PdoNumber::of::<1>())
+            .unwrap()
+            .transmission_type = tt;
+    }
+
+    fn set_tpdo_tx_type(node: &mut Node<EventTestOd, 1, 1>, tt: u8) {
+        node.tpdo_engine_mut()
+            .config_mut(PdoNumber::of::<1>())
+            .unwrap()
+            .transmission_type = tt;
+    }
+
+    fn sync_frame() -> CanFrame {
+        CanFrame::new(0x080, &[]).unwrap()
+    }
+
+    /// Drain the transmit mailbox, returning the frames on `cob_id`.
+    fn drain_frames_with_id<const TX: usize, const RX: usize>(
+        transport: &MailboxTransport<TX, RX>,
+        cob_id: u16,
+    ) -> heapless::Vec<CanFrame, 8> {
+        let mut found = heapless::Vec::new();
+        while let Some(f) = transport.next_to_transmit() {
+            if f.raw_id() == cob_id {
+                let _ = found.push(f);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn synchronous_rpdo_reaches_the_od_only_on_sync() {
+        let (mut node, mut transport) = make_event_node();
+        set_rpdo_tx_type(&mut node, crate::pdo::engine::SYNC_CYCLIC_1);
+
+        transport
+            .store_received(CanFrame::new(0x201, &[0xAA, 0xBB]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(1000));
+        assert_eq!(node.od().output1, 0, "committed before the SYNC");
+        assert!(node.next_event().is_none(), "event fired before the commit");
+
+        transport.store_received(sync_frame()).unwrap();
+        node.process(&mut transport, &TestClock(2000));
+        assert_eq!(node.od().output1, 0xAA);
+        assert_eq!(node.od().output2, 0xBB);
+        assert_eq!(node.next_event().unwrap().source, OdEventSource::Rpdo);
+    }
+
+    #[test]
+    fn sync_tpdo_samples_after_the_rpdo_commit() {
+        // A TPDO mapping the same entry an RPDO writes must report the
+        // post-SYNC value: buffered setpoints commit before TPDOs sample.
+        let (mut node, mut transport) = make_event_node();
+        set_rpdo_tx_type(&mut node, crate::pdo::engine::SYNC_CYCLIC_1);
+        set_tpdo_tx_type(&mut node, crate::pdo::engine::SYNC_CYCLIC_1);
+        {
+            let tpdo = node
+                .tpdo_engine_mut()
+                .config_mut(PdoNumber::of::<1>())
+                .unwrap();
+            tpdo.mappings.clear();
+            tpdo.mappings
+                .push(PdoMapping {
+                    index: 0x6200,
+                    subindex: 1,
+                    bit_length: 8,
+                })
+                .unwrap();
+        }
+
+        transport
+            .store_received(CanFrame::new(0x201, &[0x77, 0x00]).unwrap())
+            .unwrap();
+        transport.store_received(sync_frame()).unwrap();
+        node.process(&mut transport, &TestClock(1000));
+
+        let tpdos = drain_frames_with_id(&transport, 0x181);
+        assert_eq!(tpdos.len(), 1);
+        assert_eq!(tpdos[0].data(), &[0x77]);
+    }
+
+    #[test]
+    fn leaving_operational_discards_buffered_rpdo() {
+        let (mut node, mut transport) = make_event_node();
+        set_rpdo_tx_type(&mut node, crate::pdo::engine::SYNC_CYCLIC_1);
+
+        transport
+            .store_received(CanFrame::new(0x201, &[0xAA, 0xBB]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(1000));
+
+        // NMT Enter Pre-Operational, then back to Operational.
+        transport
+            .store_received(CanFrame::new(0x000, &[0x80, 0x01]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(2000));
+        assert_eq!(node.state(), NmtState::PreOperational);
+        transport
+            .store_received(CanFrame::new(0x000, &[0x01, 0x01]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(3000));
+        assert_eq!(node.state(), NmtState::Operational);
+
+        // The pre-Pre-Op frame must not surface now.
+        transport.store_received(sync_frame()).unwrap();
+        node.process(&mut transport, &TestClock(4000));
+        assert_eq!(node.od().output1, 0);
+    }
+
+    // An OD that declares the SYNC objects, so
+    // 0x1005/0x1006/0x1007/0x1019 are live.
+    #[derive(Clone)]
+    struct SyncOd {
+        device_type: u32,
+        sync_cob_id: u32,
+        cycle_period_us: u32,
+        sync_window_us: u32,
+        counter_overflow: u8,
+    }
+
+    static SYNC_OD_META: &[OdEntryMeta] = &[
+        OdEntryMeta {
+            index: 0x1000,
+            subindex: 0,
+            data_type: DataType::U32,
+            access: AccessType::Ro,
+            pdo_mappable: false,
+            name: "device_type",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x1005,
+            subindex: 0,
+            data_type: DataType::U32,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "cob_id_sync",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x1006,
+            subindex: 0,
+            data_type: DataType::U32,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "communication_cycle_period",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x1007,
+            subindex: 0,
+            data_type: DataType::U32,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "synchronous_window_length",
+            max_size: None,
+        },
+        OdEntryMeta {
+            index: 0x1019,
+            subindex: 0,
+            data_type: DataType::U8,
+            access: AccessType::Rw,
+            pdo_mappable: false,
+            name: "sync_counter_overflow",
+            max_size: None,
+        },
+    ];
+
+    impl ObjectDictionary for SyncOd {
+        fn lookup(&self, index: u16, subindex: u8) -> Option<&'static OdEntryMeta> {
+            SYNC_OD_META
+                .iter()
+                .find(|e| e.index == index && e.subindex == subindex)
+        }
+        fn read(&self, index: u16, subindex: u8, buf: &mut [u8]) -> Result<usize, OdError> {
+            match (index, subindex) {
+                (0x1000, 0) => {
+                    buf[..4].copy_from_slice(&self.device_type.to_le_bytes());
+                    Ok(4)
+                }
+                (0x1005, 0) => {
+                    buf[..4].copy_from_slice(&self.sync_cob_id.to_le_bytes());
+                    Ok(4)
+                }
+                (0x1006, 0) => {
+                    buf[..4].copy_from_slice(&self.cycle_period_us.to_le_bytes());
+                    Ok(4)
+                }
+                (0x1007, 0) => {
+                    buf[..4].copy_from_slice(&self.sync_window_us.to_le_bytes());
+                    Ok(4)
+                }
+                (0x1019, 0) => {
+                    buf[0] = self.counter_overflow;
+                    Ok(1)
+                }
+                _ => Err(OdError::NotFound),
+            }
+        }
+        fn write(&mut self, index: u16, subindex: u8, data: &[u8]) -> Result<(), OdError> {
+            match (index, subindex) {
+                (0x1005, 0) => {
+                    self.sync_cob_id = u32::from_le_bytes(data.try_into().unwrap());
+                    Ok(())
+                }
+                (0x1006, 0) => {
+                    self.cycle_period_us = u32::from_le_bytes(data.try_into().unwrap());
+                    Ok(())
+                }
+                (0x1007, 0) => {
+                    self.sync_window_us = u32::from_le_bytes(data.try_into().unwrap());
+                    Ok(())
+                }
+                (0x1019, 0) => {
+                    self.counter_overflow = data[0];
+                    Ok(())
+                }
+                _ => Err(OdError::ReadOnly),
+            }
+        }
+        fn sub_count(&self, _: u16) -> Option<u8> {
+            Some(0)
+        }
+    }
+
+    fn make_sync_node(od: SyncOd) -> (Node<SyncOd, 0, 0>, MailboxTransport<32, 32>) {
+        let config = NodeConfig::<0, 0> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            auto_start: true,
+            tpdo: [],
+            rpdo: [],
+            sdo_servers: [],
+            identity: LssIdentity::default(),
+        };
+        let mut node: Node<SyncOd, 0, 0> = Node::new(config, od);
+        let mut transport = MailboxTransport::<32, 32>::new();
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+        (node, transport)
+    }
+
+    fn sync_od(sync_cob_id: u32, cycle_period_us: u32, counter_overflow: u8) -> SyncOd {
+        SyncOd {
+            device_type: 0x191,
+            sync_cob_id,
+            cycle_period_us,
+            sync_window_us: 0,
+            counter_overflow,
+        }
+    }
+
+    fn sync_od_with_window(window_us: u32) -> SyncOd {
+        SyncOd {
+            sync_window_us: window_us,
+            ..sync_od(0x080, 0, 0)
+        }
+    }
+
+    #[test]
+    fn sync_cob_id_defaults_and_follows_1005() {
+        let (node, _) = make_sync_node(sync_od(0x080, 0, 0));
+        assert_eq!(node.sync_cob_id(), Some(0x080));
+        assert_eq!(node.sync_period_us(), 0, "consumer only without bit 30");
+        assert_eq!(node.sync_window_us(), 0, "missing/zero 0x1007 is unlimited");
+
+        let (node, _) = make_sync_node(sync_od(0x123, 0, 0));
+        assert_eq!(node.sync_cob_id(), Some(0x123));
+    }
+
+    #[test]
+    #[should_panic(expected = "OD 0x1005 contains an invalid or unsupported")]
+    fn node_new_rejects_an_invalid_static_sync_cob_id() {
+        // Static OD defaults obey the same rule as SDO downloads: COB-ID 0
+        // would claim NMT and is never a disabled-SYNC encoding.
+        let _ = make_sync_node(sync_od(0, 0, 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "OD 0x1019 contains an invalid")]
+    fn node_new_rejects_an_invalid_static_sync_counter_overflow() {
+        let _ = make_sync_node(sync_od(0x080, 0, 241));
+    }
+
+    #[test]
+    fn sdo_write_to_1005_relocates_the_consumer() {
+        let (mut node, mut transport) = make_sync_node(sync_od(0x080, 0, 0));
+
+        // Expedited 4-byte download of 0x123 to 0x1005:00.
+        transport
+            .store_received(
+                CanFrame::new(0x601, &[0x23, 0x05, 0x10, 0x00, 0x23, 0x01, 0x00, 0x00]).unwrap(),
+            )
+            .unwrap();
+        node.process(&mut transport, &TestClock(1000));
+
+        assert_eq!(node.sync_cob_id(), Some(0x123));
+    }
+
+    #[test]
+    fn sdo_write_to_1007_updates_the_synchronous_window() {
+        let (mut node, mut transport) = make_sync_node(sync_od(0x080, 0, 0));
+
+        // Expedited 4-byte download of 750 µs to 0x1007:00.
+        transport
+            .store_received(
+                CanFrame::new(0x601, &[0x23, 0x07, 0x10, 0x00, 0xEE, 0x02, 0x00, 0x00]).unwrap(),
+            )
+            .unwrap();
+        node.process(&mut transport, &TestClock(1_000));
+
+        let response = transport.next_to_transmit().expect("SDO response");
+        assert_eq!(response.data()[0], 0x60);
+        assert_eq!(node.sync_window_us(), 750);
+    }
+
+    #[test]
+    fn sdo_write_to_1005_rejects_unsupported_and_colliding_ids() {
+        for value in [
+            crate::sync::SYNC_FRAME_29BIT | 0x080, // 29-bit SYNC: not implemented
+            0x8000_0000,                           // reserved bit 31
+            0x0000_0000,                           // COB-ID 0 is NMT
+            0x0000_0601,                           // this node's SDO request ID
+        ] {
+            let (mut node, mut transport) = make_sync_node(sync_od(0x080, 0, 0));
+            let mut req = [0x23u8, 0x05, 0x10, 0x00, 0, 0, 0, 0];
+            req[4..].copy_from_slice(&value.to_le_bytes());
+            transport
+                .store_received(CanFrame::new(0x601, &req).unwrap())
+                .unwrap();
+            node.process(&mut transport, &TestClock(1000));
+
+            let resp = transport.next_to_transmit().expect("SDO response");
+            assert_eq!(resp.data()[0], 0x80, "expected abort for {value:#010X}");
+            assert_eq!(
+                node.sync_cob_id(),
+                Some(0x080),
+                "SYNC moved despite the abort for {value:#010X}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_producer_runs_on_the_communication_cycle_period() {
+        // 0x1005 bit 30 set + 0x1006 = 10 ms.
+        let (mut node, mut transport) =
+            make_sync_node(sync_od(crate::sync::SYNC_GEN | 0x080, 10_000, 0));
+        assert_eq!(node.sync_period_us(), 10_000);
+
+        // The boot process() call armed the producer; nothing is due yet.
+        node.process(&mut transport, &TestClock(9_000));
+        assert!(drain_frames_with_id(&transport, 0x080).is_empty());
+
+        node.process(&mut transport, &TestClock(10_000));
+        let syncs = drain_frames_with_id(&transport, 0x080);
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0].raw_dlc(), 0, "no counter byte without 0x1019");
+    }
+
+    #[test]
+    fn sync_producer_emits_counter_when_1019_is_set() {
+        let (mut node, mut transport) =
+            make_sync_node(sync_od(crate::sync::SYNC_GEN | 0x080, 10_000, 2));
+
+        node.process(&mut transport, &TestClock(10_000));
+        node.process(&mut transport, &TestClock(20_000));
+        node.process(&mut transport, &TestClock(30_000));
+
+        let syncs = drain_frames_with_id(&transport, 0x080);
+        assert_eq!(syncs.len(), 3);
+        let counters: heapless::Vec<u8, 8> = syncs.iter().map(|f| f.data()[0]).collect();
+        assert_eq!(counters.as_slice(), &[1, 2, 1]);
+    }
+
+    #[test]
+    fn sync_acyclic_tpdo_fires_on_a_later_pulse() {
+        // The dirty set is cleared at the end of every process() call, so a
+        // type-0 trigger has to be latched: an application event and the SYNC
+        // that carries it are almost never in the same cycle.
+        let (mut node, mut transport) = make_event_node();
+        set_tpdo_tx_type(&mut node, crate::pdo::engine::SYNC_ACYCLIC);
+
+        // Cycle 1: application event, no SYNC.
+        node.notify_changed(0x6000, 1);
+        node.process(&mut transport, &TestClock(1000));
+        assert!(drain_frames_with_id(&transport, 0x181).is_empty());
+
+        // Cycle 2: nothing dirty any more, still no SYNC.
+        node.process(&mut transport, &TestClock(2000));
+        assert!(drain_frames_with_id(&transport, 0x181).is_empty());
+
+        // Cycle 3: the pulse arrives and must carry the cycle-1 event.
+        transport.store_received(sync_frame()).unwrap();
+        node.process(&mut transport, &TestClock(3000));
+        assert_eq!(
+            drain_frames_with_id(&transport, 0x181).len(),
+            1,
+            "type-0 trigger lost between pulses"
+        );
+
+        // Acyclic: one transmission per event, so the next pulse is silent.
+        transport.store_received(sync_frame()).unwrap();
+        node.process(&mut transport, &TestClock(4000));
+        assert!(drain_frames_with_id(&transport, 0x181).is_empty());
+    }
+
+    #[test]
+    fn leaving_operational_discards_latched_sync_acyclic_trigger() {
+        let (mut node, mut transport) = make_event_node();
+        set_tpdo_tx_type(&mut node, crate::pdo::engine::SYNC_ACYCLIC);
+
+        node.notify_changed(0x6000, 1);
+        node.process(&mut transport, &TestClock(1000));
+
+        transport
+            .store_received(CanFrame::new(0x000, &[0x80, 0x01]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(2000));
+        transport
+            .store_received(CanFrame::new(0x000, &[0x01, 0x01]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(3000));
+        while transport.next_to_transmit().is_some() {}
+
+        transport.store_received(sync_frame()).unwrap();
+        node.process(&mut transport, &TestClock(4000));
+        assert!(drain_frames_with_id(&transport, 0x181).is_empty());
+    }
+
+    #[test]
+    fn no_sync_produced_without_the_generator_bit() {
+        // 0x1006 alone must not make the node the SYNC master.
+        let (mut node, mut transport) = make_sync_node(sync_od(0x080, 10_000, 0));
+        assert_eq!(node.sync_period_us(), 0);
+        node.process(&mut transport, &TestClock(50_000));
+        assert!(drain_frames_with_id(&transport, 0x080).is_empty());
+    }
+
+    fn make_window_tpdo_node(window_us: u32) -> Node<SyncOd, 1, 0> {
+        let config = NodeConfig::<1, 0> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            auto_start: true,
+            tpdo: [TpdoConfig {
+                od_number: 0,
+                cob_id: 0x181,
+                transmission_type: crate::pdo::engine::SYNC_CYCLIC_1,
+                inhibit_time_100us: 0,
+                event_timer_ms: 0,
+                mappings: heapless::Vec::new(),
+                enabled: true,
+            }],
+            rpdo: [],
+            sdo_servers: [],
+            identity: LssIdentity::default(),
+        };
+        Node::new(config, sync_od_with_window(window_us))
+    }
+
+    #[test]
+    fn refused_sync_tpdo_retries_inside_1007_window() {
+        let mut node = make_window_tpdo_node(500);
+        let mut transport = MailboxTransport::<1, 32>::new();
+
+        // Boot-up occupies the only TX slot. The pulse makes TPDO1 due, but
+        // the transport refuses it and Node retains it for this window.
+        node.process(&mut transport, &TestClock(0));
+        transport.store_received(sync_frame()).unwrap();
+        node.process(&mut transport, &TestClock(1_000));
+        let boot = transport.next_to_transmit().expect("boot-up frame");
+        assert_eq!(boot.raw_id(), 0x701);
+        assert!(transport.next_to_transmit().is_none());
+
+        // The boundary itself remains inside the window.
+        node.process(&mut transport, &TestClock(1_500));
+        let tpdo = transport.next_to_transmit().expect("retried TPDO");
+        assert_eq!(tpdo.raw_id(), 0x181);
+    }
+
+    #[test]
+    fn refused_sync_tpdo_is_discarded_after_1007_window() {
+        let mut node = make_window_tpdo_node(500);
+        let mut transport = MailboxTransport::<1, 32>::new();
+
+        node.process(&mut transport, &TestClock(0));
+        transport.store_received(sync_frame()).unwrap();
+        node.process(&mut transport, &TestClock(1_000));
+        let _ = transport.next_to_transmit().expect("boot-up frame");
+
+        node.process(&mut transport, &TestClock(1_501));
+        assert!(
+            transport.next_to_transmit().is_none(),
+            "stale synchronous TPDO escaped after the window"
+        );
+
+        // A fresh pulse opens a fresh window and schedules the next TPDO.
+        transport.store_received(sync_frame()).unwrap();
+        node.process(&mut transport, &TestClock(2_000));
+        let tpdo = transport.next_to_transmit().expect("fresh-cycle TPDO");
+        assert_eq!(tpdo.raw_id(), 0x181);
+    }
+
+    #[test]
+    fn nmt_reset_discards_a_refused_sync_tpdo_and_window_state() {
+        let mut node = make_window_tpdo_node(500);
+        let mut transport = MailboxTransport::<1, 32>::new();
+
+        node.process(&mut transport, &TestClock(0));
+        transport.store_received(sync_frame()).unwrap();
+        node.process(&mut transport, &TestClock(1_000));
+
+        // Reset Communication while the boot-up frame still keeps the TPDO
+        // pending. Reset must remove it rather than let it escape after reboot.
+        transport
+            .store_received(CanFrame::new(0x000, &[0x82, 0x01]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(1_100));
+        let _ = transport
+            .next_to_transmit()
+            .expect("original boot-up frame");
+
+        node.process(&mut transport, &TestClock(1_200));
+        let reboot = transport.next_to_transmit().expect("reset boot-up frame");
+        assert_eq!(reboot.raw_id(), 0x701);
+        node.process(&mut transport, &TestClock(1_300));
+        assert!(
+            transport.next_to_transmit().is_none(),
+            "pre-reset synchronous TPDO survived the communication reset"
+        );
+    }
+
+    /// A SYNC-aware node that also declares PDOs, so relocating SYNC has
+    /// something to collide with. Mappings are irrelevant here — only the
+    /// COB-IDs are.
+    fn make_sync_node_with_pdos(od: SyncOd) -> (Node<SyncOd, 1, 1>, MailboxTransport<32, 32>) {
+        let config = NodeConfig::<1, 1> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            auto_start: true,
+            tpdo: [TpdoConfig {
+                od_number: 0,
+                cob_id: 0x181,
+                transmission_type: 255,
+                inhibit_time_100us: 0,
+                event_timer_ms: 0,
+                mappings: heapless::Vec::new(),
+                enabled: true,
+            }],
+            rpdo: [RpdoConfig {
+                od_number: 0,
+                cob_id: 0x201,
+                transmission_type: 255,
+                deadline_ms: 0,
+                mappings: heapless::Vec::new(),
+                enabled: true,
+            }],
+            sdo_servers: [],
+            identity: LssIdentity::default(),
+        };
+        let mut node: Node<SyncOd, 1, 1> = Node::new(config, od);
+        let mut transport = MailboxTransport::<32, 32>::new();
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+        (node, transport)
+    }
+
+    #[test]
+    fn sdo_write_to_1005_rejects_ids_other_services_own() {
+        // SYNC is dispatched ahead of all of these, so relocating onto one
+        // would mute it outright rather than merely conflict.
+        for (value, what) in [
+            (0x0000_0201u32, "RPDO1"),
+            (0x0000_0181, "TPDO1"),
+            (0x0000_0081, "EMCY"),
+            (0x0000_0701, "own heartbeat"),
+            (0x0000_07E5, "LSS request"),
+            (0x0000_07E4, "LSS response"),
+            (0x0000_0601, "SDO request"),
+            (0x0000_0581, "SDO response"),
+        ] {
+            let (mut node, mut transport) = make_sync_node_with_pdos(sync_od(0x080, 0, 0));
+            let mut req = [0x23u8, 0x05, 0x10, 0x00, 0, 0, 0, 0];
+            req[4..].copy_from_slice(&value.to_le_bytes());
+            transport
+                .store_received(CanFrame::new(0x601, &req).unwrap())
+                .unwrap();
+            node.process(&mut transport, &TestClock(1000));
+
+            let resp = transport.next_to_transmit().expect("SDO response");
+            assert_eq!(resp.data()[0], 0x80, "expected abort for {what}");
+            assert_eq!(
+                u32::from_le_bytes(resp.data()[4..8].try_into().unwrap()),
+                0x0604_0043,
+                "wrong abort code for {what}"
+            );
+            assert_eq!(node.sync_cob_id(), Some(0x080), "SYNC moved onto {what}");
+        }
+    }
+
+    #[test]
+    fn sdo_write_to_1005_allows_a_free_cob_id() {
+        let (mut node, mut transport) = make_sync_node_with_pdos(sync_od(0x080, 0, 0));
+        transport
+            .store_received(
+                CanFrame::new(0x601, &[0x23, 0x05, 0x10, 0x00, 0x23, 0x01, 0x00, 0x00]).unwrap(),
+            )
+            .unwrap();
+        node.process(&mut transport, &TestClock(1000));
+
+        let resp = transport.next_to_transmit().expect("SDO response");
+        assert_eq!(resp.data()[0], 0x60, "download should be accepted");
+        assert_eq!(node.sync_cob_id(), Some(0x123));
+    }
+
+    #[test]
+    #[should_panic(expected = "SYNC COB-ID")]
+    fn node_new_rejects_a_sync_cob_id_that_collides_with_a_pdo() {
+        // The static half of the same invariant.
+        let _ = make_sync_node_with_pdos(sync_od(0x201, 0, 0));
+    }
+
+    #[test]
+    fn sdo_write_to_1019_enforces_the_counter_range() {
+        // CiA 301: 0 disables the counter, 2..=240 is the wrap value. 1 and
+        // anything above 240 are not legal.
+        for (value, accepted) in [
+            (0u8, true),
+            (1, false),
+            (2, true),
+            (240, true),
+            (241, false),
+        ] {
+            let (mut node, mut transport) = make_sync_node(sync_od(0x080, 0, 0));
+            transport
+                .store_received(
+                    CanFrame::new(0x601, &[0x2F, 0x19, 0x10, 0x00, value, 0, 0, 0]).unwrap(),
+                )
+                .unwrap();
+            node.process(&mut transport, &TestClock(1000));
+
+            let resp = transport.next_to_transmit().expect("SDO response");
+            if accepted {
+                assert_eq!(resp.data()[0], 0x60, "0x1019 = {value} should be accepted");
+            } else {
+                assert_eq!(resp.data()[0], 0x80, "0x1019 = {value} should abort");
+            }
+        }
+    }
+
+    #[test]
+    fn refused_sync_transmission_is_retried_without_advancing_the_counter() {
+        // A one-frame TX queue remains occupied by the boot-up frame, so each
+        // SYNC transmit attempt fails until the queue is drained. heapless
+        // queues deliberately do not support capacity zero.
+        let config = NodeConfig::<0, 0> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            auto_start: true,
+            tpdo: [],
+            rpdo: [],
+            sdo_servers: [],
+            identity: LssIdentity::default(),
+        };
+        let mut node: Node<SyncOd, 0, 0> =
+            Node::new(config, sync_od(crate::sync::SYNC_GEN | 0x080, 10_000, 3));
+        let mut transport = MailboxTransport::<1, 32>::new();
+
+        node.process(&mut transport, &TestClock(0)); // boot fills TX; producer arms
+        node.process(&mut transport, &TestClock(10_000)); // pulse due, refused
+        node.process(&mut transport, &TestClock(20_000)); // still refused
+
+        let boot = transport.next_to_transmit().expect("queued boot-up frame");
+        assert_eq!(boot.raw_id(), 0x701);
+        assert!(
+            transport.next_to_transmit().is_none(),
+            "SYNC was queued despite a full TX queue"
+        );
+
+        // With room again, the retained pulse goes out carrying counter 1.
+        node.process(&mut transport, &TestClock(30_000));
+        let syncs = drain_frames_with_id(&transport, 0x080);
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0].data(), &[1], "counter advanced on refused sends");
+    }
+
+    #[test]
+    fn nmt_reset_restarts_the_sync_producer_cycle() {
+        let (mut node, mut transport) =
+            make_sync_node(sync_od(crate::sync::SYNC_GEN | 0x080, 10_000, 3));
+
+        node.process(&mut transport, &TestClock(10_000));
+        node.process(&mut transport, &TestClock(20_000));
+        let before = drain_frames_with_id(&transport, 0x080);
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[1].data(), &[2]);
+
+        // Reset Communication re-initialises communication objects. The OD
+        // values are unchanged, so `configure` alone would keep the old phase
+        // and counter — the reset has to clear them explicitly.
+        transport
+            .store_received(CanFrame::new(0x000, &[0x82, 0x01]).unwrap())
+            .unwrap();
+        node.process(&mut transport, &TestClock(30_000));
+        while transport.next_to_transmit().is_some() {}
+
+        // The next process call performs the boot sequence and establishes
+        // the producer's new time base.
+        node.process(&mut transport, &TestClock(31_000));
+        while transport.next_to_transmit().is_some() {}
+
+        // Re-armed: no pulse until a full period after the reset...
+        node.process(&mut transport, &TestClock(40_999));
+        assert!(
+            drain_frames_with_id(&transport, 0x080).is_empty(),
+            "pulse fired before the post-reset cycle elapsed"
+        );
+        // ...and the counter starts over.
+        node.process(&mut transport, &TestClock(41_000));
+        let after = drain_frames_with_id(&transport, 0x080);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].data(), &[1], "counter carried across the reset");
     }
 }

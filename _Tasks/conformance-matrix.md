@@ -22,9 +22,8 @@ the missing/partial areas below should be tracked explicitly if the goal is
 Big gaps not fully captured by the current known-issues list:
 
 - CiA 301 mandatory/predefined communication objects are not tracked as a set.
-- SYNC support is split: TPDO sync has logic, RPDO sync buffering is known
-  missing, and SYNC producer/consumer objects are not integrated via OD 0x1005
-  / 0x1006 / 0x1007.
+- SYNC is integrated via OD 0x1005/0x1006/0x1007/0x1019 (consumer, producer,
+  synchronous window, RPDO buffer-until-SYNC).
 - TIME object/service is absent.
 - EMCY producer exists, but pre-defined error field 0x1003 and inhibit time
   0x1015 are absent or not integrated.
@@ -54,9 +53,10 @@ Big gaps not fully captured by the current known-issues list:
 | Mandatory object | 0x1017 Producer heartbeat time | Yes | OD value wins over `NodeConfig` at init; SDO writes change the runtime period, 0 disables; re-synced on reset. Unit + interop tests. |
 | Mandatory object | 0x1018 Identity object | User-provided | DSL/EDS can declare it; LSS identity is configured separately. |
 | Error history | 0x1003 Pre-defined error field | No | EMCY does not maintain 0x1003. |
-| SYNC config | 0x1005 COB-ID SYNC | No | No OD-integrated SYNC config. |
-| SYNC config | 0x1006 Communication cycle period | No | `SyncProducer` exists but not integrated. |
-| SYNC config | 0x1007 Synchronous window length | No | Not implemented. |
+| SYNC config | 0x1005 COB-ID SYNC | Yes | OD-integrated: COB-ID + generator bit 30, re-read on SDO write and reset; invalid static values fail construction, downloads validate reserved/unsupported values, and collision guards cover every node-owned service in either configuration order. Unit + interop tests. |
+| SYNC config | 0x1006 Communication cycle period | Yes | Drives `SyncProducer` when 0x1005 bit 30 is set. Unit + interop tests. |
+| SYNC config | 0x1007 Synchronous window length | Yes | Live OD value in µs; 0 disables the limit. Refused synchronous TPDOs retry through the inclusive window boundary, then are discarded; reset, leaving Operational, and the next pulse clear/supersede pending work. Unit + interop tests. The generic `embedded-can` trait cannot recall a frame already accepted into a driver's private hardware queue. |
+| SYNC config | 0x1019 Synchronous counter overflow | Yes | 0 = no counter byte, 2..=240 = counter wraps there; invalid static values fail construction and invalid downloads abort. Unit + interop tests. |
 | Guarding | 0x100C Guard time | No | Node guarding/life guarding absent. |
 | Guarding | 0x100D Life time factor | No | Node guarding/life guarding absent. |
 | TIME config | 0x1012 COB-ID TIME | No | TIME service absent. |
@@ -110,20 +110,20 @@ Big gaps not fully captured by the current known-issues list:
 | Event-driven TPDO | Yes | `OdGuard` dirty tracking, tests. |
 | TPDO event timer | Yes | Unit tests and examples. |
 | TPDO inhibit time | Partial | Implemented for event sends; needs spec edge-case audit. |
-| TPDO synchronous cyclic | Partial | `TpdoEngine::on_sync`; tests. |
-| TPDO synchronous acyclic | Partial | Code notes missing trigger mechanism. |
+| TPDO synchronous cyclic | Yes | `TpdoEngine::on_sync`; unit + interop tests. |
+| TPDO synchronous acyclic | Yes | Dirty-set application events are latched per TPDO until the next SYNC, then consumed once. Unit tests cover events several process cycles before the pulse. |
 | RPDO event-driven | Yes | Unit + interop tests. |
-| RPDO synchronous buffering | No | Known issue: sync-type RPDOs applied immediately. |
+| RPDO synchronous buffering | Yes | Frame parked per slot at reception, committed by `RpdoEngine::on_sync` before TPDOs sample; latest frame wins; discarded when leaving Operational. Unit + interop tests. |
 | RPDO deadline/event timer monitoring | Yes | Unit + interop tests. |
 | Dynamic PDO remapping in PreOperational | Partial | Mapping lock protocol exists; needs broader conformance tests. |
 | PDO config write rejected in Operational | Yes | Unit + interop tests. |
 | Extended PDO count >4 | Yes | Interop tests cover PDO5. |
 | RTR PDO transmission types 252/253 | No | DSL recognizes values, but behavior appears absent. |
 | MPDO | No | Not implemented. |
-| SYNC consumer dispatch | Partial | Node handles SYNC for TPDO; consumer object not integrated. |
-| SYNC producer | Partial | `SyncProducer` exists, not integrated into `Node`/OD. |
-| SYNC counter overflow/value rules | Unknown | Needs audit. |
-| Synchronous window length | No | Not implemented. |
+| SYNC consumer dispatch | Yes | Matched by the 0x1005 COB-ID before the pre-defined-set parse, so a relocated SYNC works; DLC > 1 rejected as malformed. |
+| SYNC producer | Yes | `SyncProducer` wired to 0x1005 bit 30 + 0x1006; transmit is two-phase, so refused pulses remain pending and local application occurs only after acceptance. Applies accepted pulses locally (transports do not loop back). Not generated in Stopped. |
+| SYNC counter overflow/value rules | Yes | Producer counts 1..=0x1019 then wraps; consumer accepts DLC 0 or 1 and synthesises a count when absent. |
+| Synchronous window length | Yes | OD 0x1007 bounds stack-owned synchronous TPDO retries; unit tests cover the inclusive boundary, expiry, and next-pulse reopening. |
 
 ## EMCY
 
@@ -230,8 +230,9 @@ bug-level backlog:
    producer.~~ Done 2026-07.
 3. Add 0x1003 pre-defined error field maintenance.
 4. Add EMCY COB-ID/inhibit-time support (0x1014/0x1015).
-5. Add SYNC OD integration (0x1005/0x1006/0x1007), including synchronous window.
-6. Implement synchronous RPDO buffering.
+5. ~~Add SYNC OD integration (0x1005/0x1006/0x1007/0x1019), including the
+   producer and synchronous window.~~ Done 2026-08.
+6. ~~Implement synchronous RPDO buffering.~~ Done 2026-08.
 7. Decide whether node guarding/life guarding is in scope; if not, document it
    as intentionally unsupported.
 8. Add TIME object/service or document as unsupported.

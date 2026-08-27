@@ -1,18 +1,18 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{self, CloseFrame, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use socketcan::SocketOptions;
 use socketcan::tokio::CanSocket;
-use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use canwsd_proto::filter::ClientCommand;
 use canwsd_proto::{CanFilter, NetworkInfo, NetworkStatus, ServerStatusRef, WireFrame, close_code};
 
+use crate::drop_buffer::{BufferEvent, DropBuffer};
 use crate::socketcan_wire::{can_frame_from_wire, wire_from_can_frame};
 
 /// Per-client receive buffer between the CAN socket and the WebSocket:
@@ -20,7 +20,7 @@ use crate::socketcan_wire::{can_frame_from_wire, wire_from_can_frame};
 /// It absorbs short WS delivery hiccups; if it fills anyway the whole buffer
 /// is cleared and the client is told how much it lost (ServerStatus::Overflow)
 /// — a client that far behind wants a fresh start, not a stale replay.
-const FRAME_BUFFER: usize = 16384;
+pub(crate) const FRAME_BUFFER: usize = 16384;
 /// CAN_RAW sockets accept at most this many kernel filters. The kernel filter
 /// is an optimization only — every failure path degrades to accept-all plus
 /// userspace filtering, never to over-filtering.
@@ -29,6 +29,9 @@ const MAX_KERNEL_FILTERS: usize = 512;
 /// no traffic) before the connection is considered half-open and dropped.
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A blocked socket write must not suspend keepalive and cleanup for the much
+/// longer operating-system TCP failure timeout.
+const WS_SEND_TIMEOUT: Duration = CLIENT_TIMEOUT;
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -115,69 +118,19 @@ pub fn open_client_socket(
     Ok((sock, userspace_filter))
 }
 
-struct RxState {
-    frames: VecDeque<WireFrame>,
-    /// Frames discarded by buffer clears since the last overflow report.
-    dropped: u64,
-    /// Set once by the reader when the CAN read fails; the reader exits after.
-    bus_error: Option<String>,
-}
-
-enum RxEvent {
-    Frame(WireFrame),
-    Overflow(u64),
-    BusError(String),
-}
-
-/// Wait for the next receive event. Overflow is reported before the frames
-/// that came after the clear; bus death is reported after everything that was
-/// buffered before it.
-async fn next_rx(state: &Mutex<RxState>, signal: &mut mpsc::Receiver<()>) -> RxEvent {
-    loop {
-        {
-            let mut s = state.lock().unwrap();
-            if s.dropped > 0 {
-                let n = s.dropped;
-                s.dropped = 0;
-                return RxEvent::Overflow(n);
-            }
-            if let Some(frame) = s.frames.pop_front() {
-                return RxEvent::Frame(frame);
-            }
-            if let Some(error) = s.bus_error.take() {
-                return RxEvent::BusError(error);
-            }
-        }
-        if signal.recv().await.is_none() {
-            // Reader gone without setting bus_error — only after abort, where
-            // nobody awaits us anymore. Report it anyway rather than spin.
-            return RxEvent::BusError("CAN reader task ended".into());
-        }
-    }
-}
-
 /// Drains the CAN socket into the buffer so the kernel-side queue (only
 /// ~200 frames at default rcvbuf) never fills while the WS is slow.
-async fn reader_task(sock: Arc<CanSocket>, state: Arc<Mutex<RxState>>, signal: mpsc::Sender<()>) {
+pub(crate) async fn reader_task(sock: Arc<CanSocket>, buffer: Arc<DropBuffer<WireFrame>>) {
     loop {
         match sock.read_frame().await {
             Ok(frame) => {
                 let Some(wf) = wire_from_can_frame(&frame) else {
                     continue;
                 };
-                {
-                    let mut s = state.lock().unwrap();
-                    if s.frames.len() >= FRAME_BUFFER {
-                        s.dropped += s.frames.len() as u64;
-                        s.frames.clear();
-                    }
-                    s.frames.push_back(wf);
-                }
-                let _ = signal.try_send(());
+                buffer.push(wf);
             }
             Err(e) => {
-                state.lock().unwrap().bus_error = Some(e.to_string());
-                let _ = signal.try_send(());
+                buffer.close(e.to_string());
                 return;
             }
         }
@@ -194,13 +147,8 @@ pub async fn run_client(
     log::info!("{log_name}: connected");
 
     let sock = Arc::new(sock);
-    let state = Arc::new(Mutex::new(RxState {
-        frames: VecDeque::with_capacity(FRAME_BUFFER),
-        dropped: 0,
-        bus_error: None,
-    }));
-    let (signal_tx, mut signal_rx) = mpsc::channel::<()>(1);
-    let reader = tokio::spawn(reader_task(sock.clone(), state.clone(), signal_tx));
+    let buffer = Arc::new(DropBuffer::new(FRAME_BUFFER));
+    let reader = tokio::spawn(reader_task(sock.clone(), buffer.clone()));
 
     let (mut ws_tx, mut ws_rx) = ws.split();
     let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -209,8 +157,8 @@ pub async fn run_client(
 
     loop {
         tokio::select! {
-            event = next_rx(&state, &mut signal_rx) => match event {
-                RxEvent::Frame(frame) => {
+            event = buffer.next() => match event {
+                BufferEvent::Item(frame) => {
                     // Error frames are only delivered if this client enabled
                     // the error mask; they bypass id filters (kernel semantics).
                     let pass = frame.is_error()
@@ -221,35 +169,39 @@ pub async fn run_client(
                         };
                     if pass {
                         let (buf, len) = frame.encode();
-                        if ws_tx
-                            .send(ws::Message::binary(buf[..len].to_vec()))
-                            .await
-                            .is_err()
-                        {
+                        if send_ws(&mut ws_tx, ws::Message::binary(buf[..len].to_vec()), &log_name)
+                            .await.is_err() {
                             break;
                         }
                     }
                 }
-                RxEvent::Overflow(dropped) => {
+                BufferEvent::Overflow(dropped) => {
                     log::warn!("{log_name}: rx buffer overflow, {dropped} frames dropped");
                     let status =
                         serde_json::to_string(&ServerStatusRef::Overflow { dropped }).unwrap();
-                    if ws_tx.send(ws::Message::text(status)).await.is_err() {
+                    if send_ws(&mut ws_tx, ws::Message::text(status), &log_name).await.is_err() {
                         break;
                     }
                 }
-                RxEvent::BusError(error) => {
+                BufferEvent::Closed(error) => {
                     log::warn!("{log_name}: bus error: {error}; disconnecting");
                     let status =
                         serde_json::to_string(&ServerStatusRef::BusError { error: &error })
                             .unwrap();
-                    let _ = ws_tx.send(ws::Message::text(status)).await;
-                    let _ = ws_tx
-                        .send(ws::Message::Close(Some(CloseFrame {
-                            code: close_code::BUS_ERROR,
-                            reason: error.into(),
-                        })))
+                    if send_ws(&mut ws_tx, ws::Message::text(status), &log_name)
+                        .await
+                        .is_ok()
+                    {
+                        let _ = send_ws(
+                            &mut ws_tx,
+                            ws::Message::Close(Some(CloseFrame {
+                                code: close_code::BUS_ERROR,
+                                reason: error.into(),
+                            })),
+                            &log_name,
+                        )
                         .await;
+                    }
                     break;
                 }
             },
@@ -261,8 +213,16 @@ pub async fn run_client(
                     ws::Message::Binary(data) => match WireFrame::decode(&data) {
                         Ok(frame) => match can_frame_from_wire(&frame) {
                             Some(out) => {
-                                if let Err(e) = sock.write_frame(out).await {
-                                    log::warn!("{log_name}: CAN write error: {e}");
+                                match tokio::time::timeout(CLIENT_TIMEOUT, sock.write_frame(out)).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => log::warn!("{log_name}: CAN write error: {e}"),
+                                    Err(_) => {
+                                        log::warn!(
+                                            "{log_name}: CAN write blocked for {}s; disconnecting",
+                                            CLIENT_TIMEOUT.as_secs()
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                             None => {
@@ -306,7 +266,11 @@ pub async fn run_client(
                     );
                     break;
                 }
-                if ws_tx.send(ws::Message::Ping(Vec::new().into())).await.is_err() {
+                if send_ws(
+                    &mut ws_tx,
+                    ws::Message::Ping(Vec::new().into()),
+                    &log_name,
+                ).await.is_err() {
                     break;
                 }
             }
@@ -315,6 +279,23 @@ pub async fn run_client(
 
     reader.abort();
     log::info!("{log_name}: disconnected");
+}
+
+async fn send_ws<S>(sink: &mut S, message: ws::Message, log_name: &str) -> Result<(), ()>
+where
+    S: futures_util::Sink<ws::Message> + Unpin,
+{
+    match tokio::time::timeout(WS_SEND_TIMEOUT, sink.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(()),
+        Err(_) => {
+            log::warn!(
+                "{log_name}: websocket write blocked for {}s; disconnecting",
+                WS_SEND_TIMEOUT.as_secs()
+            );
+            Err(())
+        }
+    }
 }
 
 /// Apply a client filter to the socket's kernel filter. Returns whether

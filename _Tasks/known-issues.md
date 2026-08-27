@@ -33,17 +33,21 @@ never called again. `Subscription::recv` documents its equivalent hazard;
 and make `send` return `Result<(), Closed>`; or at minimum add a
 `send_timeout` and a doc warning matching `recv`'s.
 
-### Sync-type RPDOs are applied immediately instead of buffered until SYNC
+### ~~Sync-type RPDOs are applied immediately instead of buffered until SYNC~~ (fixed)
 
-`RpdoEngine::process()` writes mapped values to the OD at frame reception
+`RpdoEngine::process()` wrote mapped values to the OD at frame reception
 regardless of transmission type. Per CiA 301, RPDOs with transmission type
 0..=240 must buffer received data and apply it on the next SYNC (coordinated
-updates). The stm32-node DSL comment describing buffer-until-SYNC is intent,
-not implementation; `on_sync()` exists only on the TPDO side.
+updates). The stm32-node DSL comment describing buffer-until-SYNC was intent,
+not implementation; `on_sync()` existed only on the TPDO side.
 
-**Fix:** pending buffer per sync-type RPDO in `RpdoEngine`, applied in SYNC
-handling. Planned as part of the application-models work — see
-`application-models.md` ("SYNC-based RPDOs across the models").
+**Fixed** together with OD-integrated SYNC config: `RpdoEngine` now holds a
+pending frame per slot, `RpdoEngine::on_sync()` commits them, and
+`Node::handle_sync` runs that before sampling synchronous TPDOs. Deadline
+monitoring still stamps at *reception* (it watches the bus, not the OD).
+Leaving Operational and every reset call `discard_pending()`. See the SYNC
+bullet in `CLAUDE.md`. OD 0x1007 was subsequently added: refused synchronous
+TPDOs retry only inside the configured window and are discarded after it.
 
 ### `EmcyProducer` latches the GENERIC bit forever
 

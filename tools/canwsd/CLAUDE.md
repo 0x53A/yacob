@@ -32,7 +32,11 @@ is the Linux/socketCAN implementation of that interface.
   overflows on WS hiccups. If the buffer fills anyway it is cleared completely
   and the client gets `{"status":"overflow","dropped":N}` — fresh start, not a
   stale replay. A client too slow to keep up long-term loses data audibly, not
-  silently
+  silently. Every WebSocket write has a 30s ceiling, so a blackholed client is
+  disconnected instead of pinning its CAN socket until the operating system's
+  much longer TCP failure timeout. Client-to-CAN writes have the same ceiling:
+  a wedged transmit queue can suspend that client's loop for at most 30s,
+  after which the client is disconnected
 - Bus death mid-session (read error, e.g. interface down): the client gets one
   `{"status":"bus_error","error":...}` text message, then a WS Close with
   application close code 4000 (`close_code::BUS_ERROR`). Reconnecting is the
@@ -40,6 +44,12 @@ is the Linux/socketCAN implementation of that interface.
   itself never exits over interface trouble
 - Keepalive: server pings every 10s, drops clients silent for 30s (half-open
   connections would otherwise hold a socket with a wide filter open)
+- `attach` drains local SocketCAN and the remote WebSocket into independent
+  16384-frame buffers. Either direction clears its own stale backlog on
+  overflow and logs the exact dropped count; a blocked WebSocket or local CAN
+  write is abandoned after 30s. Loss in one direction never stalls draining
+  the other direction. An immediate local CAN write error drops that one frame
+  with a warning; only a write that remains blocked for 30s is fatal
 - Generic CAN bridge: EFF/RTR frames are forwarded in both directions (TX
   builds frames from decoded flags — `CanFrame::from_raw_id` chokes on flag
   bits and would reject them all); RTR DLC is preserved. CAN error frames

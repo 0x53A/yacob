@@ -63,6 +63,8 @@ object_dictionary! {
 ```
 
 
-PDOs and SDOs mostly work, but the applicaton model(s) aren't exactly specified yet (sync, async, ...), and canopen SYNC functionality isn't implemented yet.
+PDOs, SDOs, NMT, heartbeat, EMCY, and SYNC are implemented. The application
+models are still being refined; see `_Tasks/application-models.md` for the
+agreed inline, reactive, and scan directions.
 
 Nevertheless, I am already using it for a few private projects, both implementating CANopen nodes, or interacting with existing hardware like DS402 motor drivers.

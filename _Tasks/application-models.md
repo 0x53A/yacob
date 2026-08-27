@@ -159,11 +159,13 @@ RPDOs (0..=240) are buffered at reception and commit at the next SYNC. Hence:
   invisible. A loop that must run SYNC-aligned is model 2 with SYNC as the
   wake source (or model 1 on `Msg::Sync`), not scan mode.
 
-**Implementation gap**: `RpdoEngine::process` currently applies values to the
-OD immediately regardless of transmission type — buffer-until-SYNC does not
-exist yet (the stm32-node DSL comment describes intent). Needs a pending
-buffer per sync-type RPDO, applied in SYNC handling. Work item for the
-implementation phase.
+**Implementation status** (2026-08): buffer-until-SYNC now exists in the
+engine, so the general rule above holds today for models built on `Node`.
+`RpdoEngine` parks the frame of a synchronous RPDO at reception and
+`RpdoEngine::on_sync` commits it; `Node::handle_sync` runs that before
+sampling synchronous TPDOs. What is still model-dependent is the *surface*:
+model 1's `Msg::Sync`/`handle` and model 2's single coalesced wakeup are the
+parts not yet built — the OD-commit-time semantics they rely on are.
 
 ## Removals
 
