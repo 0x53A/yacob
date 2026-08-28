@@ -1,9 +1,12 @@
-# OD Events — Reactive Object Dictionary
+# OD Events — Reactive Object Dictionary (historical)
 
-> **Status: Fully implemented.** All features described below are in canopen-core.
-> The `OdGuard` RAII pattern (not in original spec) was also added for automatic
-> change detection without manual `notify_changed` calls. Embassy async signals
-> are implemented behind the `embassy` feature flag.
+> **Status: implemented, but superseded as the future application API.** The
+> event queue, typed drain API, `OdGuard`, and Embassy wake signal described
+> below exist in `canopen-core` today. The queue/drain portion is transitional
+> and is slated for replacement by the agreed inline/reactive/scan design in
+> `application-models.md`. `OdGuard`-based TPDO change detection remains part of
+> that design. This file records the API that was built; it is not the roadmap
+> for new application-facing work.
 
 ## Problem
 

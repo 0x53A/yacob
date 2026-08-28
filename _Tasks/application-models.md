@@ -1,9 +1,13 @@
 # Application Models — API Design
 
-> **Status: design agreed (2026-07-04), not yet implemented.**
+> **Status: core design agreed (2026-07-04); public model APIs not yet
+> implemented. Deferred SDO requirements added 2026-08-28; exact API open.**
 > Supersedes the event-queue/`next_change()` design direction explored earlier
 > the same day (see api-evaluation.md Round 2 — the DSL/config/const work from
 > that round stays; the typed event-drain APIs are replaced by this design).
+> Some prerequisites have since landed: synchronous RPDO buffering,
+> queue-independent SDO config resynchronization, and an internal wake signal
+> in `SharedNode`. The transitional event queue and drain APIs still remain.
 
 ## Problem
 
@@ -20,15 +24,20 @@ Both are standardized, not vendor quirks:
 - CiA 302 0x1F51 Program Control: command register with a state machine.
 - CiA 402 controlword fault-reset: rising-edge sensitive by spec.
 
-Key insight: the standards' mental model is that triggers fire **in the write
-handler**, synchronously with the transfer — never by the application later
-observing stored state. Commands therefore belong in the synchronous path;
-state observation never needs to represent write history.
+Key insight: the standards' mental model is that triggers are **captured in the
+write handler**, at the completing SDO/RPDO frame — never by the application
+later observing stored state. Execution may finish immediately or be deferred,
+but command delivery itself must preserve every write. State observation never
+needs to represent write history.
 
-Instead of encoding state-vs-command per entry (DSL flags) or per source
-(heuristics), the distinction is expressed by **which application model the
-firmware chooses**. CAN classic at 500 kbit/s tops out at ~4000 frames/s
-bus-wide, so even the "see every frame" model is trivial for an STM32G4.
+The three application models decide how ordinary OD state is observed. They do
+not turn a coalescing state mask into a command queue. Commands handled in the
+frame path remain natural in model 1; commands that must finish later use the
+separate per-SDO-server deferred-operation path defined below, which is
+available in every model. This avoids encoding state-vs-command in DSL flags or
+guessing it from the write source. CAN classic at 500 kbit/s tops out at ~4000
+frames/s bus-wide, so even the "see every frame" model is trivial for an
+STM32G4.
 
 ## The three models
 
@@ -57,6 +66,9 @@ loop {
             // w: index, subindex, data; w.change::<NodeOdChange>() for typed view.
             if bad(&w) {
                 node.abort(w, Abort::ValueRange);   // consumes w, sends SDO abort
+            } else if must_finish_later(&w) {
+                let request = node.defer(w);        // consumes w, keeps channel busy
+                jobs.start(request);                // do not await here
             } else {
                 node.handle(w.into());              // consumes w, commits + responds
             }
@@ -87,8 +99,10 @@ Decisions:
 - **`#[must_use]` on the decoded message** — silently dropping an `SdoWrite`
   means a client timeout; the compiler should flag it. Explicit discard stays
   possible (`let _ =`).
-- The SDO download **response is sent by `handle()`** (commit-then-confirm);
-  deferred-response latency is bounded because the loop handles immediately.
+- On the immediate path, the SDO download **response is sent by `handle()`**
+  (commit-then-confirm). On the deferred path, `defer()` takes ownership of the
+  channel operation and the app must promptly return to the protocol loop;
+  completion is reported later through the cross-model API below.
 - RPDO frames may carry several mapped fields → the decoded/typed view is
   plural (small fixed array or iterator of changes per frame). Applied
   atomically by `handle` (one frame = one apply; per-field ordering would be
@@ -119,8 +133,10 @@ Decisions:
   "what changed since you last looked". No sequence claims at all.
 - Wakeup via the existing `OdEventSignal` machinery, internalized (the app no
   longer wires the static signal by hand — `SharedNode` owns it).
-- Commands cannot ride this model (two identical writes may be one wakeup).
-  Not a flaw; documented rule: commands → model 1 or `validate_write`.
+- Commands cannot ride the modified mask (two identical writes may be one
+  wakeup). Immediate side effects may use `validate_write`; operations that
+  finish later use the edge-preserving deferred-SDO path below. Neither is
+  reconstructed from the OD state mask.
 
 ## Model 3: Scan
 
@@ -140,6 +156,88 @@ Decisions:
   working). Everything else already exists.
 - Consistency rule (docs): one closure = atomic view; between closures an
   RPDO may land. Multi-field coherence → one closure.
+
+## Deferred SDO operations across the models
+
+Some SDO accesses start work whose result is not available in the frame
+handler: flash/EEPROM persistence, firmware operations, hardware acquisition,
+or application-mediated uploads. CiA 301 defines no universal server response
+deadline and no "still working" response; the client chooses its timeout. A
+server may therefore answer later, but the SDO channel remains occupied and a
+client may time out or abort before the application finishes. See the
+[CiA SDO overview](https://can-cia.org/can-knowledge/sdo-protocol) and CiA's
+[interoperability note](https://www.can-cia.org/fileadmin/cia/documents/publications/cnlm/previous_issues/17-4_cnlm.pdf),
+which specifically calls out slow flash/EEPROM-backed SDO writes and matching
+the client timeout to the server.
+
+The application models must obey this invariant:
+
+> Each SDO server channel may own one in-flight protocol transfer or deferred
+> application operation, while the node continues servicing PDO, SYNC, NMT,
+> heartbeat, EMCY, LSS, deadlines, timers, and every other SDO server channel.
+
+The deferred operation is **protocol state, never blocking control flow**. A
+model-1 handler must not await flash or other application work before returning
+to `next_frame()`. Models 2/3 already have a protocol task; deferral hands work
+to the application without stopping that task. With the default server plus
+`SDO` additional servers, up to `SDO + 1` operations may be pending in parallel,
+but never more than one on the same channel.
+
+Conceptual per-server state:
+
+```text
+Idle
+  -> ReceivingSegmentedOrBlock
+  -> DeferredToApplication
+  -> ResponseReady
+  -> Idle
+```
+
+Decisions:
+
+- Model 1 chooses reject/immediate/deferred handling in its frame path. Models
+  2/3 need a synchronous OD access hook that can return an outcome equivalent
+  to `Abort`, `Commit`, `Handled` (success without storing the request bytes),
+  or `Deferred`. The existing `validate_write` remains useful for pure vetoes
+  but cannot by itself express successful keyhole commands or deferral. Exact
+  hook registration/codegen is still open.
+- A download becomes deferrable only at the existing commit/veto point, when
+  the complete payload is available (expedited request, final segment, or block
+  end). No successful final response is sent yet. A deferred upload similarly
+  occupies the channel until the application supplies data or an abort.
+- `defer(...)` returns an opaque, copyable token identifying the server channel
+  and a transfer generation. `complete_sdo(token, result)` accepts success or
+  an SDO abort code. A generation check makes completion idempotently reject or
+  ignore a stale token rather than answering a newer transfer.
+- Completion queues the response in stack-owned state. Normal non-blocking
+  transmit/retry processing sends it; an application completion never needs to
+  spin on a full CAN driver.
+- A client abort or node reset cancels the deferred protocol operation and
+  invalidates its token. Application work may be physically irreversible and
+  continue, but its late completion cannot emit a response. Cancellation
+  observability for the worker is desirable, not required for protocol safety.
+- A new initiate request on a busy channel must not replace or corrupt its
+  active operation. Exact rejection behavior remains an API/protocol detail;
+  other configured SDO server channels are unaffected.
+- The existing five-second `SdoServer` timeout is inactivity protection for
+  segmented/block exchanges. It is not automatically the deadline for
+  application-deferred work. Any server-side deferred-operation deadline is a
+  separate configurable policy; the effective interoperability limit remains
+  the remote client's timeout.
+- Model 1 receives the request inline and starts work before immediately
+  returning to its frame loop. Models 2/3 expose pending deferred requests via
+  a dedicated edge-preserving surface (one occupied slot per server), not the
+  coalescing OD modified mask. The application takes a request exactly once and
+  later completes its token.
+- Payload access must not hold a borrow of `Node` across an await. The concrete
+  API may copy small command data into application-owned storage or provide a
+  short closure over stack-owned data before work is started; this is still an
+  open API choice.
+
+For operations expected to exceed common client timeouts, prefer a regular OD
+command that responds once the job is accepted plus separate status/result OD
+entries (optionally announced by TPDO/EMCY). Deferred confirmation is for cases
+where SDO success genuinely means that the operation itself completed.
 
 ## SYNC-based RPDOs across the models
 
@@ -176,6 +274,11 @@ The event queue and its drain APIs are the hybrid none of the models wants
   event queue + `events_dropped()`, `EVT_QUEUE` const generic.
 - `Node::set_event_signal()` (internalized into SharedNode/model 2).
 
+The per-server deferred-SDO slots are not a replacement event queue and are not
+removed: their bounded cardinality follows the number of protocol channels,
+and each occupied slot is authoritative SDO state that must eventually be
+completed, aborted, or reset.
+
 Kept from the 2026-07-04 ergonomics round:
 - DSL: transmission-type keywords, unit-suffixed time literals.
 - Address consts (`MyOd::LED: (u16, u8)`), `${Name}Node` alias.
@@ -185,40 +288,55 @@ Kept from the 2026-07-04 ergonomics round:
   (`SdoWrite::change()`, RPDO change iteration), and naming basis for the
   model-2 mask bits. `OdChanges` trait adapts accordingly.
 
-## Implementation notes (code pointers & gotchas, captured 2026-07-05)
+## Implementation notes (code pointers & gotchas)
 
-Recorded while the implementation context was fresh — line numbers approximate.
+Originally captured 2026-07-05 and reconciled with the implementation on
+2026-08-28. Exact line numbers are intentionally omitted because this refactor
+cross-cuts `node.rs`, the SDO server, the PDO engines, and macro code generation.
 
-### Hidden coupling: PDO resync depends on the event queue
+### PDO resync is already decoupled from the event queue
 
-`Node::process()` (node.rs, "Check if any SDO write targeted PDO parameter
-entries") detects runtime PDO reconfiguration by scanning **newly pushed
-events** for index 0x1400..=0x1BFF with source Sdo, then calls
-`sync_pdo_from_od()`. Removing the event queue silently breaks this unless
-replaced. Cleanest fix: see "change sink" below.
+This was a hidden coupling in the original implementation: runtime PDO
+reconfiguration was detected by scanning newly pushed SDO events. It has been
+fixed independently of the application-model refactor. Every successful SDO
+download now records its committed `(index, subindex)` in `SdoServer`, and
+`Node::handle_sdo_request()` consumes that marker to resynchronize PDO,
+heartbeat, or SYNC configuration. Queue overflow therefore cannot suppress a
+configuration update.
+
+When the event queue is removed, preserve this direct committed-write path (or
+fold it into the change sink below); do not reintroduce event-queue inspection.
 
 ### Suggested refactor: change sink instead of event deque
 
-`SdoServer::process(...)` (three commit sites: expedited ~line 340, segmented
-~440, block ~690, all via `push_event()`) and
+`SdoServer::process(...)` (three commit sites: expedited, segmented, and block,
+all currently via `push_event()`) and
 `RpdoEngine::process_with_drop_count()` currently take
 `&mut Deque<OdEvent, N>`. Replace with a small sink trait
 (`fn note_write(&mut self, index: u16, subindex: u8, source)`) implemented by:
 - the generated `${Name}Mask` (models 2/3) — Node holds mask, sets bit via
   generated `fn mask_bit(index, sub) -> Option<u16>`;
-- a PDO-resync flag (folds the 0x1400..=0x1BFF check into the sink);
+- optionally, a configuration-write collector (or keep the existing direct
+  `committed_write` marker alongside the sink);
 - a no-op/passthrough for model 1 (the app is in the frame path already).
 
-### SharedNode signal internalization
+The PDO-resync bullet is no longer required to fix correctness—the direct
+`committed_write` marker already does that—but a composite sink may absorb it
+later if doing so keeps the control flow clearer.
 
-`SharedNode` should own the wake signal as a field (drop the user-visible
-`static EVENT_SIGNAL` + `set_event_signal()` wiring). The `&'static` problem
-solves itself by taking `init(&'static self, node)` — SharedNode lives in a
-static anyway, and `&'static self` methods can hand `&self.signal` to the
-node. `wait_for_change(f)` must **loop while the mask is empty**: the signal
-is a binary latch (`embassy_sync::Signal<CS, ()>`) and `OdGuard::drop` also
-signals on app-side writes (kept — it hastens `process()`), so spurious
-wakes are normal.
+### SharedNode signal internalization (partly complete)
+
+`SharedNode` now owns the wake signal as a field, and
+`init(&'static self, node)` installs it in the node. New firmware using
+`SharedNode` no longer needs a user-visible `static EVENT_SIGNAL` or a direct
+`set_event_signal()` call.
+
+The current `SharedNode::wait_for_change()` is still the transitional bare
+signal: callers wake and drain `Node::next_change()` under `with()`. Model 2
+must replace that with `wait_for_change(f)`, backed by the generated modified
+mask. It must **loop while the mask is empty**: the signal is a binary latch
+(`embassy_sync::Signal<CS, ()>`) and `OdGuard::drop` also signals on app-side
+writes (kept—it hastens `process()`), so spurious wakes are normal.
 
 ### Model 1 machinery
 
@@ -238,13 +356,41 @@ wakes are normal.
 - `validate_write` call sites (the 3 commit sites above) stay — they are the
   veto for models 2/3.
 
-### Sync-RPDO buffering (the known gap)
+### Deferred-SDO machinery
 
-`RpdoEngine` has no `on_sync()` (only `TpdoEngine` does — called from the
-SYNC dispatch in Node). Add `pending: [Option<(u8, [u8; 8])>; N]` (len +
-frame data) to `RpdoEngine`; `process()` stores instead of applying when
-transmission_type ≤ 240; new `on_sync(od, sink)` applies + notes writes.
-Also recorded in known-issues.md.
+- Add the OD access disposition needed by models 2/3 before replacing the
+  event queue. It must select deferral synchronously at the completing frame;
+  observing a later modified-mask wake is too late and loses repeated commands.
+- Today each configured `SdoServer` already has independent segmented/block
+  transfer state, and `Node` continues dispatching other protocols while those
+  transfers are active. Extend that same per-server state machine with
+  `DeferredToApplication` and `ResponseReady`; do not park `Node::process()` or
+  the model-1 frame loop in an application future.
+- The default and additional servers need a stable internal server number plus
+  a wrapping generation counter for opaque completion tokens.
+- The current response path attempts transmit immediately. Deferred completion
+  needs one retained response per server so CAN backpressure cannot lose the
+  confirmation and cannot force application code to retry it manually.
+- Models 2/3 need a wakeable request-taking API independent of
+  `${Name}Mask`. Since a busy server cannot accept a second deferred operation,
+  one slot per server preserves every accepted request without an arbitrary
+  queue capacity or overflow policy.
+- Decide whether application cancellation is polled through the token, emitted
+  on the same wake source, or only observed when `complete_sdo` reports a stale
+  token. Protocol correctness requires only the last option.
+
+### Sync-RPDO buffering (complete prerequisite)
+
+This former gap is implemented. `RpdoEngine` holds one pending `CanFrame` per
+slot; `process()` stores the latest frame instead of applying it when the
+transmission type is 0..=240, and `on_sync()` commits all pending frames before
+`TpdoEngine::on_sync()` samples the OD. Deadline monitoring is stamped at frame
+reception. Leaving Operational and reset discard pending frames. Unit tests,
+the node-level integration test, and python-canopen interop cover the behavior.
+
+The application-model work still needs to replace the event deque passed to
+`on_sync()` with the change sink/mask so model 2 emits one coalesced wake for a
+multi-RPDO SYNC commit.
 
 ### Mask codegen
 
@@ -270,12 +416,15 @@ changes (engine state, OD sub 5, EDS round-trip are queue-independent).
 
 ### Consumers to migrate when the queue APIs go
 
-- `examples/stm32-node/src/main.rs` — `EVENT_SIGNAL` static,
-  `set_event_signal`, `next_change` loop → model 2.
-- `examples/stm32-fwupdate/src/main.rs` — same wiring + `next_event` +
-  `events_dropped` → model 1 (it is the command-style device).
+- `examples/stm32-node/src/main.rs` — already uses `SharedNode`'s internal
+  signal, but its `wait_for_change` + `next_change` drain loop → model 2 mask
+  closure.
+- `examples/stm32-fwupdate/src/main.rs` — manual `EVENT_SIGNAL` wiring and a
+  `next_event` loop (its module docs also advertise `events_dropped`) → model 1
+  because it is a command-style device.
 - `canopen-linux/examples/sensor_hub.rs` — `next_event` + `events_dropped`
-  (doc comment references the queue) → model 3 + `validate_write`.
+  (doc comment references the queue) → model 3; its existing
+  `#[validate_write(check_thresholds)]` remains the synchronous veto.
 - `canopen-linux/examples/vcan_node.rs` — `next_event` → model 2 or 3.
 - `canopen-core/tests/macro_test.rs` — `change_enum_decodes_events`,
   `node_next_change_drains_typed` rewrite against the new surface; node.rs
@@ -291,5 +440,12 @@ changes (engine state, OD sub 5, EDS round-trip are queue-independent).
   (`changed.led()` + iterator).
 - Whether `next_frame` takes the transport/clock or `Node` holds them in
   model 1 (it owns the loop, so borrowing per-call like `process()` is fine).
+- Deferred-SDO API names and ownership: request/payload representation,
+  `complete_sdo` result for stale tokens, worker-visible cancellation, busy
+  channel abort behavior, optional server-side deadline, and whether deferred
+  requests share a wake signal with model-2 state changes.
+- Models-2/3 OD access-hook shape and codegen/registration: how an entry returns
+  `Abort`/`Commit`/`Handled`/`Deferred` without requiring every node to use the
+  inline model.
 - Migration of examples: stm32-node → model 2, stm32-fwupdate → model 1,
   sensor-hub style → model 3.

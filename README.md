@@ -63,8 +63,9 @@ object_dictionary! {
 ```
 
 
-PDOs, SDOs, NMT, heartbeat, EMCY, and SYNC are implemented. The application
-models are still being refined; see `_Tasks/application-models.md` for the
-agreed inline, reactive, and scan directions.
+PDOs, SDOs, NMT, heartbeat, EMCY, and SYNC are implemented. The inline,
+reactive, and scan application models are agreed but their public APIs are not
+implemented yet; the current event-queue APIs are transitional. See
+`_Tasks/application-models.md` for the design and implementation status.
 
 Nevertheless, I am already using it for a few private projects, both implementating CANopen nodes, or interacting with existing hardware like DS402 motor drivers.

@@ -33,22 +33,6 @@ never called again. `Subscription::recv` documents its equivalent hazard;
 and make `send` return `Result<(), Closed>`; or at minimum add a
 `send_timeout` and a doc warning matching `recv`'s.
 
-### ~~Sync-type RPDOs are applied immediately instead of buffered until SYNC~~ (fixed)
-
-`RpdoEngine::process()` wrote mapped values to the OD at frame reception
-regardless of transmission type. Per CiA 301, RPDOs with transmission type
-0..=240 must buffer received data and apply it on the next SYNC (coordinated
-updates). The stm32-node DSL comment describing buffer-until-SYNC was intent,
-not implementation; `on_sync()` existed only on the TPDO side.
-
-**Fixed** together with OD-integrated SYNC config: `RpdoEngine` now holds a
-pending frame per slot, `RpdoEngine::on_sync()` commits them, and
-`Node::handle_sync` runs that before sampling synchronous TPDOs. Deadline
-monitoring still stamps at *reception* (it watches the bus, not the OD).
-Leaving Operational and every reset call `discard_pending()`. See the SYNC
-bullet in `CLAUDE.md`. OD 0x1007 was subsequently added: refused synchronous
-TPDOs retry only inside the configured window and are discarded after it.
-
 ### `EmcyProducer` latches the GENERIC bit forever
 
 (2026-07-14, noticed during RPDO deadline design.) `set_error()` unconditionally
@@ -125,17 +109,43 @@ Users must always specify every field including `identity: LssIdentity::default(
 
 Setting up TPDO/RPDO configs requires manually creating `heapless::Vec`, calling `.push()` with `.unwrap()`. Helper methods or a small builder would improve ergonomics.
 
-### Configurable and additional SDO channels
+### Additional SDO client channels and EDS import for additional servers
 
-The stack only supports the predefined default SDO channel (`0x600 + node_id` / `0x580 + node_id`). Classic CANopen supports additional SDO server/client channels via communication parameter objects such as `0x1201+` and `0x1280+`.
+Additional SDO **server** channels are implemented through DSL
+`sdo_server[N](...)` declarations and 0x1201+ OD records. They have independent
+transfer state, fixed/non-remappable COB-IDs, EDS export, construction/runtime
+collision guards, and support in the generated node alias/config source.
 
-**Improvement:** Make SDO client/server COB-IDs configurable, support multiple independent `SdoServer` state machines on a node, and expose the corresponding OD communication parameter entries.
+Still missing are EDS **import** of 0x1201+ records and OD-managed SDO
+**client** channels at 0x1280+.
+
+**Improvement:** import additional server declarations from EDS and model
+configurable client channels when the CiA 302 SDO Manager/master-side use case
+requires them. See `additional-sdo-servers.md`.
 
 ### Expose SDO server busy state for diagnostics
 
 `SdoServer` does not expose whether a segmented/block transfer is active or which object it targets.
 
 **Improvement:** Add `is_busy()` and active transfer metadata accessors so applications and diagnostic tooling can avoid starting optional SDO work while a local server channel is occupied.
+
+## Fixed (SYNC integration)
+
+### Sync-type RPDOs were applied immediately instead of buffered until SYNC
+
+`RpdoEngine::process()` used to write mapped values to the OD at frame
+reception regardless of transmission type. Per CiA 301, RPDOs with
+transmission type 0..=240 must buffer received data and apply it on the next
+SYNC.
+
+**Fixed** together with OD-integrated SYNC config: `RpdoEngine` now holds a
+pending frame per slot, `RpdoEngine::on_sync()` commits them, and
+`Node::handle_sync` runs that before sampling synchronous TPDOs. Deadline
+monitoring still stamps at *reception* (it watches the bus, not the OD).
+Leaving Operational and every reset call `discard_pending()`. OD 0x1007 was
+subsequently added: refused synchronous TPDOs retry only inside the configured
+window and are discarded after it. See the SYNC bullet in `CLAUDE.md` and the
+implementation-status section in `application-models.md`.
 
 ## Fixed (2026-07-06)
 
