@@ -9,4 +9,6 @@ pub mod websocket_transport;
 pub use slcan::SlcanTransport;
 pub use socketcan_transport::SocketcanTransport;
 pub use udp_multicast::UdpMulticastTransport;
-pub use websocket_transport::{WebSocketTransport, WebSocketTransportError};
+pub use websocket_transport::{
+    WebSocketTransport, WebSocketTransportConfig, WebSocketTransportError,
+};
