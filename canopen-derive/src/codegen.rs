@@ -66,9 +66,9 @@ fn collect_arrays(entries: &[OdEntry]) -> Vec<ArrayEntry> {
 
 /// Resolved PDO mapping: field name → (index, subindex, bit_length).
 pub(crate) struct ResolvedMapping {
-    index: u16,
-    subindex: u8,
-    bit_length: u8,
+    pub(crate) index: u16,
+    pub(crate) subindex: u8,
+    pub(crate) bit_length: u8,
 }
 
 impl ResolvedMapping {
@@ -146,7 +146,9 @@ pub(crate) fn resolve_pdo_mappings(pdo: &PdoDef, flat: &[FlatEntry]) -> Vec<Reso
     }
     let total_bits: usize = resolved.iter().map(|m| m.bit_length as usize).sum();
     if total_bits > PDO_MAX_PAYLOAD_BITS {
-        panic!("{pdo_label} maps {total_bits} bits, but classic CANopen PDOs can carry at most {PDO_MAX_PAYLOAD_BITS} bits");
+        panic!(
+            "{pdo_label} maps {total_bits} bits, but classic CANopen PDOs can carry at most {PDO_MAX_PAYLOAD_BITS} bits"
+        );
     }
     resolved
 }
@@ -208,7 +210,9 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         nums.sort_unstable();
         nums.dedup();
         if nums.len() != sdo_servers.len() {
-            panic!("duplicate sdo_server[N] definition: each server number may only be declared once");
+            panic!(
+                "duplicate sdo_server[N] definition: each server number may only be declared once"
+            );
         }
     }
     // Compile-time COB-ID collision check. Every rx/tx slot — including the
@@ -222,8 +226,16 @@ pub fn generate(od: OdDefinition) -> TokenStream {
     {
         // (is_node_relative, value, human label)
         let mut slots: Vec<(bool, u32, String)> = vec![
-            (true, 0x600, "the default SDO server rx (0x600+node_id)".to_string()),
-            (true, 0x580, "the default SDO server tx (0x580+node_id)".to_string()),
+            (
+                true,
+                0x600,
+                "the default SDO server rx (0x600+node_id)".to_string(),
+            ),
+            (
+                true,
+                0x580,
+                "the default SDO server tx (0x580+node_id)".to_string(),
+            ),
         ];
         for s in sdo_servers.iter() {
             for (spec, dir) in [(s.cob_rx, "cob_rx"), (s.cob_tx, "cob_tx")] {

@@ -38,6 +38,12 @@ impl CobId {
         embedded_can::StandardId::new(self.0).unwrap()
     }
 
+    /// Heuristically interpret this ID using the CiA 301 pre-defined
+    /// connection set.
+    ///
+    /// This has no device configuration, so it cannot authoritatively identify
+    /// custom or remapped PDOs. Use it for generic bus monitors; protocol
+    /// routing must compare the exact configured COB-ID instead.
     pub fn parse(self) -> ParsedCobId {
         let raw = self.0;
         match raw {
@@ -120,7 +126,8 @@ impl CobId {
     }
 }
 
-/// Semantic interpretation of a COB-ID.
+/// Pre-defined-connection-set interpretation of a COB-ID for generic monitors.
+/// It is not authoritative routing information for configured devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParsedCobId {
     Nmt,

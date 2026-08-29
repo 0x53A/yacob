@@ -251,9 +251,9 @@ mod web {
     use crate::sdo::SdoEngine;
     use canopen_core::transport::CanFrame;
     use canopen_web::transport::{
-        CanEvent, CanTransport,
         canwsd::{self, CanwsdTransport},
         slcan::SlcanTransport,
+        CanEvent, CanTransport,
     };
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -385,4 +385,4 @@ mod web {
 pub use native::CanConnection;
 
 #[cfg(target_arch = "wasm32")]
-pub use web::{CanConnection, fetch_canwsd_networks_async, try_recv_canwsd_networks};
+pub use web::{fetch_canwsd_networks_async, try_recv_canwsd_networks, CanConnection};

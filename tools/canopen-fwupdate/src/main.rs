@@ -249,7 +249,10 @@ fn flash(
         use std::io::Write;
         std::io::stdout().flush().ok();
     }
-    println!("\rprogrammed {total} bytes in {:.1} s", started.elapsed().as_secs_f32());
+    println!(
+        "\rprogrammed {total} bytes in {:.1} s",
+        started.elapsed().as_secs_f32()
+    );
 
     let written = read_u32(can, node, UPDATE_INFO, 2)?;
     if written != total as u32 {

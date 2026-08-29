@@ -152,7 +152,11 @@ pub fn generate_eds(od: &OdDefinition) -> String {
         .copied()
         .filter(|i| *i < 0x2000)
         .collect();
-    let optional: Vec<u16> = pdo_indices.iter().copied().chain(sdo_indices.clone()).collect();
+    let optional: Vec<u16> = pdo_indices
+        .iter()
+        .copied()
+        .chain(sdo_indices.clone())
+        .collect();
     let manufacturer: Vec<u16> = user_indices
         .iter()
         .copied()
@@ -273,7 +277,15 @@ fn cob_id_spec_eds(spec: CobIdSpec) -> String {
 fn write_sdo_server_eds(out: &mut String, s: &crate::dsl::SdoServerDef) {
     let idx = 0x1200 + (s.number - 1);
     write_record_header(out, idx, "SDO Server Parameter", 3);
-    write_pdo_sub(out, idx, 0, "Highest sub-index supported", 0x0005, "ro", "2");
+    write_pdo_sub(
+        out,
+        idx,
+        0,
+        "Highest sub-index supported",
+        0x0005,
+        "ro",
+        "2",
+    );
     write_pdo_sub(
         out,
         idx,

@@ -214,7 +214,9 @@ impl Parse for OdDefinition {
             } else {
                 return Err(syn::Error::new(
                     attr_name.span(),
-                    format!("unknown attribute `{attr_name}`, expected `export_eds`, `use_alloc`, or `validate_write`"),
+                    format!(
+                        "unknown attribute `{attr_name}`, expected `export_eds`, `use_alloc`, or `validate_write`"
+                    ),
                 ));
             }
         }
@@ -625,7 +627,9 @@ fn parse_sdo_server_def(input: ParseStream) -> Result<SdoServerDef> {
             other => {
                 return Err(syn::Error::new(
                     key.span(),
-                    format!("unknown sdo_server parameter `{other}`, expected `cob_rx` or `cob_tx`"),
+                    format!(
+                        "unknown sdo_server parameter `{other}`, expected `cob_rx` or `cob_tx`"
+                    ),
                 ));
             }
         }
@@ -635,10 +639,10 @@ fn parse_sdo_server_def(input: ParseStream) -> Result<SdoServerDef> {
     }
     input.parse::<Token![;]>()?;
 
-    let cob_rx = cob_rx
-        .ok_or_else(|| syn::Error::new(kw.span(), "sdo_server requires `cob_rx = ...`"))?;
-    let cob_tx = cob_tx
-        .ok_or_else(|| syn::Error::new(kw.span(), "sdo_server requires `cob_tx = ...`"))?;
+    let cob_rx =
+        cob_rx.ok_or_else(|| syn::Error::new(kw.span(), "sdo_server requires `cob_rx = ...`"))?;
+    let cob_tx =
+        cob_tx.ok_or_else(|| syn::Error::new(kw.span(), "sdo_server requires `cob_tx = ...`"))?;
 
     // COB-ID uniqueness (rx vs tx, cross-server, and vs the default server) is
     // checked comprehensively in codegen, where every server is visible and the
@@ -661,7 +665,9 @@ fn parse_transmission_type(input: ParseStream) -> Result<u8> {
         if (241..=251).contains(&raw) {
             return Err(syn::Error::new(
                 lit.span(),
-                format!("transmission type {raw} is reserved (CiA 301); valid values are 0 (sync acyclic), 1-240 (sync cyclic), 252/253 (RTR), 254/255 (event-driven)"),
+                format!(
+                    "transmission type {raw} is reserved (CiA 301); valid values are 0 (sync acyclic), 1-240 (sync cyclic), 252/253 (RTR), 254/255 (event-driven)"
+                ),
             ));
         }
         return Ok(raw);
@@ -691,7 +697,9 @@ fn parse_transmission_type(input: ParseStream) -> Result<u8> {
         }
         other => Err(syn::Error::new(
             kw.span(),
-            format!("unknown transmission type `{other}`, expected event_driven, event_driven_manufacturer, sync_acyclic, sync_cyclic(N), rtr_sync, rtr_event, or a raw CiA 301 value"),
+            format!(
+                "unknown transmission type `{other}`, expected event_driven, event_driven_manufacturer, sync_acyclic, sync_cyclic(N), rtr_sync, rtr_event, or a raw CiA 301 value"
+            ),
         )),
     }
 }

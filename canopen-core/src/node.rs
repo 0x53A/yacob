@@ -1,4 +1,4 @@
-use crate::cobid::{CobId, NodeId, ParsedCobId};
+use crate::cobid::{CobId, NodeId};
 use crate::emcy::EmcyProducer;
 use crate::heartbeat::{
     HeartbeatEvent, HeartbeatEventBuf, HeartbeatMonitor, HeartbeatMonitorState, HeartbeatProducer,
@@ -1275,10 +1275,6 @@ impl<
         transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
         now: u64,
     ) {
-        let Some(cob) = CobId::new(frame.raw_id()) else {
-            return;
-        };
-
         // Additional SDO servers (0x1201+) match by their configured rx COB-ID,
         // which is arbitrary and need not fall in the default SDO request range.
         // Check them first; the default server is handled in the parse below.
@@ -1300,86 +1296,78 @@ impl<
             return;
         }
 
-        match cob.parse() {
-            ParsedCobId::Nmt => {
-                if frame.raw_dlc() >= 2 {
-                    let data = frame.data();
-                    if let Some(cmd) = NmtCommand::from_byte(data[0]) {
-                        let transition = self.nmt.process_command(cmd, data[1], self.node_id);
-                        match transition {
-                            NmtTransition::ResetApplication => {
-                                // Reset everything: PDO config and application state.
-                                // The application should handle resetting OD values
-                                // to defaults via the event queue or other mechanism.
-                                self.booted = false;
-                                self.abort_all_sdo_transfers();
-                                self.sync_pdo_from_od();
-                                self.sync_heartbeat_from_od(false);
-                                self.reset_sync_state();
-                            }
-                            NmtTransition::ResetCommunication => {
-                                // Reset only communication parameters (PDO, heartbeat).
-                                // Application data in the OD is preserved.
-                                self.booted = false;
-                                self.abort_all_sdo_transfers();
-                                self.sync_pdo_from_od();
-                                self.sync_heartbeat_from_od(false);
-                                self.reset_sync_state();
-                            }
-                            _ => {}
+        // The remaining protocols also route by their exact configured/fixed
+        // COB-IDs. Do not use `CobId::parse()` here: its PDO classification is
+        // only a pre-defined-connection-set heuristic and custom PDOs may live
+        // anywhere in the 11-bit ID space.
+        if frame.raw_id() == CobId::nmt().raw() {
+            if frame.raw_dlc() >= 2 {
+                let data = frame.data();
+                if let Some(cmd) = NmtCommand::from_byte(data[0]) {
+                    let transition = self.nmt.process_command(cmd, data[1], self.node_id);
+                    match transition {
+                        NmtTransition::ResetApplication => {
+                            self.booted = false;
+                            self.abort_all_sdo_transfers();
+                            self.sync_pdo_from_od();
+                            self.sync_heartbeat_from_od(false);
+                            self.reset_sync_state();
                         }
+                        NmtTransition::ResetCommunication => {
+                            self.booted = false;
+                            self.abort_all_sdo_transfers();
+                            self.sync_pdo_from_od();
+                            self.sync_heartbeat_from_od(false);
+                            self.reset_sync_state();
+                        }
+                        _ => {}
                     }
                 }
             }
-
-            ParsedCobId::SdoRequest(node) if node == self.node_id => {
-                self.handle_sdo_request(SdoServerSel::Default, frame, transport, now);
-            }
-
-            // No `ParsedCobId::Sync` arm: SYNC is matched by COB-ID above. A
-            // frame on 0x080 only reaches here when 0x1005 moved SYNC
-            // elsewhere (or disabled it), and 0x080 is then just another
-            // COB-ID — so it falls through to the RPDO engine like any other.
-            ParsedCobId::Rpdo { .. } | ParsedCobId::Tpdo { .. } => {
-                // For RPDO: we receive on RPDO COB-IDs (which are the remote's TPDO)
-                // The RPDO engine matches on COB-ID, so just feed it the frame
-                self.process_rpdo_frame(frame, now);
-            }
-
-            ParsedCobId::Heartbeat(remote) => {
-                if frame.raw_dlc() >= 1 {
-                    let mut events = HeartbeatEventBuf::new();
-                    for monitor in self.hb_monitors.iter_mut().flatten() {
-                        if monitor.process(remote, frame.data()[0], now, &mut events) {
-                            // 0x1016 validation rejects duplicate node ids,
-                            // so at most one monitor matches.
-                            break;
-                        }
-                    }
-                    for evt in events {
-                        if self.hb_event_queue.is_full() {
-                            let _ = self.hb_event_queue.pop_front();
-                            self.event_overflow_count = self.event_overflow_count.saturating_add(1);
-                        }
-                        let _ = self.hb_event_queue.push_back(evt);
-                    }
-                }
-            }
-
-            _ => {
-                // Check for LSS (fixed COB-IDs, not part of standard COB-ID scheme)
-                if frame.raw_id() == crate::lss::LSS_REQUEST_COB {
-                    if let Some(resp) = self.lss.process(frame) {
-                        let _ = transport.transmit(&resp);
-                    }
-                } else {
-                    // Custom RPDO COB-IDs may be outside the pre-defined
-                    // connection set. Once node-owned protocols have had
-                    // priority, let the RPDO engine match the exact ID.
-                    self.process_rpdo_frame(frame, now);
-                }
-            }
+            return;
         }
+
+        if frame.raw_id() == CobId::sdo_rx(self.node_id).raw() {
+            self.handle_sdo_request(SdoServerSel::Default, frame, transport, now);
+            return;
+        }
+
+        if frame.raw_id() == crate::lss::LSS_REQUEST_COB {
+            if let Some(resp) = self.lss.process(frame) {
+                let _ = transport.transmit(&resp);
+            }
+            return;
+        }
+
+        let heartbeat_node = (frame.raw_dlc() >= 1)
+            .then(|| {
+                self.hb_monitors
+                    .iter()
+                    .flatten()
+                    .map(HeartbeatMonitor::node_id)
+                    .find(|node| CobId::heartbeat(*node).raw() == frame.raw_id())
+            })
+            .flatten();
+        if let Some(remote) = heartbeat_node {
+            let mut events = HeartbeatEventBuf::new();
+            for monitor in self.hb_monitors.iter_mut().flatten() {
+                if monitor.process(remote, frame.data()[0], now, &mut events) {
+                    break;
+                }
+            }
+            for evt in events {
+                if self.hb_event_queue.is_full() {
+                    let _ = self.hb_event_queue.pop_front();
+                    self.event_overflow_count = self.event_overflow_count.saturating_add(1);
+                }
+                let _ = self.hb_event_queue.push_back(evt);
+            }
+            return;
+        }
+
+        // The RPDO engine performs the authoritative exact-COB-ID match,
+        // including custom IDs outside every predefined PDO range.
+        self.process_rpdo_frame(frame, now);
     }
 }
 
@@ -1937,6 +1925,22 @@ mod tests {
             .cob_id = 0x123;
 
         let rpdo_frame = CanFrame::new(0x123, &[0xAA, 0xBB]).unwrap();
+        transport.store_received(rpdo_frame).unwrap();
+        node.process(&mut transport, &TestClock(1000));
+
+        assert_eq!(node.od().output1, 0xAA);
+        assert_eq!(node.od().output2, 0xBB);
+    }
+
+    #[test]
+    fn custom_rpdo_in_an_unmonitored_heartbeat_range_is_dispatched() {
+        let (mut node, mut transport) = make_event_node();
+        node.rpdo_engine_mut()
+            .config_mut(PdoNumber::of::<1>())
+            .unwrap()
+            .cob_id = 0x712;
+
+        let rpdo_frame = CanFrame::new(0x712, &[0xAA, 0xBB]).unwrap();
         transport.store_received(rpdo_frame).unwrap();
         node.process(&mut transport, &TestClock(1000));
 

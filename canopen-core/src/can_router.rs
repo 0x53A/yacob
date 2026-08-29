@@ -1,8 +1,12 @@
-//! CAN frame router — demuxes a single receive stream to multiple consumers.
+//! Legacy CAN frame demultiplexing helpers.
 //!
-//! The router owns the async CAN transport and provides filtered views for
-//! each protocol (SDO, PDO, heartbeat, etc.). Each consumer gets its own
-//! buffer so frames are never lost.
+//! [`SdoPort`] routes by the exact target SDO response COB-ID and remains safe.
+//! [`HeartbeatPort`] and [`CanDemux`], however, classify heartbeat/PDO traffic
+//! from the CiA 301 predefined ranges. That is only a heuristic suitable for
+//! generic monitoring: custom PDOs may use IDs inside or outside those ranges.
+//! EDS-aware applications must use the generated device codec over raw frames
+//! (normally distributed by `bus::SharedCanBus`) instead.
+#![allow(deprecated)]
 //!
 //! ```ignore
 //! let router = CanRouter::new(transport);
@@ -72,6 +76,7 @@ impl<T: AsyncCan> AsyncCan for SdoPort<'_, T> {
 }
 
 /// A filtered async CAN port that only yields heartbeat frames.
+#[deprecated(note = "predefined-range heuristic; use raw frames and exact device configuration")]
 pub struct HeartbeatPort<'a, T: AsyncCan> {
     transport: &'a mut T,
     /// Optional: only accept heartbeats from this node. None = all nodes.
@@ -148,9 +153,9 @@ pub fn sdo_port<T: AsyncCan>(transport: &mut T, target: NodeId) -> SdoPort<'_, T
 /// while let Some(frame) = demux.try_recv_heartbeat() { ... }
 /// while let Some(frame) = demux.try_recv_pdo() { ... }
 /// ```
+#[deprecated(note = "predefined-range heuristic; use SharedCanBus and EDS-generated device codecs")]
 pub struct CanDemux<T: AsyncCan> {
     transport: T,
-    sdo_buf: heapless::Deque<CanFrame, 4>,
     pdo_buf: heapless::Deque<CanFrame, 16>,
     heartbeat_buf: heapless::Deque<CanFrame, 8>,
     other_buf: heapless::Deque<CanFrame, 4>,
@@ -160,7 +165,6 @@ impl<T: AsyncCan> CanDemux<T> {
     pub fn new(transport: T) -> Self {
         Self {
             transport,
-            sdo_buf: heapless::Deque::new(),
             pdo_buf: heapless::Deque::new(),
             heartbeat_buf: heapless::Deque::new(),
             other_buf: heapless::Deque::new(),
@@ -268,7 +272,8 @@ impl<T: AsyncCan> CanDemux<T> {
         found
     }
 
-    /// Receive the next PDO frame, waiting asynchronously.
+    /// Receive the next frame heuristically classified as a predefined PDO.
+    /// Custom/remapped PDO routing requires exact device configuration.
     pub async fn recv_pdo(&mut self) -> Result<CanFrame, T::Error> {
         if let Some(f) = self.pdo_buf.pop_front() {
             return Ok(f);
@@ -302,13 +307,11 @@ impl<T: AsyncCan> CanDemux<T> {
         self.other_buf.pop_front()
     }
 
-    /// Route a frame to the appropriate buffer based on COB-ID.
+    /// Heuristically classify generic monitor traffic. Protocol clients must
+    /// match their configured COB-IDs before calling this fallback.
     fn route_frame(&mut self, frame: CanFrame) {
         let parsed = CobId::new(frame.raw_id()).map(|c| c.parse());
         match parsed {
-            Some(ParsedCobId::SdoResponse(_)) => {
-                let _ = self.sdo_buf.push_back(frame);
-            }
             Some(ParsedCobId::Heartbeat(_)) => {
                 let _ = self.heartbeat_buf.push_back(frame);
             }
@@ -337,18 +340,10 @@ impl<T: AsyncCan> AsyncCan for DemuxSdoPort<'_, T> {
     }
 
     async fn receive(&mut self) -> Result<CanFrame, Self::Error> {
-        // Check SDO buffer first — drain and re-push non-matching frames
-        let len = self.demux.sdo_buf.len();
-        for _ in 0..len {
-            if let Some(f) = self.demux.sdo_buf.pop_front() {
-                if f.raw_id() == self.response_cob && f.raw_dlc() == 8 {
-                    return Ok(f);
-                }
-                let _ = self.demux.sdo_buf.push_back(f);
-            }
-        }
-
-        // Poll transport, routing non-SDO frames
+        // Match the active client's exact configured response COB-ID. Do not
+        // pre-classify: a custom PDO may legally live in the default SDO
+        // response range, and an unrelated SDO response is stale for a future
+        // transaction rather than something to replay later.
         loop {
             let frame = self.demux.transport.receive().await?;
             if frame.raw_id() == self.response_cob && frame.raw_dlc() == 8 {

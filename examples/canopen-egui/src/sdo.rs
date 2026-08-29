@@ -7,7 +7,7 @@
 //! thread/waker backed). The engine touches no transport at all — the caller
 //! feeds it received frames and transmits whatever it hands back.
 
-use canopen_core::cobid::{CobId, NodeId, ParsedCobId};
+use canopen_core::cobid::{CobId, NodeId};
 use canopen_core::sdo::client::{SdoClient, SdoClientResult};
 use canopen_core::transport::CanFrame;
 use std::collections::VecDeque;
@@ -189,13 +189,10 @@ impl SdoEngine {
             return;
         };
 
-        let Some(cob) = CobId::new(frame.raw_id()) else {
+        let Some(node) = NodeId::new(active.request.node_id) else {
             return;
         };
-        let ParsedCobId::SdoResponse(node) = cob.parse() else {
-            return;
-        };
-        if node.raw() != active.request.node_id {
+        if frame.raw_id() != CobId::sdo_tx(node).raw() {
             return;
         }
 

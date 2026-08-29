@@ -1,4 +1,4 @@
-//! Async CANopen master — monitors nodes and performs SDO operations using CanDemux.
+//! Generic CANopen monitor example using the legacy heuristic `CanDemux`.
 //!
 //! Demonstrates the async master-side API:
 //! - `CanDemux` for routing CAN frames to SDO/heartbeat/PDO buffers
@@ -15,7 +15,9 @@
 //!
 //! ## API notes
 //!
-//! The CanDemux pattern works well for masters that need to interleave SDO
+//! `CanDemux` is appropriate here only because this example displays generic
+//! predefined-connection-set traffic. EDS-aware masters must route raw frames
+//! through exact generated device codecs instead. It can still interleave SDO
 //! operations with heartbeat monitoring. During an SDO transfer, incoming
 //! heartbeats and PDOs are buffered in the demux. After the transfer, the
 //! master drains the buffers to update its view of the network.
@@ -24,6 +26,8 @@
 //! of SDO operations), you'd need separate tasks — either using Embassy on
 //! embedded, or tokio/async-std on Linux. The CanDemux still helps by routing
 //! frames to the right consumer.
+
+#![allow(deprecated)] // This example deliberately demonstrates the legacy monitor.
 
 use canopen_core::can_router::CanDemux;
 use canopen_core::cobid::{CobId, NodeId, ParsedCobId};

@@ -46,7 +46,9 @@ impl std::str::FromStr for TimestampMode {
             "d" => Ok(Self::Delta),
             "z" => Ok(Self::Zero),
             "A" => Ok(Self::AbsoluteDate),
-            other => Err(format!("invalid timestamp type '{other}' (expected a, d, z or A)")),
+            other => Err(format!(
+                "invalid timestamp type '{other}' (expected a, d, z or A)"
+            )),
         }
     }
 }
@@ -78,7 +80,11 @@ impl Timestamps {
             }
             TimestampMode::AbsoluteDate => {
                 let dt: chrono::DateTime<chrono::Local> = (UNIX_EPOCH + now).into();
-                format!("({}.{:06}) ", dt.format("%Y-%m-%d %H:%M:%S"), now.subsec_micros())
+                format!(
+                    "({}.{:06}) ",
+                    dt.format("%Y-%m-%d %H:%M:%S"),
+                    now.subsec_micros()
+                )
             }
             TimestampMode::Delta | TimestampMode::Zero => {
                 // candump: first frame initialises the reference to itself, so
@@ -144,7 +150,11 @@ fn frame_body(wf: &WireFrame, binary: bool, ascii: bool) -> String {
         set_at(&mut buf, &mut offset, b' ');
         if binary {
             for j in (0..8).rev() {
-                set_at(&mut buf, &mut offset, if byte & (1 << j) != 0 { b'1' } else { b'0' });
+                set_at(
+                    &mut buf,
+                    &mut offset,
+                    if byte & (1 << j) != 0 { b'1' } else { b'0' },
+                );
             }
         } else {
             set_at(&mut buf, &mut offset, HEX[(byte >> 4) as usize]);
@@ -159,7 +169,11 @@ fn frame_body(wf: &WireFrame, binary: bool, ascii: bool) -> String {
     } else if ascii {
         append_right_justified(&mut buf, dlen * (8 - len) + 4, "'");
         for &byte in &data[..len] {
-            buf.push(if (0x20..0x7F).contains(&byte) { byte } else { b'.' });
+            buf.push(if (0x20..0x7F).contains(&byte) {
+                byte
+            } else {
+                b'.'
+            });
         }
         buf.push(b'\'');
     }
@@ -244,7 +258,10 @@ mod tests {
     #[test]
     fn standard_frame_hex() {
         let f = sff(0x123, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
-        assert_eq!(frame_body(&f, false, false), "123   [8]  11 22 33 44 55 66 77 88");
+        assert_eq!(
+            frame_body(&f, false, false),
+            "123   [8]  11 22 33 44 55 66 77 88"
+        );
     }
 
     #[test]
@@ -291,7 +308,10 @@ mod tests {
     #[test]
     fn line_layout_without_timestamp() {
         let f = sff(0x123, &[0x11]);
-        assert_eq!(format_line("", "can0", &f, false, false), "  can0  123   [1]  11");
+        assert_eq!(
+            format_line("", "can0", &f, false, false),
+            "  can0  123   [1]  11"
+        );
     }
 
     #[test]

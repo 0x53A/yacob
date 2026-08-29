@@ -184,7 +184,10 @@ fn interface_name(remote: &str) -> String {
         .strip_prefix("ws://")
         .or_else(|| remote.strip_prefix("wss://"))
         .unwrap_or(remote);
-    let path = after_scheme.split(['?', '#']).next().unwrap_or(after_scheme);
+    let path = after_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
     let path = path.trim_end_matches('/');
     match path.rsplit_once('/') {
         Some((_, name)) if !name.is_empty() => name.to_string(),
@@ -221,7 +224,10 @@ mod tests {
     #[test]
     fn interface_name_from_url() {
         assert_eq!(interface_name("ws://h:8080/api/networks/can0"), "can0");
-        assert_eq!(interface_name("ws://h:8080/api/networks/arm?filter=1:2"), "arm");
+        assert_eq!(
+            interface_name("ws://h:8080/api/networks/arm?filter=1:2"),
+            "arm"
+        );
         assert_eq!(interface_name("ws://h:8080/"), "can");
     }
 }

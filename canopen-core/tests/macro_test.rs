@@ -1550,15 +1550,16 @@ fn sdo_server_second_channel_serves_and_is_independent() {
     // Both are expedited upload responses (cs 0x43) carrying device_type 0x191.
     for resp in [default_resp.unwrap(), diag_resp.unwrap()] {
         assert_eq!(resp.data()[0], 0x43);
-        assert_eq!(u32::from_le_bytes(resp.data()[4..8].try_into().unwrap()), 0x191);
+        assert_eq!(
+            u32::from_le_bytes(resp.data()[4..8].try_into().unwrap()),
+            0x191
+        );
     }
 
     // Writing via the diagnostics channel updates the shared OD, and the
     // response comes back on the diag tx COB-ID.
     transport
-        .store_received(
-            CanFrame::new(0x645, &[0x2B, 0x00, 0x20, 0x00, 0x2A, 0x00, 0, 0]).unwrap(),
-        )
+        .store_received(CanFrame::new(0x645, &[0x2B, 0x00, 0x20, 0x00, 0x2A, 0x00, 0, 0]).unwrap())
         .unwrap();
     node.process(&mut transport, &FixedClock(2_000));
     let frames = drain(&mut transport);
@@ -1591,7 +1592,10 @@ fn sdo_server_channels_have_independent_transfer_state() {
         .unwrap();
     node.process(&mut transport, &FixedClock(1_000));
     let init = drain(&mut transport);
-    assert!(init.iter().any(|f| f.raw_id() == 0x585), "default upload init");
+    assert!(
+        init.iter().any(|f| f.raw_id() == 0x585),
+        "default upload init"
+    );
 
     // Meanwhile a full expedited transaction on the diag channel must complete
     // normally, unaffected by the parked default transfer.
@@ -1602,7 +1606,10 @@ fn sdo_server_channels_have_independent_transfer_state() {
     let frames = drain(&mut transport);
     let diag = frames.iter().find(|f| f.raw_id() == 0x5C5).unwrap();
     assert_eq!(diag.data()[0], 0x43);
-    assert_eq!(u32::from_le_bytes(diag.data()[4..8].try_into().unwrap()), 0x191);
+    assert_eq!(
+        u32::from_le_bytes(diag.data()[4..8].try_into().unwrap()),
+        0x191
+    );
 
     // The default channel's segmented transfer is still alive: continue it and
     // get the first segment back.

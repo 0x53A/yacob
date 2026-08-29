@@ -9,6 +9,10 @@ pub fn generate(def: eds_parser::EdsDefinition) -> TokenStream {
         Err(e) => return e.to_compile_error(),
     };
 
+    generate_from_od(&od, true)
+}
+
+pub(crate) fn generate_from_od(od: &OdDefinition, addressed_names: bool) -> TokenStream {
     let vis = &od.vis;
     let name = &od.name;
 
@@ -30,14 +34,22 @@ pub fn generate(def: eds_parser::EdsDefinition) -> TokenStream {
             EntryKind::Var(var) => {
                 let ty_str = var.type_name.to_string();
                 let base = base_name(entry, None);
-                let name = format!("i{:04x}_s00_{base}", entry.index);
+                let name = if addressed_names {
+                    format!("i{:04x}_s00_{base}", entry.index)
+                } else {
+                    base
+                };
                 gen_var_methods(&mut methods, entry.index, 0, &name, &ty_str, var.access);
             }
             EntryKind::Record(subs) => {
                 for sub in subs {
                     let ty_str = sub.var.type_name.to_string();
                     let base = base_name(entry, Some(&sub.name.to_string()));
-                    let method_name = format!("i{:04x}_s{:02x}_{base}", entry.index, sub.subindex);
+                    let method_name = if addressed_names {
+                        format!("i{:04x}_s{:02x}_{base}", entry.index, sub.subindex)
+                    } else {
+                        base
+                    };
                     gen_var_methods(
                         &mut methods,
                         entry.index,
@@ -51,7 +63,11 @@ pub fn generate(def: eds_parser::EdsDefinition) -> TokenStream {
             EntryKind::Array(arr) => {
                 let ty_str = arr.element_type.to_string();
                 let base = base_name(entry, None);
-                let name = format!("i{:04x}_{base}", entry.index);
+                let name = if addressed_names {
+                    format!("i{:04x}_{base}", entry.index)
+                } else {
+                    base
+                };
                 gen_array_methods(
                     &mut methods,
                     entry.index,
