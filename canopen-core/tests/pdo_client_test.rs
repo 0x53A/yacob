@@ -7,8 +7,16 @@ device_from_eds! {
     pub struct TestPdo = "tests/test_pdo_device.eds";
 }
 
+device_from_eds! {
+    pub struct NamesDevice = "tests/test_sdo_client_names.eds";
+}
+
 pdo_client_from_eds! {
     pub struct RawTestPdo = "tests/test_pdo_device.eds";
+}
+
+pdo_client_from_eds! {
+    pub struct AmbiguousPdo = "tests/test_pdo_ambiguous.eds";
 }
 
 #[test]
@@ -72,4 +80,24 @@ fn custom_tpdo_is_matched_exactly_before_generic_classification() {
             controlword: 0x1234,
         }))
     );
+}
+
+#[test]
+fn node_relative_and_absolute_tpdos_cannot_shadow_each_other() {
+    let client = AmbiguousPdo::new(NodeId::new(7).unwrap());
+    let frame = CanFrame::new(0x187, &[0x34, 0x12]).unwrap();
+
+    assert_eq!(
+        client.decode(&frame),
+        Err(PdoDecodeError::AmbiguousCobId { cob_id: 0x187 })
+    );
+}
+
+#[allow(dead_code)]
+async fn device_sdo_methods_are_always_addressed(
+    device: &NamesDevice,
+    can: &mut impl canopen_core::sdo::AsyncCan<Error = core::convert::Infallible>,
+) {
+    let _ = device.read_i2032_s00_max_motor_speed(can).await;
+    let _ = device.read_i6080_s00_max_motor_speed(can).await;
 }

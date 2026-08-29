@@ -9,16 +9,16 @@ pub fn generate(def: eds_parser::EdsDefinition) -> TokenStream {
         Err(e) => return e.to_compile_error(),
     };
 
-    generate_from_od(&od, true)
+    generate_from_od(&od)
 }
 
-pub(crate) fn generate_from_od(od: &OdDefinition, addressed_names: bool) -> TokenStream {
+pub(crate) fn generate_from_od(od: &OdDefinition) -> TokenStream {
     let vis = &od.vis;
     let name = &od.name;
 
-    // Generate typed read/write methods for each OD entry. Every generated
-    // method includes the OD address so callers can work directly from
-    // datasheets and duplicate EDS ParameterNames remain unambiguous.
+    // Every generated method includes the OD address so names remain stable,
+    // callers can cross-reference datasheets directly, and duplicate EDS
+    // ParameterNames cannot collide.
     let base_name = |entry: &OdEntry, sub_name: Option<&str>| -> String {
         match sub_name {
             // EDS record sub-entry names are already prefixed with the record
@@ -34,22 +34,14 @@ pub(crate) fn generate_from_od(od: &OdDefinition, addressed_names: bool) -> Toke
             EntryKind::Var(var) => {
                 let ty_str = var.type_name.to_string();
                 let base = base_name(entry, None);
-                let name = if addressed_names {
-                    format!("i{:04x}_s00_{base}", entry.index)
-                } else {
-                    base
-                };
+                let name = format!("i{:04x}_s00_{base}", entry.index);
                 gen_var_methods(&mut methods, entry.index, 0, &name, &ty_str, var.access);
             }
             EntryKind::Record(subs) => {
                 for sub in subs {
                     let ty_str = sub.var.type_name.to_string();
                     let base = base_name(entry, Some(&sub.name.to_string()));
-                    let method_name = if addressed_names {
-                        format!("i{:04x}_s{:02x}_{base}", entry.index, sub.subindex)
-                    } else {
-                        base
-                    };
+                    let method_name = format!("i{:04x}_s{:02x}_{base}", entry.index, sub.subindex);
                     gen_var_methods(
                         &mut methods,
                         entry.index,
@@ -63,11 +55,7 @@ pub(crate) fn generate_from_od(od: &OdDefinition, addressed_names: bool) -> Toke
             EntryKind::Array(arr) => {
                 let ty_str = arr.element_type.to_string();
                 let base = base_name(entry, None);
-                let name = if addressed_names {
-                    format!("i{:04x}_{base}", entry.index)
-                } else {
-                    base
-                };
+                let name = format!("i{:04x}_{base}", entry.index);
                 gen_array_methods(
                     &mut methods,
                     entry.index,
@@ -217,7 +205,7 @@ fn gen_array_methods(
                     sub: u8,
                     can: &mut impl canopen_core::sdo::AsyncCan<Error = E>,
                 ) -> Result<#ret_ty, canopen_core::sdo::SdoError<E>> {
-                    assert!(sub >= 1 && sub <= #count_u8, "array subindex out of range");
+                    assert!((1..=#count_u8).contains(&sub), "array subindex out of range");
                     self.driver.#driver_fn(#index, sub, can).await
                 }
             });
@@ -237,7 +225,7 @@ fn gen_array_methods(
                     val: #param_ty,
                     can: &mut impl canopen_core::sdo::AsyncCan<Error = E>,
                 ) -> Result<(), canopen_core::sdo::SdoError<E>> {
-                    assert!(sub >= 1 && sub <= #count_u8, "array subindex out of range");
+                    assert!((1..=#count_u8).contains(&sub), "array subindex out of range");
                     self.driver.#driver_fn(#index, sub, val, can).await
                 }
             });

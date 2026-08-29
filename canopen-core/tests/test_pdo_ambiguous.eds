@@ -1,0 +1,108 @@
+[FileInfo]
+FileName=test_pdo_ambiguous.eds
+FileVersion=1
+CreatedBy=canopen-rs test
+
+[DeviceInfo]
+VendorName=Test
+ProductName=AmbiguousPdoTest
+BaudRate_500=1
+SimpleBootUpSlave=1
+
+[1800]
+ParameterName=TPDO1 Communication
+ObjectType=0x9
+SubNumber=3
+
+[1800sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=2
+
+[1800sub1]
+ParameterName=COB-ID
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=$NODEID+0x180
+
+[1800sub2]
+ParameterName=Transmission Type
+ObjectType=0x7
+DataType=0x0005
+AccessType=rw
+DefaultValue=0xFF
+
+[1A00]
+ParameterName=TPDO1 Mapping
+ObjectType=0x9
+SubNumber=2
+
+[1A00sub0]
+ParameterName=Number of Mapped Objects
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=1
+
+[1A00sub1]
+ParameterName=Mapping Entry 1
+ObjectType=0x7
+DataType=0x0007
+AccessType=ro
+DefaultValue=0x60410010
+
+[1801]
+ParameterName=TPDO2 Communication
+ObjectType=0x9
+SubNumber=3
+
+[1801sub0]
+ParameterName=Number of Entries
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=2
+
+[1801sub1]
+ParameterName=COB-ID
+ObjectType=0x7
+DataType=0x0007
+AccessType=rw
+DefaultValue=0x187
+
+[1801sub2]
+ParameterName=Transmission Type
+ObjectType=0x7
+DataType=0x0005
+AccessType=rw
+DefaultValue=0xFF
+
+[1A01]
+ParameterName=TPDO2 Mapping
+ObjectType=0x9
+SubNumber=2
+
+[1A01sub0]
+ParameterName=Number of Mapped Objects
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=1
+
+[1A01sub1]
+ParameterName=Mapping Entry 1
+ObjectType=0x7
+DataType=0x0007
+AccessType=ro
+DefaultValue=0x60410010
+
+[6041]
+ParameterName=Statusword
+ObjectType=0x7
+DataType=0x0006
+AccessType=ro
+DefaultValue=0
+PDOMapping=1

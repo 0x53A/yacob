@@ -1339,22 +1339,20 @@ impl<
             return;
         }
 
-        let heartbeat_node = (frame.raw_dlc() >= 1)
-            .then(|| {
-                self.hb_monitors
-                    .iter()
-                    .flatten()
-                    .map(HeartbeatMonitor::node_id)
-                    .find(|node| CobId::heartbeat(*node).raw() == frame.raw_id())
-            })
-            .flatten();
-        if let Some(remote) = heartbeat_node {
+        let heartbeat_monitor = if frame.raw_dlc() >= 1 {
+            self.hb_monitors
+                .iter_mut()
+                .flatten()
+                .find(|monitor| CobId::heartbeat(monitor.node_id()).raw() == frame.raw_id())
+        } else {
+            None
+        };
+        if let Some(monitor) = heartbeat_monitor {
             let mut events = HeartbeatEventBuf::new();
-            for monitor in self.hb_monitors.iter_mut().flatten() {
-                if monitor.process(remote, frame.data()[0], now, &mut events) {
-                    break;
-                }
-            }
+            // The exact COB-ID lookup makes the supplied node tautologically
+            // the monitor's own remote node.
+            let remote = monitor.node_id();
+            monitor.process(remote, frame.data()[0], now, &mut events);
             for evt in events {
                 if self.hb_event_queue.is_full() {
                     let _ = self.hb_event_queue.pop_front();

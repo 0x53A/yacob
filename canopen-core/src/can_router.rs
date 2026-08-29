@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 //! Legacy CAN frame demultiplexing helpers.
 //!
 //! [`SdoPort`] routes by the exact target SDO response COB-ID and remains safe.
@@ -6,18 +8,6 @@
 //! generic monitoring: custom PDOs may use IDs inside or outside those ranges.
 //! EDS-aware applications must use the generated device codec over raw frames
 //! (normally distributed by `bus::SharedCanBus`) instead.
-#![allow(deprecated)]
-//!
-//! ```ignore
-//! let router = CanRouter::new(transport);
-//!
-//! // SDO driver gets only SDO response frames
-//! let sdo = SdoDriver::new(target);
-//! let val = sdo.read_u32(0x1000, 0, &mut router.sdo_port(target)).await?;
-//!
-//! // Heartbeat listener gets only heartbeat frames
-//! let hb = router.receive_heartbeat().await;
-//! ```
 
 use crate::cobid::{CobId, NodeId, ParsedCobId};
 use crate::sdo::driver::AsyncCan;

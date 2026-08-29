@@ -61,8 +61,42 @@ fn generate_parts(
     let flat = flatten(&od.entries);
     let mut payload_types = Vec::new();
     let mut methods = Vec::new();
+    // A disabled-but-mapped PDO still has a complete typed wire contract and
+    // may be enabled later by the master, so it keeps its direct codec.
+    // Unmapped communication records have no payload shape to generate.
+    let mapped_pdos: Vec<&PdoDef> = od
+        .pdos
+        .iter()
+        .filter(|pdo| !pdo.mappings.is_empty())
+        .collect();
+    // Generic dispatch describes what the EDS says is active at power-up.
+    // Disabled PDOs must not claim frames until the caller addresses them
+    // explicitly after enabling them.
+    let dispatch_pdos: Vec<&PdoDef> = mapped_pdos
+        .iter()
+        .copied()
+        .filter(|pdo| !pdo_is_disabled(pdo))
+        .collect();
 
-    for pdo in &od.pdos {
+    for (i, pdo) in dispatch_pdos.iter().enumerate() {
+        for other in dispatch_pdos.iter().skip(i + 1) {
+            if effective_cob_id_spec(pdo) == effective_cob_id_spec(other) {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "{}[{}] and {}[{}] resolve to the same COB-ID",
+                        method_stem(pdo),
+                        pdo.number,
+                        method_stem(other),
+                        other.number,
+                    ),
+                )
+                .to_compile_error());
+            }
+        }
+    }
+
+    for pdo in mapped_pdos {
         let mappings = resolve_pdo_mappings(pdo, &flat);
         match generate_pdo(vis, name, pdo, &mappings, &flat, &node_id_raw) {
             Ok((payload, generated_methods)) => {
@@ -78,7 +112,7 @@ fn generate_parts(
     }
 
     let tpdo_enum = format_ident!("{}Tpdo", name);
-    let tpdo_variants = od.pdos.iter().filter_map(|pdo| {
+    let tpdo_variants = dispatch_pdos.iter().filter_map(|pdo| {
         if pdo.direction != PdoDirection::Tpdo {
             return None;
         }
@@ -94,7 +128,30 @@ fn generate_parts(
         }
     });
 
-    let decode_arms = od.pdos.iter().filter_map(|pdo| {
+    let tpdo_pdos: Vec<&PdoDef> = dispatch_pdos
+        .iter()
+        .copied()
+        .filter(|pdo| pdo.direction == PdoDirection::Tpdo)
+        .collect();
+    let potentially_ambiguous_pairs = tpdo_pdos.iter().enumerate().flat_map(|(i, pdo)| {
+        tpdo_pdos.iter().skip(i + 1).filter_map(move |other| {
+            node_id_dependent_collision(pdo, other).then_some((*pdo, *other))
+        })
+    });
+    let ambiguity_checks = potentially_ambiguous_pairs.map(|(pdo, other)| {
+        let cob_method = format_ident!("tpdo{}_cob_id", pdo.number);
+        let other_cob_method = format_ident!("tpdo{}_cob_id", other.number);
+        quote! {
+            if frame.raw_id() == self.#cob_method().raw()
+                && frame.raw_id() == self.#other_cob_method().raw()
+            {
+                return Err(canopen_core::pdo::PdoDecodeError::AmbiguousCobId {
+                    cob_id: frame.raw_id(),
+                });
+            }
+        }
+    });
+    let decode_arms = dispatch_pdos.iter().filter_map(|pdo| {
         if pdo.direction != PdoDirection::Tpdo {
             return None;
         }
@@ -110,12 +167,13 @@ fn generate_parts(
         })
     });
     methods.push(quote! {
-        /// Decode any TPDO configured by the EDS for this remote node.
+        /// Decode any initially active TPDO configured by the EDS for this remote node.
         /// Unrelated CAN frames return `Ok(None)`.
         pub fn decode(
             &self,
             frame: &canopen_core::transport::CanFrame,
         ) -> Result<Option<#tpdo_enum>, canopen_core::pdo::PdoDecodeError> {
+            #(#ambiguity_checks)*
             #(#decode_arms)*
             Ok(None)
         }
@@ -141,7 +199,7 @@ fn generate_pdo(
         .iter()
         .map(|field| {
             let name = &field.name;
-            let ty = rust_type(&field.var)?;
+            let ty = rust_type(field.var)?;
             Ok(quote! { pub #name: #ty })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -170,7 +228,7 @@ fn generate_pdo(
         .iter()
         .map(|mapping| mapping.bit_length as usize)
         .sum();
-    let payload_bytes = (payload_bits + 7) / 8;
+    let payload_bytes = payload_bits.div_ceil(8);
     let mut generated = vec![cob];
     match pdo.direction {
         PdoDirection::Tpdo => {
@@ -255,6 +313,19 @@ fn mapped_fields<'a>(
                     mapping.subindex,
                 )
             })?;
+        let object_bits = wire_bits(&entry.var)?;
+        if bit_length > object_bits {
+            return Err(format!(
+                "{}[{}] maps {} bits from 0x{:04X}:{:02X}, but `{}` is only {} bits",
+                method_stem(pdo),
+                pdo.number,
+                bit_length,
+                mapping.index,
+                mapping.subindex,
+                entry.var.type_name,
+                object_bits,
+            ));
+        }
         if fields
             .iter()
             .any(|field: &MappedField<'_>| field.name == entry.field_name)
@@ -284,8 +355,8 @@ fn method_stem(pdo: &PdoDef) -> &'static str {
     }
 }
 
-fn cob_id_expr(pdo: &PdoDef, node_id_raw: &TokenStream) -> Result<TokenStream, String> {
-    let spec = pdo.cob_id.or_else(|| {
+fn effective_cob_id_spec(pdo: &PdoDef) -> Option<CobIdSpec> {
+    pdo.cob_id.map(mask_cob_id_flags).or_else(|| {
         let base = match (pdo.direction, pdo.number) {
             (PdoDirection::Tpdo, 1) => 0x180,
             (PdoDirection::Tpdo, 2) => 0x280,
@@ -298,7 +369,35 @@ fn cob_id_expr(pdo: &PdoDef, node_id_raw: &TokenStream) -> Result<TokenStream, S
             _ => return None,
         };
         Some(CobIdSpec::NodeRelative(base))
-    });
+    })
+}
+
+fn mask_cob_id_flags(spec: CobIdSpec) -> CobIdSpec {
+    match spec {
+        CobIdSpec::Absolute(raw) => CobIdSpec::Absolute(raw & 0x3fff_ffff),
+        CobIdSpec::NodeRelative(base) => CobIdSpec::NodeRelative(base & 0x3fff_ffff),
+    }
+}
+
+fn node_id_dependent_collision(pdo: &PdoDef, other: &PdoDef) -> bool {
+    match (effective_cob_id_spec(pdo), effective_cob_id_spec(other)) {
+        (Some(CobIdSpec::Absolute(id)), Some(CobIdSpec::NodeRelative(base)))
+        | (Some(CobIdSpec::NodeRelative(base)), Some(CobIdSpec::Absolute(id))) => id
+            .checked_sub(base)
+            .is_some_and(|node_id| (1..=127).contains(&node_id)),
+        _ => false,
+    }
+}
+
+fn pdo_is_disabled(pdo: &PdoDef) -> bool {
+    match pdo.cob_id {
+        Some(CobIdSpec::Absolute(raw) | CobIdSpec::NodeRelative(raw)) => raw & 0x8000_0000 != 0,
+        None => false,
+    }
+}
+
+fn cob_id_expr(pdo: &PdoDef, node_id_raw: &TokenStream) -> Result<TokenStream, String> {
+    let spec = effective_cob_id_spec(pdo);
     let Some(spec) = spec else {
         return Err(format!(
             "{}[{}] has no predefined COB-ID and must declare one",
@@ -306,6 +405,17 @@ fn cob_id_expr(pdo: &PdoDef, node_id_raw: &TokenStream) -> Result<TokenStream, S
             pdo.number
         ));
     };
+    if matches!(
+        spec,
+        CobIdSpec::Absolute(raw) | CobIdSpec::NodeRelative(raw)
+            if raw & 0x2000_0000 != 0
+    ) {
+        return Err(format!(
+            "{}[{}] uses a 29-bit CAN ID; only 11-bit COB-IDs are supported",
+            method_stem(pdo),
+            pdo.number,
+        ));
+    }
     match spec {
         CobIdSpec::Absolute(raw) if raw <= 0x7ff => {
             let raw = raw as u16;
@@ -320,6 +430,18 @@ fn cob_id_expr(pdo: &PdoDef, node_id_raw: &TokenStream) -> Result<TokenStream, S
             method_stem(pdo),
             pdo.number
         )),
+    }
+}
+
+fn wire_bits(var: &VarDef) -> Result<usize, String> {
+    let ty = var.type_name.to_string();
+    match ty.as_str() {
+        "bool" | "u8" | "i8" => Ok(8),
+        "u16" | "i16" => Ok(16),
+        "u24" | "i24" => Ok(24),
+        "u32" | "i32" | "f32" => Ok(32),
+        "f64" => Ok(64),
+        _ => Err(format!("PDO codec does not support mapped type `{ty}`")),
     }
 }
 
@@ -391,5 +513,183 @@ fn decode_field(field: &MappedField<'_>) -> TokenStream {
             canopen_core::pdo::copy_pdo_bits(data, #offset, &mut object_data, 0, #bits);
             #value
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::{AccessKind, EntryKind, MappingKind, OdDefinition, OdEntry, PdoMappingDef};
+    use quote::quote;
+    use syn::parse_quote;
+
+    fn test_od(pdos: Vec<PdoDef>, type_name: syn::Ident) -> OdDefinition {
+        OdDefinition {
+            vis: parse_quote!(pub),
+            name: parse_quote!(Generated),
+            entries: vec![OdEntry {
+                index: 0x6041,
+                name: parse_quote!(statusword),
+                kind: EntryKind::Var(VarDef {
+                    type_name,
+                    capacity: None,
+                    default_value: None,
+                    access: AccessKind::Ro,
+                    pdo_mappable: true,
+                }),
+            }],
+            pdos,
+            sdo_servers: Vec::new(),
+            export_eds_path: None,
+            use_alloc: false,
+            validate_write_fn: None,
+        }
+    }
+
+    fn pdo(
+        direction: PdoDirection,
+        number: u16,
+        cob_id: Option<CobIdSpec>,
+        bit_length: Option<u8>,
+    ) -> PdoDef {
+        PdoDef {
+            direction,
+            number,
+            cob_id,
+            transmission_type: 255,
+            inhibit_time: 0,
+            event_timer: 0,
+            mapping: MappingKind::Immutable,
+            mappings: bit_length
+                .map(|bit_length| {
+                    vec![PdoMappingDef {
+                        field_name: parse_quote!(statusword),
+                        bit_length: Some(bit_length),
+                        raw_mapping: None,
+                    }]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn over_wide_mapping_is_rejected_during_expansion() {
+        let od = test_od(
+            vec![pdo(PdoDirection::Tpdo, 1, None, Some(16))],
+            parse_quote!(u8),
+        );
+
+        let error = match generate_parts(&od, quote!(self.node_id.raw())) {
+            Ok(_) => panic!("over-wide mapping unexpectedly generated a codec"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("maps 16 bits"));
+        assert!(error.contains("only 8 bits"));
+    }
+
+    #[test]
+    fn disabled_mapped_pdo_keeps_direct_codec_but_not_dispatch() {
+        let od = test_od(
+            vec![
+                pdo(
+                    PdoDirection::Tpdo,
+                    1,
+                    Some(CobIdSpec::NodeRelative(0x8000_0180)),
+                    Some(16),
+                ),
+                pdo(PdoDirection::Rpdo, 2, None, None),
+                pdo(
+                    PdoDirection::Rpdo,
+                    3,
+                    Some(CobIdSpec::NodeRelative(0x8000_0400)),
+                    Some(16),
+                ),
+            ],
+            parse_quote!(u16),
+        );
+
+        let (payloads, methods) =
+            generate_parts(&od, quote!(self.node_id.raw())).expect("codec generation failed");
+        let generated = quote!(#(#payloads)* #(#methods)*).to_string();
+
+        assert!(generated.contains("GeneratedTpdo1"));
+        assert!(!generated.contains("GeneratedRpdo2"));
+        assert!(generated.contains("GeneratedRpdo3"));
+        assert!(generated.contains("tpdo1_cob_id"));
+        assert!(generated.contains("decode_tpdo1"));
+        assert!(!generated.contains("rpdo2_cob_id"));
+        assert!(generated.contains("rpdo3_cob_id"));
+        assert!(generated.contains("fn rpdo3"));
+        assert!(
+            generated.contains("enum GeneratedTpdo { }")
+                || generated.contains("enum GeneratedTpdo {}")
+        );
+    }
+
+    #[test]
+    fn duplicate_effective_cob_ids_are_rejected() {
+        let od = test_od(
+            vec![
+                pdo(
+                    PdoDirection::Tpdo,
+                    1,
+                    Some(CobIdSpec::Absolute(0x180)),
+                    Some(16),
+                ),
+                pdo(
+                    PdoDirection::Tpdo,
+                    2,
+                    Some(CobIdSpec::Absolute(0x4000_0180)),
+                    Some(16),
+                ),
+            ],
+            parse_quote!(u16),
+        );
+
+        let error = match generate_parts(&od, quote!(self.node_id.raw())) {
+            Ok(_) => panic!("duplicate COB-IDs unexpectedly generated a codec"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("resolve to the same COB-ID"));
+    }
+
+    #[test]
+    fn extended_can_id_is_rejected_explicitly() {
+        let od = test_od(
+            vec![pdo(
+                PdoDirection::Tpdo,
+                1,
+                Some(CobIdSpec::Absolute(0x2000_0185)),
+                Some(16),
+            )],
+            parse_quote!(u16),
+        );
+
+        let error = match generate_parts(&od, quote!(self.node_id.raw())) {
+            Ok(_) => panic!("29-bit PDO unexpectedly generated a codec"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("uses a 29-bit CAN ID"));
+        assert!(error.contains("only 11-bit COB-IDs are supported"));
+    }
+
+    #[test]
+    fn all_node_relative_tpdos_emit_no_runtime_ambiguity_check() {
+        let od = test_od(
+            vec![
+                pdo(PdoDirection::Tpdo, 1, None, Some(16)),
+                pdo(PdoDirection::Tpdo, 2, None, Some(16)),
+            ],
+            parse_quote!(u16),
+        );
+
+        let (payloads, methods) =
+            generate_parts(&od, quote!(self.node_id.raw())).expect("codec generation failed");
+        let generated = quote!(#(#payloads)* #(#methods)*).to_string();
+
+        assert!(!generated.contains("AmbiguousCobId"));
     }
 }

@@ -153,9 +153,15 @@ sdo_client_from_eds! {
     pub struct DeviceClient = "device.eds";
 }
 let client = DeviceClient::new(node_id);
-let status: u16 = client.read_statusword(&mut can).await?;
-client.write_controlword(0x0F, &mut can).await?;
+let status: u16 = client.read_i6041_s00_statusword(&mut can).await?;
+client.write_i6040_s00_controlword(0x0F, &mut can).await?;
 ```
+
+Both `sdo_client_from_eds!` and `device_from_eds!` always include the OD
+address in generated SDO method names. Fixed subindices use
+`i{index}_s{sub}_{name}`; arrays use `i{index}_{name}` and take the subindex as
+an argument. This keeps names stable when an EDS gains unrelated entries and
+allows duplicate `ParameterName` values without collisions.
 
 Transport-independent typed PDO codec from EDS (the lower-level wire API):
 ```rust
@@ -167,8 +173,15 @@ let frame = pdo.rpdo1(DevicePdoRpdo1 { controlword: 0x0F });
 let event = pdo.decode(&raw_frame)?; // exact EDS COB-IDs; Ok(None) if unrelated
 ```
 
-Normal master-side device API combines friendly typed SDO names with the PDO
-codec; raw index/subindex upload/download methods remain an escape hatch:
+Every statically mapped PDO gets a direct typed codec, including PDOs disabled
+at power-up so a master can use them after enabling them. Generic `decode()`
+dispatch claims only initially active TPDOs; unmapped communication records are
+omitted because they have no static payload shape. The generated codec supports
+11-bit CAN IDs only and rejects EDS PDOs marked as 29-bit.
+
+Normal master-side device API combines address-qualified typed SDO names with
+the PDO codec; raw index/subindex upload/download methods remain an escape
+hatch:
 ```rust
 device_from_eds! {
     pub struct Device = "device.eds";
@@ -179,8 +192,13 @@ match device.decode(&raw_frame)? {
     Some(DeviceTpdo::Tpdo1(status)) => { /* typed fields */ }
     None => {}
 }
-device.write_controlword(0x0F, &mut can).await?;
+device.write_i6040_s00_controlword(0x0F, &mut can).await?;
 ```
+
+EDS provider proc-macro crates can keep the raw file in their own package and
+forward its text to `device_from_eds_content!`. Its declaration syntax and
+generated API are identical to `device_from_eds!`; only the string literal's
+meaning changes from a caller-relative path to the complete EDS contents.
 
 Runtime DCF configuration (requires `alloc` feature):
 ```rust
@@ -194,11 +212,10 @@ dcf.apply_remote(&sdo_driver, &mut can).await?;    // remote node via SDO
 `AsyncCan` trait for async CAN transports. `SdoDriver` drives complete SDO transfers:
 ```rust
 let sdo = SdoDriver::new(target_node);
-let mut demux = CanDemux::new(transport);
-let mut port = demux.sdo_port(target_node);
+let mut port = SdoPort::new(&mut transport, target_node);
 let val = sdo.read_u32(0x1000, 0, &mut port).await?;
-// Non-SDO frames buffered in demux:
-while let Some(hb) = demux.try_recv_heartbeat() { ... }
+// Process non-SDO frames retained while the transfer was active:
+for frame in port.drain_overflow() { ... }
 ```
 
 ## Embedding the monitor (`examples/canopen-egui`)

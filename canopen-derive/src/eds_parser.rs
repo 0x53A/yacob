@@ -6,11 +6,12 @@ use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
 use syn::{braced, bracketed, Ident, LitInt, LitStr, Result, Token, Visibility};
 
-/// Parsed input for `object_dictionary_from_eds!`.
+/// Parsed EDS macro declaration. The caller decides whether `source` is a
+/// filesystem path or the EDS contents themselves.
 pub struct EdsDefinition {
     pub vis: Visibility,
     pub name: Ident,
-    pub file_path: String,
+    pub source: String,
     /// Per-index capacity overrides for variable-length types.
     pub capacity_overrides: std::collections::HashMap<u16, usize>,
 }
@@ -57,7 +58,7 @@ impl Parse for EdsDefinition {
         Ok(EdsDefinition {
             vis,
             name,
-            file_path: path_lit.value(),
+            source: path_lit.value(),
             capacity_overrides,
         })
     }
@@ -65,10 +66,17 @@ impl Parse for EdsDefinition {
 
 /// Parse an EDS file and convert it to an OdDefinition for codegen.
 pub fn parse_eds_to_od(def: EdsDefinition) -> std::result::Result<OdDefinition, syn::Error> {
+    let EdsDefinition {
+        vis,
+        name,
+        source,
+        capacity_overrides,
+    } = def;
+
     // Resolve path relative to CARGO_MANIFEST_DIR
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
         .map_err(|_| syn::Error::new(Span::call_site(), "CARGO_MANIFEST_DIR not set"))?;
-    let full_path = std::path::Path::new(&manifest_dir).join(&def.file_path);
+    let full_path = std::path::Path::new(&manifest_dir).join(&source);
 
     let content = std::fs::read_to_string(&full_path).map_err(|e| {
         syn::Error::new(
@@ -77,12 +85,34 @@ pub fn parse_eds_to_od(def: EdsDefinition) -> std::result::Result<OdDefinition, 
         )
     })?;
 
-    let (entries, pdos) = parse_eds_content_with_overrides(&content, &def.capacity_overrides)
+    parse_eds_source_to_od(vis, name, capacity_overrides, &content)
+}
+
+/// Parse EDS contents embedded in a macro invocation.
+pub fn parse_eds_content_to_od(
+    def: EdsDefinition,
+) -> std::result::Result<OdDefinition, syn::Error> {
+    let EdsDefinition {
+        vis,
+        name,
+        source,
+        capacity_overrides,
+    } = def;
+    parse_eds_source_to_od(vis, name, capacity_overrides, &source)
+}
+
+fn parse_eds_source_to_od(
+    vis: Visibility,
+    name: Ident,
+    capacity_overrides: std::collections::HashMap<u16, usize>,
+    content: &str,
+) -> std::result::Result<OdDefinition, syn::Error> {
+    let (entries, pdos) = parse_eds_content_with_overrides(content, &capacity_overrides)
         .map_err(|e| syn::Error::new(Span::call_site(), format!("EDS parse error: {e}")))?;
 
     Ok(OdDefinition {
-        vis: def.vis,
-        name: def.name,
+        vis,
+        name,
         entries,
         pdos,
         // EDS import of additional SDO servers (0x1201+) is not yet supported;

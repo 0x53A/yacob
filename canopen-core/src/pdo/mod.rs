@@ -7,9 +7,11 @@ pub use engine::{
 
 /// Error returned by EDS-generated remote PDO decoders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum PdoDecodeError {
     WrongCobId { expected: u16, actual: u16 },
     PayloadTooShort { expected: usize, actual: usize },
+    AmbiguousCobId { cob_id: u16 },
 }
 
 impl core::fmt::Display for PdoDecodeError {
@@ -23,6 +25,9 @@ impl core::fmt::Display for PdoDecodeError {
             }
             Self::PayloadTooShort { expected, actual } => {
                 write!(f, "expected at least {expected} PDO bytes, got {actual}")
+            }
+            Self::AmbiguousCobId { cob_id } => {
+                write!(f, "more than one TPDO resolves to COB-ID 0x{cob_id:03X}")
             }
         }
     }

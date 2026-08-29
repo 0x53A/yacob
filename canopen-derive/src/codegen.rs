@@ -1527,7 +1527,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         );
         change_variants.push(quote! { #[doc = #doc] #variant(u8, #ty) });
         decode_arms.push(quote! {
-            (#index, sub) if sub >= 1 && sub <= #count_u8 =>
+            (#index, sub) if (1..=#count_u8).contains(&sub) =>
                 Some(#change_name::#variant(sub, self.#fname[(sub as usize) - 1])),
         });
     }

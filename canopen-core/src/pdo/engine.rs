@@ -55,33 +55,6 @@ const fn is_dummy_mapping_index(index: u16) -> bool {
     matches!(index, 0x0001..=0x0007)
 }
 
-fn copy_bits(
-    src: &[u8],
-    src_bit_offset: usize,
-    dst: &mut [u8],
-    dst_bit_offset: usize,
-    bit_len: usize,
-) {
-    if src_bit_offset % 8 == 0 && dst_bit_offset % 8 == 0 && bit_len % 8 == 0 {
-        let byte_len = bit_len / 8;
-        let src_start = src_bit_offset / 8;
-        let dst_start = dst_bit_offset / 8;
-        dst[dst_start..dst_start + byte_len].copy_from_slice(&src[src_start..src_start + byte_len]);
-        return;
-    }
-
-    for bit in 0..bit_len {
-        let src_bit = src_bit_offset + bit;
-        let dst_bit = dst_bit_offset + bit;
-        let value = (src[src_bit / 8] >> (src_bit % 8)) & 1;
-        if value != 0 {
-            dst[dst_bit / 8] |= 1 << (dst_bit % 8);
-        } else {
-            dst[dst_bit / 8] &= !(1 << (dst_bit % 8));
-        }
-    }
-}
-
 const fn bytes_for_bits(bits: usize) -> usize {
     (bits + 7) / 8
 }
@@ -558,7 +531,7 @@ impl<const N: usize> TpdoEngine<N> {
             {
                 return None;
             }
-            copy_bits(
+            super::copy_pdo_bits(
                 &object_data[..object_len],
                 0,
                 &mut data,
@@ -601,7 +574,7 @@ fn apply_mapped<OD: ObjectDictionary, const EVT_QUEUE: usize>(
             bit_offset = end_bit;
             continue;
         }
-        copy_bits(data, bit_offset, &mut object_data, 0, bit_len);
+        super::copy_pdo_bits(data, bit_offset, &mut object_data, 0, bit_len);
         if od
             .write(mapping.index, mapping.subindex, &object_data[..object_len])
             .is_ok()
