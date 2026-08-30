@@ -2,7 +2,90 @@
 
 > Prototype status (2026-08-30): implemented as `canopen-gateway`, with unit
 > tests and an integration test using `device_from_eds!`. It deliberately has
-> no ROS dependency.
+> no ROS dependency. It merges and tests successfully with current `main`, but
+> the blockers below must be resolved before the crate is imported there.
+
+## Pre-main integration blockers
+
+These are defects or unresolved contracts in the prototype, not optional
+future enhancements. Passing the existing tests does not close them.
+
+### Fair reselection after an abandoned PDO
+
+`LatestPdoSet::confirm` advances the round-robin cursor, but `abandon` only
+clears `in_flight`. If slot 0 fails while slot 1 is also ready, the next
+`prepare_next` can select slot 0 again. Repeated adapter errors on one slot can
+therefore contradict the documented fair-reselection behavior and delay other
+commands.
+
+**Acceptance:** abandoning a valid selection retains its original sample and
+validity deadline but advances selection past that slot. Add a two-slot
+regression proving that a ready peer is selected next and the abandoned sample
+is still available afterward.
+
+### `PreparedPdo` exposes confirmation invariants
+
+All `PreparedPdo` fields are public. External code can fabricate a value with
+a chosen slot and generation and pass it to `confirm` or `abandon`. Generation
+checking limits some damage, but the API should not make an internal commit
+token constructible by callers.
+
+**Acceptance:** keep the frame available for transmission through accessors,
+but make the slot, generation, and timestamp/invariant fields private. Only
+`LatestPdoSet` may construct a token. Retain tests for stale confirmation,
+double confirmation, and a newer sample replacing the prepared generation.
+
+### Direct TPDO decoders do not perform bus dispatch
+
+An EDS-generated `decode_tpdoN(frame)` expects that exact PDO and returns
+`WrongCobId` for unrelated traffic. Using
+`decode_tpdo1(frame).map(Some)` as a `PdoToTopic` decode closure therefore
+misclassifies every other bus frame as a malformed matching PDO. The original
+README example had this bug and has been replaced with exact generated
+`device.decode()` dispatch.
+
+**Acceptance:** keep the README example on the EDS-aware dispatcher (or add an
+explicit exact-COB-ID prefilter) and add an integration assertion that an
+unrelated frame and another valid TPDO both return `Ok(None)` for the TPDO1
+route, while malformed TPDO1 data remains a decode error.
+
+### `SdoCall::execute` supports only the default SDO channel
+
+`ServiceQueue` can be instantiated once per logical channel, but execution
+always constructs `SdoDriver::new(target)`. That driver uses the default
+`0x600 + node` request and `0x580 + node` response COB-IDs. The earlier claim
+that the complete API supports every configured additional SDO server channel
+was therefore too broad.
+
+**Acceptance:** either add an explicit request/response COB-ID channel to the
+call/runner and test two independent channels, or deliberately scope the
+public API and all documentation to the default SDO channel. Do not claim
+additional-channel support based on queue separation alone.
+
+### Active timeout means total transfer deadline
+
+`SdoCall::execute(timeout_us)` delegates to `SdoDriver::*_timed`, which computes
+one deadline before the initial request. Progress during a segmented transfer
+does not reset it. This differs from an inactivity or response-silence timeout
+and can fail a healthy long transfer even though every segment arrives
+promptly.
+
+**Acceptance:** choose and name the intended gateway policy explicitly. If it
+remains a total deadline, document and test that boundary. If it is meant to
+detect silence, implement a progress-reset inactivity timeout in the SDO
+runner and test both ongoing progress and a stalled segment.
+
+### Transport diagnostics are erased at the service boundary
+
+`map_sdo_error` reduces `SdoError::Transport(error)` to the stable
+`SdoFailure::Transport` unit variant. Keeping adapter types out of middleware
+responses is desirable, but the underlying error is currently lost before an
+adapter can log or report it.
+
+**Acceptance:** preserve the stable service failure vocabulary while giving
+the runner an explicit diagnostic path (for example structured logging or a
+callback) that receives the original transport error before reduction. Add a
+test proving both the stable response and diagnostic observation occur.
 
 ## What was repeated in the existing gateways
 
@@ -108,8 +191,9 @@ still need the state machines now provided explicitly.
 - A newer value in the prepared slot supersedes the unaccepted frame.
 - Confirmation is generation checked, so confirming an older selection never
   clears a newer sample.
-- Transport failure may abandon the selection for later fair reselection; its
-  original age is retained.
+- Transport failure may abandon the selection while retaining its original
+  age. Fair reselection after abandonment is a known blocker above; only
+  successful confirmation currently advances the cursor.
 
 ### `ServiceToSdo` / `ServiceQueue`
 
@@ -129,6 +213,11 @@ still need the state machines now provided explicitly.
   client buffer.
 - `SdoAbort` retains every raw 32-bit abort code. `known()` classifies standard
   CiA 301 values without rewriting unknown/profile-specific values.
+- Built-in `SdoCall::execute` currently addresses only the default SDO channel;
+  separate queues do not yet provide additional-channel execution.
+- Its active timeout is a whole-transfer deadline, not a progress-reset
+  inactivity deadline, and transport failures lose their adapter-specific
+  diagnostic during response mapping. Both are tracked as blockers above.
 
 ## Migration order
 

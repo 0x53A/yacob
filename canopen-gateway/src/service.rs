@@ -45,10 +45,13 @@ pub enum SdoFailure {
 impl SdoCall {
     /// Execute this call with the stack's high-level SDO driver.
     ///
-    /// The timeout is a protocol-response deadline, distinct from a
-    /// [`ServiceQueue`]'s pre-start queue age. Transport details are reduced to
+    /// This currently uses the target node's default SDO channel. The timeout
+    /// is one deadline for the complete transfer, not an inactivity deadline
+    /// reset by segmented progress, and is distinct from a [`ServiceQueue`]'s
+    /// pre-start queue age. Transport details are reduced to
     /// [`SdoFailure::Transport`] so middleware response schemas do not depend
-    /// on a particular CAN adapter error type.
+    /// on a particular CAN adapter error type; callers that need adapter
+    /// diagnostics must record them before this conversion currently occurs.
     pub async fn execute<E: core::fmt::Debug>(
         &self,
         can: &mut impl AsyncCan<Error = E>,

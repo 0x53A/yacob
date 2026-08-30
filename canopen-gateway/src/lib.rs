@@ -8,7 +8,8 @@
 //! - pass subscription messages through [`TopicToPdo`] into a shared
 //!   [`LatestPdoSet`], then transmit prepared frames;
 //! - pass service requests through [`ServiceToSdo`] and serialize them with a
-//!   [`ServiceQueue`] for each SDO server channel.
+//!   [`ServiceQueue`]. The built-in [`SdoCall::execute`] currently addresses
+//!   only the default SDO server channel.
 //!
 //! The policies that caused subtle differences between hand-written gateways
 //! are explicit here: no implicit inbound buffering, latest-only RPDO slots,

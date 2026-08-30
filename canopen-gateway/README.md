@@ -3,6 +3,10 @@
 Code-first, middleware-neutral primitives for mapping a remote CANopen object
 dictionary onto topics and services.
 
+> **Prototype:** this crate is not ready to move to `main`. The known API and
+> behavioral blockers are summarized below and tracked with acceptance criteria
+> in [`_Tasks/gateway-abstractions.md`](../_Tasks/gateway-abstractions.md#pre-main-integration-blockers).
+
 The crate intentionally stops below ROS. Generated message types, publishers,
 subscriptions, and service responders stay in the application, while the hard
 behavioral contracts live here:
@@ -20,7 +24,10 @@ topics without accidentally returning stale state.
 
 ```rust,ignore
 let tpdo1 = PdoToTopic::new(
-    move |frame| device.decode_tpdo1(frame).map(Some),
+    move |frame| match device.decode(frame)? {
+        Some(DeviceTpdo::Tpdo1(payload)) => Ok(Some(payload)),
+        Some(_) | None => Ok(None),
+    },
     |pdo| Ok::<_, Infallible>(StatusMsg::from(pdo)),
 );
 
@@ -51,9 +58,35 @@ if let Some(prepared) = outgoing_pdos.prepare_next(Instant::now()) {
 }
 ```
 
-An SDO service uses one `ServiceQueue` per configured SDO server channel. The
-queue serializes calls; `SdoCall::execute` runs the selected operation through
-the existing `SdoDriver` and a `SharedCanBus` filtered subscription. Active
-timeouts belong to that runner, because only it can safely cancel a live
-protocol transfer. SDO aborts retain the exact remote 32-bit value, including
-manufacturer-specific codes.
+An SDO service uses a `ServiceQueue` to serialize calls. `SdoCall::execute`
+runs the selected operation through the existing `SdoDriver` and a
+`SharedCanBus` filtered subscription. SDO aborts retain the exact remote
+32-bit value, including manufacturer-specific codes.
+
+## Known prototype limitations
+
+- `LatestPdoSet::abandon` retains the sample but does not advance the
+  round-robin cursor. A repeatedly failing slot can therefore be selected
+  again immediately and delay another ready slot. Do not rely on fair
+  reselection after transport errors yet.
+- `PreparedPdo` exposes its slot, generation, and timestamps as public fields.
+  This lets external callers construct confirmation values that were not
+  issued by `LatestPdoSet`; those invariant-bearing fields must become private
+  before the API is considered stable.
+- A direct generated `decode_tpdoN` call reports an unrelated frame as
+  `WrongCobId`. A `PdoToTopic` route must first dispatch with `device.decode()`,
+  as above, or otherwise prefilter the exact COB-ID. Treating
+  `decode_tpdoN(frame).map(Some)` as a general bus route incorrectly reports
+  unrelated traffic as malformed.
+- Although multiple `ServiceQueue` instances can serialize separate logical
+  channels, `SdoCall::execute` currently constructs `SdoDriver::new(target)`
+  and therefore uses only the default SDO request/response COB-IDs. Additional
+  configured SDO server channels are not supported by the execution API yet.
+- The `timeout_us` passed to `SdoCall::execute` is one deadline for the entire
+  transfer. It is not an inactivity timeout reset by segmented-transfer
+  progress. Gateways must size it for the complete transfer until this policy
+  is changed.
+- `SdoFailure::Transport` intentionally has a middleware-stable shape, but
+  conversion currently discards the adapter's underlying error. The runner
+  must log or otherwise retain that diagnostic before mapping a failure into a
+  service response.
