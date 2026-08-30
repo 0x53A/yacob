@@ -1,6 +1,6 @@
 use crate::dsl::{
     AccessKind, CobIdSpec, EntryKind, MappingKind, OdDefinition, OdEntry, PdoDef, PdoDirection,
-    PdoMappingDef, SubEntry, VarDef,
+    PdoMappingDef, SubEntry, VarDef, PDO_MAX_MAPPINGS,
 };
 use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
@@ -304,7 +304,7 @@ fn parse_eds_content_with_overrides(
     entries.sort_by_key(|e| e.index);
 
     // Third pass: extract PDO definitions from comm/mapping indices
-    let pdos = extract_pdos(&sections, &mut entries);
+    let pdos = extract_pdos(&sections, &mut entries)?;
 
     Ok((entries, pdos))
 }
@@ -343,7 +343,7 @@ fn is_pdo_index(index: u16) -> bool {
 fn extract_pdos(
     sections: &[(String, Vec<(String, String)>)],
     entries: &mut [OdEntry],
-) -> Vec<PdoDef> {
+) -> std::result::Result<Vec<PdoDef>, String> {
     let mut pdos = Vec::new();
 
     // Helper: look up props for a given section like "1800sub2"
@@ -373,28 +373,36 @@ fn extract_pdos(
             .and_then(|v| parse_pdo_cob_id(&v));
 
         // Read transmission type from sub2
-        let transmission_type = get_section_props(&format!("{:04X}sub2", comm_idx))
-            .and_then(|props| get_prop(props, "DefaultValue"))
-            .and_then(|v| parse_int(&v))
-            .unwrap_or(255) as u8;
+        let transmission_type = parse_pdo_default(
+            get_section_props(&format!("{:04X}sub2", comm_idx)),
+            255u8,
+            comm_idx,
+            2,
+            "transmission type",
+        )?;
+        validate_pdo_transmission_type(transmission_type, PdoDirection::Tpdo, comm_idx)?;
 
         // Read inhibit time from sub3
-        let inhibit_time = get_section_props(&format!("{:04X}sub3", comm_idx))
-            .and_then(|props| get_prop(props, "DefaultValue"))
-            .and_then(|v| parse_int(&v))
-            .unwrap_or(0) as u16;
+        let inhibit_time = parse_pdo_default(
+            get_section_props(&format!("{:04X}sub3", comm_idx)),
+            0u16,
+            comm_idx,
+            3,
+            "inhibit time",
+        )?;
 
         // Read event timer from sub5
-        let event_timer = get_section_props(&format!("{:04X}sub5", comm_idx))
-            .and_then(|props| get_prop(props, "DefaultValue"))
-            .and_then(|v| parse_int(&v))
-            .unwrap_or(0) as u16;
+        let event_timer = parse_pdo_default(
+            get_section_props(&format!("{:04X}sub5", comm_idx)),
+            0u16,
+            comm_idx,
+            5,
+            "event timer",
+        )?;
 
         // Read mapping count from mapping sub0
-        let map_count = get_section_props(&format!("{:04X}sub0", map_idx))
-            .and_then(|props| get_prop(props, "DefaultValue"))
-            .and_then(|v| parse_int(&v))
-            .unwrap_or(0) as u8;
+        let map_count =
+            parse_pdo_mapping_count(get_section_props(&format!("{:04X}sub0", map_idx)), map_idx)?;
 
         let mapping = mapping_kind_from_access(
             get_section_props(&format!("{:04X}sub0", map_idx))
@@ -445,21 +453,26 @@ fn extract_pdos(
             .and_then(|props| get_prop(props, "DefaultValue"))
             .and_then(|v| parse_pdo_cob_id(&v));
 
-        let transmission_type = get_section_props(&format!("{:04X}sub2", comm_idx))
-            .and_then(|props| get_prop(props, "DefaultValue"))
-            .and_then(|v| parse_int(&v))
-            .unwrap_or(255) as u8;
+        let transmission_type = parse_pdo_default(
+            get_section_props(&format!("{:04X}sub2", comm_idx)),
+            255u8,
+            comm_idx,
+            2,
+            "transmission type",
+        )?;
+        validate_pdo_transmission_type(transmission_type, PdoDirection::Rpdo, comm_idx)?;
 
         // Sub 5 event timer = reception deadline monitoring for RPDOs
-        let event_timer = get_section_props(&format!("{:04X}sub5", comm_idx))
-            .and_then(|props| get_prop(props, "DefaultValue"))
-            .and_then(|v| parse_int(&v))
-            .unwrap_or(0) as u16;
+        let event_timer = parse_pdo_default(
+            get_section_props(&format!("{:04X}sub5", comm_idx)),
+            0u16,
+            comm_idx,
+            5,
+            "event timer",
+        )?;
 
-        let map_count = get_section_props(&format!("{:04X}sub0", map_idx))
-            .and_then(|props| get_prop(props, "DefaultValue"))
-            .and_then(|v| parse_int(&v))
-            .unwrap_or(0) as u8;
+        let map_count =
+            parse_pdo_mapping_count(get_section_props(&format!("{:04X}sub0", map_idx)), map_idx)?;
 
         let mapping = mapping_kind_from_access(
             get_section_props(&format!("{:04X}sub0", map_idx))
@@ -493,7 +506,82 @@ fn extract_pdos(
         });
     }
 
-    pdos
+    Ok(pdos)
+}
+
+/// Wire type of a PDO communication/mapping parameter, for error messages.
+trait PdoWireType: TryFrom<u64> {
+    const EDS_NAME: &'static str;
+}
+
+impl PdoWireType for u8 {
+    const EDS_NAME: &'static str = "UNSIGNED8";
+}
+
+impl PdoWireType for u16 {
+    const EDS_NAME: &'static str = "UNSIGNED16";
+}
+
+/// Read a PDO parameter's `DefaultValue` and narrow it to its wire type.
+///
+/// A missing key and an empty value both mean "not specified" and fall back to
+/// the CiA 301 default. EDS files routinely write a bare `DefaultValue=` for a
+/// parameter they leave at its default, so treating that as a parse failure
+/// would reject ordinary vendor files. Anything non-empty must parse and fit:
+/// a typo or an out-of-range value stays a hard error instead of silently
+/// truncating into a different, valid mode.
+fn parse_pdo_default<T: PdoWireType>(
+    props: Option<&Vec<(String, String)>>,
+    default: T,
+    index: u16,
+    subindex: u8,
+    name: &str,
+) -> std::result::Result<T, String> {
+    let Some(raw) = props.and_then(|props| get_prop(props, "DefaultValue")) else {
+        return Ok(default);
+    };
+    if raw.trim().is_empty() {
+        return Ok(default);
+    }
+    let value = parse_int(&raw)
+        .ok_or_else(|| format!("invalid {name} `{raw}` at 0x{index:04X}:{subindex:02X}"))?;
+    T::try_from(value).map_err(|_| {
+        format!(
+            "{name} `{raw}` at 0x{index:04X}:{subindex:02X} does not fit {}",
+            T::EDS_NAME
+        )
+    })
+}
+
+fn parse_pdo_mapping_count(
+    props: Option<&Vec<(String, String)>>,
+    index: u16,
+) -> std::result::Result<u8, String> {
+    let count = parse_pdo_default(props, 0u8, index, 0, "PDO mapping count")?;
+    if count as usize > PDO_MAX_MAPPINGS {
+        return Err(format!(
+            "PDO mapping count `{count}` at 0x{index:04X}:00 exceeds this stack's limit of {PDO_MAX_MAPPINGS}"
+        ));
+    }
+    Ok(count)
+}
+
+fn validate_pdo_transmission_type(
+    value: u8,
+    direction: PdoDirection,
+    index: u16,
+) -> std::result::Result<(), String> {
+    if (241..=251).contains(&value) {
+        return Err(format!(
+            "reserved PDO transmission type `{value}` at 0x{index:04X}:02"
+        ));
+    }
+    if direction == PdoDirection::Rpdo && matches!(value, 252 | 253) {
+        return Err(format!(
+            "RTR transmission type `{value}` at 0x{index:04X}:02 is TPDO-only"
+        ));
+    }
+    Ok(())
 }
 
 /// Map an EDS mapping-record AccessType to mapping mutability. `ro` and
@@ -838,5 +926,92 @@ DataType=0x0007
 "#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn pdo_parameters_reject_values_wider_than_their_wire_types() {
+        for (section, value, expected) in [
+            ("1800sub2", "256", "does not fit UNSIGNED8"),
+            ("1800sub2", "not-a-number", "invalid transmission type"),
+            ("1800sub3", "65536", "does not fit UNSIGNED16"),
+            ("1800sub5", "0x10000", "does not fit UNSIGNED16"),
+            ("1400sub5", "99999", "does not fit UNSIGNED16"),
+            ("1A00sub0", "256", "does not fit UNSIGNED8"),
+        ] {
+            let comm_index = if section.starts_with("14") {
+                "1400"
+            } else {
+                "1800"
+            };
+            let eds = format!(
+                "[{comm_index}]\nParameterName=PDO communication\nObjectType=0x9\n\
+                 [{section}]\nParameterName=Parameter\nObjectType=0x7\nDefaultValue={value}\n"
+            );
+            let err = parse_eds_content(&eds).unwrap_err();
+            assert!(
+                err.contains(expected),
+                "{section}={value}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn pdo_parameters_treat_an_empty_default_value_as_unspecified() {
+        // Vendor EDS files routinely write a bare `DefaultValue=` for a
+        // parameter left at its CiA 301 default. That must import, not fail.
+        let (_, pdos) = parse_eds_content(
+            "[1800]\nParameterName=TPDO communication\nObjectType=0x9\n\
+             [1800sub2]\nParameterName=Transmission type\nObjectType=0x7\nDefaultValue=\n\
+             [1800sub3]\nParameterName=Inhibit time\nObjectType=0x7\nDefaultValue=   \n\
+             [1800sub5]\nParameterName=Event timer\nObjectType=0x7\nDefaultValue=\n",
+        )
+        .expect("empty DefaultValue must fall back to the spec default");
+
+        let tpdo = pdos
+            .iter()
+            .find(|p| p.direction == PdoDirection::Tpdo)
+            .expect("TPDO1");
+        assert_eq!(tpdo.transmission_type, 255);
+        assert_eq!(tpdo.inhibit_time, 0);
+        assert_eq!(tpdo.event_timer, 0);
+    }
+
+    #[test]
+    fn pdo_mapping_count_rejects_values_above_stack_capacity() {
+        let err = parse_eds_content(
+            r#"
+[1800]
+ParameterName=TPDO communication
+ObjectType=0x9
+
+[1A00sub0]
+ParameterName=Number of mapped objects
+ObjectType=0x7
+DefaultValue=65
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("PDO mapping count `65`"));
+        assert!(err.contains("limit of 64"));
+    }
+
+    #[test]
+    fn pdo_transmission_type_rejects_reserved_and_wrong_direction_values() {
+        for (comm_index, value, expected) in [
+            ("1800", 245, "reserved PDO transmission type"),
+            ("1400", 252, "is TPDO-only"),
+            ("1400", 253, "is TPDO-only"),
+        ] {
+            let eds = format!(
+                "[{comm_index}]\nParameterName=PDO communication\nObjectType=0x9\n\
+                 [{comm_index}sub2]\nParameterName=Transmission type\nObjectType=0x7\nDefaultValue={value}\n"
+            );
+            let err = parse_eds_content(&eds).unwrap_err();
+            assert!(
+                err.contains(expected),
+                "0x{comm_index}:02={value}: unexpected error: {err}"
+            );
+        }
     }
 }

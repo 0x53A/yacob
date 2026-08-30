@@ -146,7 +146,8 @@ impl SyncConsumer {
     /// A SYNC carries either no data or a single counter byte (CiA 301
     /// §7.2.5.2.1); anything longer is malformed and rejected. Without a
     /// counter byte the returned value is synthetic — this consumer's own
-    /// count of pulses seen — so callers always get a monotonic tick.
+    /// wrapping `u8` count of pulses seen. It wraps through zero after 255;
+    /// callers must not treat it as a never-decreasing timestamp.
     pub fn process(&mut self, frame: &CanFrame) -> Option<u8> {
         if self.cob_id == 0 || frame.raw_id() != self.cob_id || frame.raw_dlc() > 1 {
             return None;

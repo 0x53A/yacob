@@ -68,4 +68,9 @@ reactive, and scan application models are agreed but their public APIs are not
 implemented yet; the current event-queue APIs are transitional. See
 `_Tasks/application-models.md` for the design and implementation status.
 
+Before using the stack for command or safety traffic, read the canonical
+[`_Tasks/known-issues.md`](_Tasks/known-issues.md) defect index and the
+[`_Tasks/conformance-matrix.md`](_Tasks/conformance-matrix.md). In particular,
+RPDO acceptance is not yet transactional for malformed process images.
+
 Nevertheless, I am already using it for a few private projects, both implementating CANopen nodes, or interacting with existing hardware like DS402 motor drivers.

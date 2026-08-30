@@ -34,9 +34,15 @@ struct BlockUploadState {
     buf: [u8; 889],
     total_len: usize,
     offset: usize, // how far we've sent
-    blksize: u8,   // segments per sub-block
-    seqno: u8,     // current segment number within sub-block (1-based)
-    crc: u16,      // running CRC-16/CCITT
+    /// Offset at which the current sub-block started. Used with the client's
+    /// ACK sequence number to rewind to the first unacknowledged segment.
+    subblock_start_offset: usize,
+    blksize: u8, // segments per sub-block
+    seqno: u8,   // current segment number within sub-block (1-based)
+    /// Number of the last segment offered in the current sub-block. `seqno`
+    /// becomes zero while waiting for the ACK, so this is retained separately.
+    last_seqno: u8,
+    crc: u16, // running CRC-16/CCITT
     last_activity_us: u64,
 }
 
@@ -258,6 +264,7 @@ impl SdoServer {
         } else {
             state.seqno += 1;
         }
+        state.last_seqno = frame[0] & 0x7F;
 
         Some(frame)
     }
@@ -621,6 +628,11 @@ impl SdoServer {
                 let client_blksize = request[4];
                 let _crc_supported = (request[0] & 0x04) != 0;
 
+                if !(1..=MAX_BLKSIZE).contains(&client_blksize) {
+                    *response = encode_abort(index, subindex, AbortCode::InvalidBlockSize);
+                    return Ok(());
+                }
+
                 let mut buf = [0u8; 889];
                 let len = match od.read(index, subindex, &mut buf) {
                     Ok(n) => n,
@@ -630,7 +642,7 @@ impl SdoServer {
                     }
                 };
 
-                let blksize = client_blksize.min(MAX_BLKSIZE);
+                let blksize = client_blksize;
 
                 // SCS=6, sc=0 (initiate), ss=1 (size indicated), cc=1 (CRC supported)
                 *response = [0; 8];
@@ -646,8 +658,10 @@ impl SdoServer {
                     buf,
                     total_len: len,
                     offset: 0,
+                    subblock_start_offset: 0,
                     blksize,
                     seqno: 0, // waiting for "start upload" from client
+                    last_seqno: 0,
                     crc: 0,
                     last_activity_us: now_us,
                 }));
@@ -675,9 +689,32 @@ impl SdoServer {
                 // Sub-block ACK from client (cs=2, block upload response)
                 match &mut self.transfer {
                     Some(TransferState::BlockUpload(state)) if state.seqno == 0 => {
-                        let _ackseq = request[1];
+                        let ackseq = request[1];
                         let new_blksize = request[2];
-                        state.blksize = new_blksize.min(MAX_BLKSIZE);
+                        if !(1..=MAX_BLKSIZE).contains(&new_blksize) {
+                            let (index, subindex) = (state.index, state.subindex);
+                            self.transfer = None;
+                            *response = encode_abort(index, subindex, AbortCode::InvalidBlockSize);
+                            return Ok(());
+                        }
+                        if ackseq > state.last_seqno {
+                            let (index, subindex) = (state.index, state.subindex);
+                            self.transfer = None;
+                            *response =
+                                encode_abort(index, subindex, AbortCode::InvalidSequenceNumber);
+                            return Ok(());
+                        }
+
+                        // ACK may stop before the end of the sub-block. Resume
+                        // with the first unacknowledged payload byte, numbering
+                        // the retransmission sub-block from one as required by
+                        // the block protocol.
+                        let acknowledged = usize::from(ackseq) * 7;
+                        state.offset =
+                            (state.subblock_start_offset + acknowledged).min(state.total_len);
+                        state.crc = crc16_ccitt_update(0, &state.buf[..state.offset]);
+                        state.subblock_start_offset = state.offset;
+                        state.blksize = new_blksize;
                         state.last_activity_us = now_us;
 
                         if state.offset >= state.total_len {
@@ -698,6 +735,7 @@ impl SdoServer {
                         } else {
                             // More data to send — start next sub-block
                             state.seqno = 1;
+                            state.last_seqno = 0;
                             Err(()) // poll_block_upload sends segments
                         }
                     }
@@ -1558,6 +1596,155 @@ mod tests {
 
         // Transfer should be cleared
         assert!(server.check_timeout(10_000_000).is_none());
+    }
+
+    #[test]
+    fn block_upload_retransmits_after_partial_ack() {
+        let mut server = SdoServer::new();
+        let mut od = TestOd::new();
+        for (i, byte) in od.long_data.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        let mut resp = [0u8; 8];
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        // Initiate a CRC-capable block upload with three segments per block.
+        let init = [0xA4, 0x01, 0x20, 0x00, 3, 0, 0, 0];
+        server
+            .process(
+                &init,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                0,
+            )
+            .unwrap();
+        assert_eq!(resp[0], 0xC6);
+
+        let start = [0xA3, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            server.process(
+                &start,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                1,
+            ),
+            Err(())
+        );
+
+        let first = server.poll_block_upload(2).unwrap();
+        let second = server.poll_block_upload(3).unwrap();
+        let third = server.poll_block_upload(4).unwrap();
+        assert_eq!(first[0], 1);
+        assert_eq!(second[0], 2);
+        assert_eq!(third[0], 0x83, "final segment in the first attempt");
+
+        // Only segment 1 arrived. The next sub-block must restart at byte 7,
+        // not skip ahead to the end of the object.
+        let partial_ack = [0xA2, 1, 2, 0, 0, 0, 0, 0];
+        assert_eq!(
+            server.process(
+                &partial_ack,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                5,
+            ),
+            Err(())
+        );
+        let retry_first = server.poll_block_upload(6).unwrap();
+        let retry_second = server.poll_block_upload(7).unwrap();
+        assert_eq!(retry_first[0], 1);
+        assert_eq!(&retry_first[1..8], &od.long_data[7..14]);
+        assert_eq!(retry_second[0], 0x82);
+        assert_eq!(&retry_second[1..7], &od.long_data[14..20]);
+
+        let final_ack = [0xA2, 2, 2, 0, 0, 0, 0, 0];
+        server
+            .process(
+                &final_ack,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                8,
+            )
+            .unwrap();
+        assert_eq!(resp[0], 0xC5, "end response with one unused byte");
+        assert_eq!(
+            u16::from_le_bytes([resp[1], resp[2]]),
+            crc16_ccitt_update(0, &od.long_data)
+        );
+    }
+
+    #[test]
+    fn block_upload_rejects_invalid_block_sizes() {
+        let mut server = SdoServer::new();
+        let mut od = TestOd::new();
+        let mut resp = [0u8; 8];
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        let invalid_init = [0xA4, 0x01, 0x20, 0x00, 0, 0, 0, 0];
+        server
+            .process(
+                &invalid_init,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                0,
+            )
+            .unwrap();
+        assert_eq!(command_specifier(resp[0]), Scs::AbortTransfer as u8);
+        assert_eq!(
+            u32::from_le_bytes(resp[4..8].try_into().unwrap()),
+            AbortCode::InvalidBlockSize as u32
+        );
+
+        let init = [0xA4, 0x01, 0x20, 0x00, 1, 0, 0, 0];
+        server
+            .process(
+                &init,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                1,
+            )
+            .unwrap();
+        let start = [0xA3, 0, 0, 0, 0, 0, 0, 0];
+        assert!(server
+            .process(
+                &start,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                2,
+            )
+            .is_err());
+        let _ = server.poll_block_upload(3).unwrap();
+
+        let invalid_ack = [0xA2, 1, 0, 0, 0, 0, 0, 0];
+        server
+            .process(
+                &invalid_ack,
+                &mut od,
+                &mut resp,
+                &mut events,
+                NmtState::Operational,
+                4,
+            )
+            .unwrap();
+        assert_eq!(command_specifier(resp[0]), Scs::AbortTransfer as u8);
+        assert_eq!(
+            u32::from_le_bytes(resp[4..8].try_into().unwrap()),
+            AbortCode::InvalidBlockSize as u32
+        );
     }
 
     #[test]

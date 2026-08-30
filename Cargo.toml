@@ -16,6 +16,7 @@ exclude = [
     "examples/stm32-node",
     "examples/stm32-fwupdate",
     "examples/emdm-fwupdate",
+    "examples/f767-canwsd-fwupdate",
 ]
 
 [workspace.package]

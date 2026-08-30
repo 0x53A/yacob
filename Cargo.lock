@@ -441,6 +441,8 @@ dependencies = [
  "canopen-linux",
  "clap",
  "crc",
+ "embedded-can",
+ "nb 1.1.0",
 ]
 
 [[package]]

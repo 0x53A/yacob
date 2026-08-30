@@ -334,7 +334,14 @@ pub struct TpdoEngine<const N: usize = 4> {
     /// which is generally not the same processing cycle: the caller's dirty
     /// set is rebuilt and cleared every cycle, so the trigger has to be
     /// latched here or it is lost between pulses.
-    event_pending: [bool; N],
+    sync_event_pending: [bool; N],
+    /// Application event latched for an asynchronous event-driven TPDO
+    /// (types 254/255), waiting for inhibit time to expire.
+    ///
+    /// Changes are coalesced per TPDO: when the PDO becomes eligible it samples
+    /// the latest process image once. Keeping this state per PDO also means
+    /// correctness does not depend on the caller's bounded dirty-address set.
+    async_event_pending: [bool; N],
 }
 
 impl<const N: usize> TpdoEngine<N> {
@@ -343,7 +350,8 @@ impl<const N: usize> TpdoEngine<N> {
             pdos,
             sync_counter: [0; N],
             last_send_us: [0; N],
-            event_pending: [false; N],
+            sync_event_pending: [false; N],
+            async_event_pending: [false; N],
         }
     }
 
@@ -363,6 +371,43 @@ impl<const N: usize> TpdoEngine<N> {
 
     pub(crate) fn config_slot_mut(&mut self, slot: usize) -> Option<&mut TpdoConfig> {
         self.pdos.get_mut(slot)
+    }
+
+    /// Latch an application change in every TPDO which maps it.
+    ///
+    /// Type 0 retains the trigger until SYNC. Types 254/255 retain it until
+    /// inhibit time permits transmission. Cyclic synchronous types ignore
+    /// application changes.
+    pub(crate) fn notify_changed(&mut self, index: u16, subindex: u8) {
+        for slot in 0..N {
+            if self.pdos[slot].enabled
+                && self.pdos[slot]
+                    .mappings
+                    .iter()
+                    .any(|m| m.index == index && m.subindex == subindex)
+            {
+                self.latch_slot_event(slot);
+            }
+        }
+    }
+
+    /// Latch an already mapping-resolved TPDO event.
+    ///
+    /// Used by [`crate::node::OdGuard`], which has already compared every
+    /// mapping against its OD snapshot and can therefore avoid a bounded list
+    /// of changed addresses entirely.
+    pub(crate) fn latch_slot_event(&mut self, slot: usize) {
+        let Some(pdo) = self.pdos.get(slot) else {
+            return;
+        };
+        if !pdo.enabled {
+            return;
+        }
+        match pdo.transmission_type {
+            0 => self.sync_event_pending[slot] = true,
+            254 | 255 => self.async_event_pending[slot] = true,
+            _ => {}
+        }
     }
 
     fn slot_for_number(&self, number: PdoNumber) -> Option<usize> {
@@ -388,7 +433,7 @@ impl<const N: usize> TpdoEngine<N> {
                 && self.pdos[i].transmission_type == 0
                 && self.has_dirty_mapping(i, dirty)
             {
-                self.event_pending[i] = true;
+                self.sync_event_pending[i] = true;
             }
         }
     }
@@ -399,18 +444,35 @@ impl<const N: usize> TpdoEngine<N> {
     /// that never reached a SYNC must not fire one on re-entry. Companion to
     /// [`RpdoEngine::discard_pending`].
     pub fn discard_sync_events(&mut self) {
-        self.event_pending = [false; N];
+        self.sync_event_pending = [false; N];
     }
 
-    /// Reset all runtime state driven by SYNC without changing PDO config.
+    /// Drop asynchronous application events which never became eligible.
     ///
-    /// NMT reset re-initialises communication objects, so both cyclic TPDO
-    /// divisors and acyclic application-event latches start fresh. Merely
-    /// leaving Operational only discards acyclic latches; it does not imply a
+    /// PDO traffic stops outside Operational, so carrying an inhibited event
+    /// across that boundary would emit stale work after re-entry. Companion to
+    /// [`discard_sync_events`](Self::discard_sync_events).
+    pub fn discard_async_events(&mut self) {
+        self.async_event_pending = [false; N];
+    }
+
+    /// Reset all runtime transmission state without changing PDO config.
+    ///
+    /// NMT reset re-initialises communication objects, so cyclic TPDO
+    /// divisors, acyclic application-event latches and inhibited asynchronous
+    /// events all start fresh. Merely leaving Operational discards the latched
+    /// events too, but keeps the cyclic divisors; it does not imply a
     /// communication reset.
-    pub(crate) fn reset_sync_state(&mut self) {
+    ///
+    /// The asynchronous latch has to be cleared here as well as on the
+    /// Operational boundary: a node with `auto_start` re-enters Operational in
+    /// the same `process()` call that performs the reset, so the boundary path
+    /// never runs and a pre-reset event would otherwise be transmitted once
+    /// its inhibit time expired.
+    pub(crate) fn reset_communication_state(&mut self) {
         self.sync_counter = [0; N];
-        self.event_pending = [false; N];
+        self.sync_event_pending = [false; N];
+        self.async_event_pending = [false; N];
     }
 
     /// Called on SYNC reception. Returns frames to transmit for sync-triggered PDOs.
@@ -427,7 +489,7 @@ impl<const N: usize> TpdoEngine<N> {
             if tt == 0 {
                 // Sync acyclic: one transmission per latched application
                 // event, on the first SYNC after it.
-                if core::mem::take(&mut self.event_pending[i]) {
+                if core::mem::take(&mut self.sync_event_pending[i]) {
                     if let Some(frame) = self.build_pdo_frame(i, od) {
                         let _ = out.push(frame);
                     }
@@ -486,8 +548,12 @@ impl<const N: usize> TpdoEngine<N> {
             let inhibit_us = self.pdos[i].inhibit_time_100us as u64 * 100;
             let elapsed = now_us.wrapping_sub(self.last_send_us[i]);
 
-            // Check if any mapped entry was marked dirty
-            let has_dirty = self.has_dirty_mapping(i, dirty);
+            // Latch the application event before checking inhibit time. The
+            // caller clears its dirty set after this poll, while the event may
+            // need to survive for several processing cycles.
+            if self.has_dirty_mapping(i, dirty) {
+                self.async_event_pending[i] = true;
+            }
 
             // Send on dirty trigger (respecting inhibit time) or event timer
             let timer_trigger = self.pdos[i].event_timer_ms > 0 && {
@@ -495,10 +561,15 @@ impl<const N: usize> TpdoEngine<N> {
                 elapsed >= interval_us
             };
 
-            if (has_dirty && elapsed >= inhibit_us) || timer_trigger {
-                self.last_send_us[i] = now_us;
+            let application_trigger = self.async_event_pending[i] && elapsed >= inhibit_us;
+            if application_trigger || timer_trigger {
                 if let Some(frame) = self.build_pdo_frame(i, od) {
-                    let _ = out.push(frame);
+                    if out.push(frame).is_ok() {
+                        self.last_send_us[i] = now_us;
+                        // A timer transmission carries the same latest process
+                        // image and therefore also satisfies a pending event.
+                        self.async_event_pending[i] = false;
+                    }
                 }
             }
         }
@@ -1761,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn tpdo_reset_sync_state_restarts_the_cyclic_divisor() {
+    fn tpdo_reset_communication_state_restarts_the_cyclic_divisor() {
         let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         mappings
             .push(PdoMapping {
@@ -1786,7 +1857,7 @@ mod tests {
         engine.on_sync(&od, &mut out);
         assert!(out.is_empty());
 
-        engine.reset_sync_state();
+        engine.reset_communication_state();
 
         // Reset Communication starts the divisor over; the first post-reset
         // pulse must not complete the pre-reset count.
@@ -1794,5 +1865,50 @@ mod tests {
         assert!(out.is_empty());
         engine.on_sync(&od, &mut out);
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn tpdo_reset_communication_state_drops_an_inhibited_async_event() {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        let mut engine = TpdoEngine::new([TpdoConfig {
+            od_number: 0,
+            cob_id: 0x181,
+            transmission_type: 255,
+            inhibit_time_100us: 500, // 50 ms
+            event_timer_ms: 0,
+            mappings,
+            enabled: true,
+        }]);
+        let od = zeroed_od();
+        let mut out = Vec::<CanFrame, 1>::new();
+        let no_dirty = Vec::<(u16, u8), 1>::new();
+
+        // First change transmits and starts the inhibit window.
+        engine.notify_changed(0x6000, 1);
+        engine.poll(&od, 100_000, &no_dirty, &mut out);
+        assert_eq!(out.len(), 1);
+        out.clear();
+
+        // Second change lands inside the window and stays latched.
+        engine.notify_changed(0x6000, 1);
+        engine.poll(&od, 110_000, &no_dirty, &mut out);
+        assert!(out.is_empty());
+
+        engine.reset_communication_state();
+
+        // The latched event belonged to the pre-reset session. Well past the
+        // inhibit time it must not be transmitted.
+        engine.poll(&od, 400_000, &no_dirty, &mut out);
+        assert!(
+            out.is_empty(),
+            "pre-reset asynchronous event transmitted after reset: {out:?}"
+        );
     }
 }

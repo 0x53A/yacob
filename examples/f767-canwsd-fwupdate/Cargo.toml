@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = ["common", "bootloader", "app"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+f767-canwsd-fwupdate-common = { path = "common" }
+canopen-core = { path = "../../canopen-core", features = ["embassy", "defmt"] }
+canopen-derive = { path = "../../canopen-derive" }
+canwsd-proto = { path = "../../canwsd-proto", default-features = false, features = ["serde"] }
+
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+embassy-futures = "0.1"
+embassy-net = { version = "0.9", features = [
+    "tcp",
+    "dhcpv4",
+    "dhcpv4-hostname",
+    "medium-ethernet",
+    "proto-ipv4",
+] }
+embassy-stm32 = { version = "0.6", features = [
+    "stm32f767zi",
+    "single-bank",
+    "time-driver-any",
+    "defmt",
+] }
+embassy-sync = "0.8"
+embassy-time = { version = "0.5", features = ["tick-hz-32_768"] }
+
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+crc = { version = "3", default-features = false }
+defmt = "1"
+defmt-rtt = "1"
+embedded-can = "0.4"
+embedded-io-async = "0.7"
+heapless = "0.9"
+nb = "1.1"
+serde-json-core = { version = "0.6", default-features = false }
+sha1 = { version = "0.11", default-features = false }
+static_cell = "2.1"
+panic-probe = { version = "1", features = ["print-defmt"] }
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+debug = 2
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
