@@ -11,7 +11,7 @@ pub enum SdoClientResult {
     /// Segmented transfer: send this frame next.
     SendNext(CanFrame),
     /// Transfer aborted by server.
-    Aborted(AbortCode),
+    Aborted(SdoAbort),
     /// Abort for an unrelated index/subindex while a transfer is active
     /// (e.g. another client's rejected request on the same SDO channel).
     /// The active transfer continues; keep waiting for the real response.
@@ -176,31 +176,7 @@ impl<const BUF: usize> SdoClient<BUF> {
             }
             self.state = State::Idle;
             let code = u32::from_le_bytes([response[4], response[5], response[6], response[7]]);
-            // Find matching abort code
-            return SdoClientResult::Aborted(match code {
-                0x0503_0000 => AbortCode::ToggleBitNotAlternated,
-                0x0504_0000 => AbortCode::SdoProtocolTimeout,
-                0x0504_0001 => AbortCode::InvalidCommandSpecifier,
-                0x0504_0002 => AbortCode::InvalidBlockSize,
-                0x0504_0003 => AbortCode::InvalidSequenceNumber,
-                0x0504_0005 => AbortCode::OutOfMemory,
-                0x0601_0000 => AbortCode::UnsupportedAccess,
-                0x0601_0001 => AbortCode::WriteOnlyObject,
-                0x0601_0002 => AbortCode::ReadOnlyObject,
-                0x0602_0000 => AbortCode::ObjectNotFound,
-                0x0604_0041 => AbortCode::ObjectCannotBeMapped,
-                0x0604_0042 => AbortCode::PdoLengthExceeded,
-                0x0604_0043 => AbortCode::ParameterIncompatibility,
-                0x0609_0011 => AbortCode::SubindexNotFound,
-                0x0609_0030 => AbortCode::ValueRangeExceeded,
-                0x0609_0031 => AbortCode::ValueTooHigh,
-                0x0609_0032 => AbortCode::ValueTooLow,
-                0x0609_0043 => AbortCode::DataTypeMismatch,
-                0x0800_0020 => AbortCode::DataTransferError,
-                0x0800_0021 => AbortCode::DataTransferLocalControl,
-                0x0800_0022 => AbortCode::DataTransferDeviceState,
-                _ => AbortCode::GeneralError,
-            });
+            return SdoClientResult::Aborted(SdoAbort::new(code));
         }
 
         match &self.state {
@@ -690,7 +666,9 @@ mod tests {
 
         let matching = abort_payload(0x1000, 0, 0x0602_0000);
         match client.process_response(&matching) {
-            SdoClientResult::Aborted(code) => assert_eq!(code, AbortCode::ObjectNotFound),
+            SdoClientResult::Aborted(code) => {
+                assert_eq!(code.known(), Some(AbortCode::ObjectNotFound))
+            }
             _ => panic!("expected Aborted"),
         }
     }
@@ -705,7 +683,7 @@ mod tests {
         let channel = abort_payload(0x0000, 0, 0x0504_0001);
         match client.process_response(&channel) {
             SdoClientResult::Aborted(code) => {
-                assert_eq!(code, AbortCode::InvalidCommandSpecifier)
+                assert_eq!(code.known(), Some(AbortCode::InvalidCommandSpecifier))
             }
             _ => panic!("expected Aborted"),
         }
@@ -725,7 +703,23 @@ mod tests {
         let req = client.start_upload(0xFFFF, 0);
         match run_transfer(&mut client, &mut server, &mut od, req) {
             SdoClientResult::Aborted(code) => {
-                assert_eq!(code, AbortCode::ObjectNotFound);
+                assert_eq!(code.known(), Some(AbortCode::ObjectNotFound));
+            }
+            _ => panic!("expected Aborted"),
+        }
+    }
+
+    #[test]
+    fn client_preserves_manufacturer_specific_abort_code() {
+        let target = NodeId::new(1).unwrap();
+        let mut client = SdoClient::<256>::new(target);
+        let _req = client.start_upload(0x2000, 0);
+
+        let vendor_abort = abort_payload(0x2000, 0, 0x0F00_0042);
+        match client.process_response(&vendor_abort) {
+            SdoClientResult::Aborted(code) => {
+                assert_eq!(code.raw(), 0x0F00_0042);
+                assert_eq!(code.known(), None);
             }
             _ => panic!("expected Aborted"),
         }

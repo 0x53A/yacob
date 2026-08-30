@@ -221,7 +221,7 @@ impl SdoEngine {
             }
             SdoClientResult::Aborted(code) => {
                 let active = self.active.take().expect("checked above");
-                self.finish(active.request, Err(format!("abort {code:?}")));
+                self.finish(active.request, Err(format!("abort {code}")));
             }
             SdoClientResult::Error => {
                 let active = self.active.take().expect("checked above");

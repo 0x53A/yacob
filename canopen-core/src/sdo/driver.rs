@@ -9,7 +9,7 @@
 
 use crate::cobid::{CobId, NodeId};
 use crate::sdo::client::{SdoClient, SdoClientResult};
-use crate::sdo::AbortCode;
+use crate::sdo::SdoAbort;
 use crate::time::Clock;
 use crate::transport::CanFrame;
 
@@ -34,7 +34,7 @@ pub trait AsyncCan {
 #[derive(Debug)]
 pub enum SdoError<E: core::fmt::Debug> {
     /// Transfer aborted by the remote node.
-    Aborted(AbortCode),
+    Aborted(SdoAbort),
     /// Protocol error (unexpected response, toggle mismatch, etc.)
     ProtocolError,
     /// CAN transport error.
@@ -48,7 +48,7 @@ pub enum SdoError<E: core::fmt::Debug> {
 impl<E: core::fmt::Debug> core::fmt::Display for SdoError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Aborted(code) => write!(f, "SDO aborted: {:?}", code),
+            Self::Aborted(code) => write!(f, "SDO aborted: {code}"),
             Self::ProtocolError => write!(f, "SDO protocol error"),
             Self::Transport(e) => write!(f, "CAN transport error: {:?}", e),
             Self::Timeout => write!(f, "SDO timeout"),
@@ -788,7 +788,8 @@ mod tests {
         block_on(async {
             let result = driver.read_u32(0xFFFF, 0, &mut can).await;
             match result {
-                Err(SdoError::Aborted(AbortCode::ObjectNotFound)) => {}
+                Err(SdoError::Aborted(code))
+                    if code.known() == Some(crate::sdo::AbortCode::ObjectNotFound) => {}
                 other => panic!("expected ObjectNotFound, got {:?}", other),
             }
         });
@@ -871,7 +872,8 @@ mod tests {
         block_on(async {
             let result = driver.write_u16(0x2000, 0, 2000, &mut can).await;
             match result {
-                Err(SdoError::Aborted(AbortCode::ValueRangeExceeded)) => {}
+                Err(SdoError::Aborted(code))
+                    if code.known() == Some(crate::sdo::AbortCode::ValueRangeExceeded) => {}
                 other => panic!("expected ValueRangeExceeded, got {:?}", other),
             }
         });
