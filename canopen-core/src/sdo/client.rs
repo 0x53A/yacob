@@ -715,10 +715,10 @@ mod tests {
         let mut client = SdoClient::<256>::new(target);
         let _req = client.start_upload(0x2000, 0);
 
-        let vendor_abort = abort_payload(0x2000, 0, 0x0f00_0042);
+        let vendor_abort = abort_payload(0x2000, 0, 0x0F00_0042);
         match client.process_response(&vendor_abort) {
             SdoClientResult::Aborted(code) => {
-                assert_eq!(code.raw(), 0x0f00_0042);
+                assert_eq!(code.raw(), 0x0F00_0042);
                 assert_eq!(code.known(), None);
             }
             _ => panic!("expected Aborted"),

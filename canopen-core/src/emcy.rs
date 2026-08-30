@@ -151,12 +151,33 @@ impl EmcyProducer {
         ));
     }
 
-    /// Clear error register bits. If the register becomes 0, sends an
-    /// "error reset" EMCY frame (code 0x0000).
+    /// Clear error register bits. If this leaves the device error-free, sends
+    /// an "error reset" EMCY frame (code 0x0000).
+    ///
+    /// GENERIC is not an independent cause — [`set_error`](Self::set_error)
+    /// adds it to every report — so clearing the last remaining category
+    /// clears GENERIC with it, and clearing GENERIC alone does nothing while
+    /// another category is still active.
+    ///
+    /// Clearing when no error was set is a no-op and sends nothing. This
+    /// differs from [`clear_all`](Self::clear_all), which always announces:
+    /// `clear_error` reports that a specific condition ended, so with no
+    /// condition there is nothing to report, whereas `clear_all` is the
+    /// explicit "tell the bus this device is healthy" hammer and stays usable
+    /// as an unconditional announcement (e.g. at startup).
     pub fn clear_error(&mut self, register_bits: u8) {
+        let before = self.error_register;
+        let cleared_categories = before & register_bits & !error_register::GENERIC;
         self.error_register &= !register_bits;
-        if self.error_register == 0 {
-            // Also clear the generic bit
+        // GENERIC is added automatically by `set_error`; it is not an
+        // independent cause. Keep it while a category remains and clear it
+        // together with the final category.
+        if self.error_register & !error_register::GENERIC != 0 {
+            self.error_register |= error_register::GENERIC;
+        } else if cleared_categories != 0 {
+            self.error_register = 0;
+        }
+        if before != 0 && self.error_register == 0 {
             self.queue(build_emcy_frame(
                 self.node_id,
                 EmcyErrorCode::NoError as u16,
@@ -166,7 +187,11 @@ impl EmcyProducer {
         }
     }
 
-    /// Clear all errors and send error-reset EMCY.
+    /// Clear all errors and send an error-reset EMCY.
+    ///
+    /// Unconditional by design: unlike [`clear_error`](Self::clear_error) this
+    /// announces even when no error was set, so it can be used to state
+    /// "healthy" outright.
     pub fn clear_all(&mut self) {
         self.error_register = 0;
         self.queue(build_emcy_frame(
@@ -230,18 +255,62 @@ mod tests {
         assert_eq!(frame.raw_id(), 0x081);
         assert_eq!(frame.data()[0..2], [0x00, 0x30]); // 0x3000 LE
 
-        // Clear specific bit
+        // Clearing the final category also clears the automatic generic bit
+        // and queues the standard error-reset EMCY.
         emcy.clear_error(error_register::VOLTAGE);
-        // Generic bit still set since error_register != 0 if we cleared voltage but generic remains
-        // Actually: error_register = GENERIC (since we clear VOLTAGE but not GENERIC)
-        assert_eq!(emcy.error_register(), error_register::GENERIC);
-        assert!(emcy.take_pending().is_none()); // not zero yet
+        assert_eq!(emcy.error_register(), 0);
+        let frame = emcy.take_pending().unwrap();
+        assert_eq!(frame.data()[0..2], [0x00, 0x00]);
 
         // Clear all
         emcy.clear_all();
         assert_eq!(emcy.error_register(), 0);
         let frame = emcy.take_pending().unwrap();
         assert_eq!(frame.data()[0..2], [0x00, 0x00]); // NoError
+    }
+
+    #[test]
+    fn clearing_one_category_keeps_generic_for_other_active_categories() {
+        let node = NodeId::new(4).unwrap();
+        let mut emcy = EmcyProducer::new(node);
+        emcy.set_error(0x8250, error_register::COMMUNICATION, &[]);
+        emcy.set_error(0x1000, error_register::MANUFACTURER, &[]);
+
+        emcy.clear_error(error_register::COMMUNICATION);
+
+        assert_eq!(
+            emcy.error_register(),
+            error_register::GENERIC | error_register::MANUFACTURER
+        );
+    }
+
+    #[test]
+    fn clearing_an_inactive_category_keeps_a_generic_error() {
+        let node = NodeId::new(4).unwrap();
+        let mut emcy = EmcyProducer::new(node);
+        emcy.set_error(0x1000, error_register::GENERIC, &[]);
+        let _ = emcy.take_pending();
+
+        emcy.clear_error(error_register::VOLTAGE);
+
+        assert_eq!(emcy.error_register(), error_register::GENERIC);
+        assert!(emcy.take_pending().is_none());
+    }
+
+    #[test]
+    fn clearing_generic_keeps_it_while_a_category_remains() {
+        let node = NodeId::new(4).unwrap();
+        let mut emcy = EmcyProducer::new(node);
+        emcy.set_error(0x3000, error_register::VOLTAGE, &[]);
+        let _ = emcy.take_pending();
+
+        emcy.clear_error(error_register::GENERIC);
+
+        assert_eq!(
+            emcy.error_register(),
+            error_register::GENERIC | error_register::VOLTAGE
+        );
+        assert!(emcy.take_pending().is_none());
     }
 
     #[test]

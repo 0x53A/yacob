@@ -75,7 +75,7 @@ Big gaps not fully captured by the current known-issues list:
 |---|---|---|
 | Boot-up heartbeat | Yes | `Node::process` sends boot frame; interop tests. |
 | NMT start/stop/pre-op/reset command parsing | Yes | `NmtHandler`, interop tests. |
-| Reset node vs reset communication distinction | Yes | `NmtTransition`, `Node::request_reset`. |
+| Reset node vs reset communication distinction | Yes | `NmtTransition`, `Node::request_reset`, and application-facing `Node::take_reset_event`. |
 | NMT master command frame builder | Yes | `NmtCommand::to_frame`. |
 | Automatic startup / auto operational | Yes | `NodeConfig::auto_start`. |
 | Heartbeat producer | Yes | `HeartbeatProducer`, interop tests. |
@@ -132,8 +132,8 @@ Big gaps not fully captured by the current known-issues list:
 | EMCY frame producer | Yes | `EmcyProducer`, interop tests. |
 | EMCY frame parser/consumer side | Yes | `EmcyMessage::parse`, event decoding tests. |
 | Multiple pending EMCY frames | Yes | Fixed, tested. |
-| Error register bit handling | Partial | Known issue: GENERIC bit latching semantics wrong. |
-| Error reset frame | Partial | Blocked by GENERIC-bit issue in some recovery paths. |
+| Error register bit handling | Yes | GENERIC coupling and per-bit clear semantics are covered by unit tests. |
+| Error reset frame | Yes | `clear_error()` announces reset when the final condition clears; `clear_all()` deliberately announces unconditionally. |
 | Pre-defined error field 0x1003 | No | Not maintained. |
 | EMCY inhibit time 0x1015 | No | Not implemented. |
 | Configurable EMCY COB-ID 0x1014 | No | Not implemented. |

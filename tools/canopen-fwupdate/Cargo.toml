@@ -10,3 +10,5 @@ canopen-core = { path = "../../canopen-core", features = ["std"] }
 canopen-linux = { path = "../../canopen-linux" }
 clap = { version = "4.6.3", features = ["derive"] }
 crc = "3"
+embedded-can = "0.4"
+nb = "1.1"

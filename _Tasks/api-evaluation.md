@@ -48,7 +48,7 @@ The inline DSL is concise and readable. PDO mapping declarations (`tpdo[1](...) 
 
 **Impact**: Medium — affects firmware update, watchdog recovery, config-driven resets.
 
-**What was done**: Added `Node::request_reset(ResetType)` and `ResetType` enum (`Application`, `Communication`). Aborts any in-progress SDO transfer, resets NMT state to Initializing, re-syncs PDO config. On the next `process()` call, the boot sequence runs (boot heartbeat + transition per `auto_start`).
+**What was done**: Added `Node::request_reset(ResetType)` and `ResetType` enum (`Application`, `Communication`). Aborts any in-progress SDO transfer, resets NMT state to Initializing, re-syncs PDO config. On the next `process()` call, the boot sequence runs (boot heartbeat + transition per `auto_start`). `Node::take_reset_event()` exposes the latest local or NMT reset type so application state outside the OD can distinguish Reset Application from Reset Communication.
 
 **Used by**: `stm32-fwupdate` (reset after firmware validation).
 

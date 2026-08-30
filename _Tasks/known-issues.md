@@ -1,6 +1,96 @@
 # Known Issues
 
+Verified against the working tree on **2026-08-31**. This is the canonical
+defect index for `canopen_rs`; feature/conformance omissions are tracked in
+[`conformance-matrix.md`](conformance-matrix.md), while the stateful protocol
+items that need a design decision are expanded in
+[`protocol-reliability-followups.md`](protocol-reliability-followups.md) and
+[`sync-feature-audit.md`](sync-feature-audit.md).
+
+“Open” means the behavior is present in the current source, not merely in an
+old review. The working tree also contains fixes that are newer than the
+current committed baseline; downstream users must pin or vendor an exact
+revision rather than infer behavior from this file's date.
+
 ## Open
+
+### RPDO reception is not atomic and accepts malformed process images
+
+Severity: critical for command/safety RPDOs.
+
+`RpdoEngine::process_with_drop_count()` currently identifies an RPDO only by
+enabled COB-ID, refreshes its deadline state immediately, and then calls
+`apply_mapped()`. The latter writes mapped entries one at a time, stops when a
+short frame runs out of bits, and does not roll back earlier writes when a
+later mapping is missing or an OD write is rejected. Synchronous RPDOs buffer
+the same unvalidated frame and fail in the same incremental way on SYNC.
+
+Consequences:
+
+- a short frame can partially update an otherwise atomic command image;
+- an invalid/unwritable mapping can leave preceding fields committed;
+- any matching frame, including a malformed one, refreshes the RPDO deadline;
+- callers receive `true` (“consumed”) and cannot distinguish full acceptance.
+
+**Fix:** preflight the exact expected DLC/bit length and every mapped target,
+decode into a temporary transaction, then commit all writes and deadline state
+only if the complete process image is valid. Add event-driven and synchronous
+regressions for short, long, unwritable, and mixed-validity mappings.
+
+### Nonblocking transmit refusal can lose protocol work
+
+Severity: high. `embedded_can::nb::Can::transmit()` may return `WouldBlock`,
+but several producers advance or consume their state before the transport has
+accepted the frame. This includes SDO responses/segments, timeout aborts,
+EMCY, heartbeat, and parts of asynchronous TPDO scheduling. SYNC production
+and synchronous-window TPDO retry already use two-phase behavior.
+
+The required shared scheduler/commit design and test matrix are in
+[`protocol-reliability-followups.md` section 1](protocol-reliability-followups.md#1-protocol-state-is-consumed-before-transmit-acceptance).
+
+### Block download does not recover a sequence gap
+
+The block-upload server now honours a partial ACK and retransmits the missing
+tail. The block-download server still aborts a whole transfer on the first
+missing segment instead of consuming the remainder of the sub-block and ACKing
+the last contiguous sequence. See
+[`protocol-reliability-followups.md` section 5](protocol-reliability-followups.md#5-block-download-aborts-where-the-spec-asks-for-retransmission).
+
+### Firmware updater does not retry the post-erase status request
+
+After erase/reboot, the updater issues one status read. A slow target or a
+single lost response can fail an otherwise successful update. The design
+options are recorded in
+[`protocol-reliability-followups.md` section 6](protocol-reliability-followups.md#6-the-updaters-post-erase-status-read-has-no-retry).
+
+### Invalid TPDO construction can retry forever
+
+For an event or event-timer trigger, `TpdoEngine::poll()` clears the pending
+latch and advances `last_send_us` only after `build_pdo_frame()` returns a
+frame and the output queue accepts it. If the live mapping is broken (too
+long, unreadable, or otherwise not buildable), the latch/timer stays armed and
+the same failed construction is retried on every poll. Retrying preserves data
+for a transient refusal, but a permanent configuration fault has no explicit
+drop, disable, or diagnostic policy. Decide that policy together with runtime
+reconfiguration semantics.
+
+### Runtime communication changes inherit stale phase and pending state
+
+Live PDO/SYNC configuration is updated separately from counters, pending
+frames, event latches, deadlines, and inhibit timestamps. The reset behavior
+also deliberately remains undecided for `last_send_us`. See
+[`protocol-reliability-followups.md` section 4](protocol-reliability-followups.md#4-runtime-reconfiguration-needs-transition-semantics)
+and [`sync-feature-audit.md`](sync-feature-audit.md).
+
+### Postponed SYNC behavior is incomplete
+
+SYNC is not used by the current downstream project, so its audited gaps remain
+postponed rather than silently treated as complete. The canonical detail is
+[`sync-feature-audit.md`](sync-feature-audit.md): TPDO start-value/counter phase
+is absent; type-0 ignores its event timer; consumer missing-SYNC monitoring is
+absent; payload shape/counter use is incomplete; reserved values can enter by
+some configuration paths; legacy RTR types 252/253 and extended-frame SYNC are
+not implemented; and runtime validation/phase lifecycle still needs design.
 
 ### `SharedCanBus::publish` runs subscriber filters under the subscriber-list lock
 
@@ -32,22 +122,6 @@ never called again. `Subscription::recv` documents its equivalent hazard;
 **Fix:** give `TxQueue` a `close()` (set by the pump on exit, `notify_all`)
 and make `send` return `Result<(), Closed>`; or at minimum add a
 `send_timeout` and a doc warning matching `recv`'s.
-
-### `EmcyProducer` latches the GENERIC bit forever
-
-(2026-07-14, noticed during RPDO deadline design.) `set_error()` unconditionally
-ORs in `error_register::GENERIC`, but `clear_error(bits)` only clears the bits
-it is given — so after any error, GENERIC stays set unless the app explicitly
-clears it (or calls `clear_all()`). Consequence: the register never returns to
-0 through per-bit clears, and the "error reset" EMCY (0x0000) is never emitted
-on recovery. CiA 301 intends GENERIC as "set while any error condition is
-present", i.e. derived, not latched.
-
-**Fix (later):** derive GENERIC (set while any other bit is set, or when an
-error with no specific bit is reported; cleared when the last one clears) so
-`clear_error(COMMUNICATION)` after e.g. an RPDO-timeout recovery can reach
-register 0 and emit the standard error-reset frame. Touches
-`emcy_producer_set_clear` test semantics.
 
 ### Low-level SdoClient has no transfer timeout
 
@@ -84,6 +158,14 @@ There are tests for ordinary transfers and some block sequence errors, but not f
 - same-register initiate request while a transfer is busy,
 - ~~abort filtering in `SdoClient`~~ (done 2026-07-06, see Fixed section),
 - valid-looking continuation frame collision behavior.
+
+### Unknown SDO abort codes lose their raw wire value
+
+`SdoClient` and `SdoDriver` expose `Aborted(AbortCode)`. The decoder maps only
+the library's closed enum, so manufacturer-specific or newly standardised raw
+abort values cannot be preserved for diagnostics. A separate gateway
+prototype changes this to an `SdoAbort` value with `raw()`/`known()`, but that
+API is not in this working tree's main implementation.
 
 ## Ergonomic Improvements (backlog)
 
@@ -123,11 +205,53 @@ Still missing are EDS **import** of 0x1201+ records and OD-managed SDO
 configurable client channels when the CiA 302 SDO Manager/master-side use case
 requires them. See `additional-sdo-servers.md`.
 
+This is a functional blocker for applications which need a second client SDO
+channel without rewriting the default request/response COB-IDs in an adapter.
+
+### Array declarations cannot express non-zero element defaults
+
+The DSL/code generator initialises every declared array to the element type's
+zero value. EDS import therefore only promotes sufficiently large all-zero
+records to arrays; non-zero per-element defaults must remain records. Devices
+which need array-shaped OD objects with non-zero defaults must install them by
+hand after `Default::default()`.
+
 ### Expose SDO server busy state for diagnostics
 
 `SdoServer` does not expose whether a segmented/block transfer is active or which object it targets.
 
 **Improvement:** Add `is_busy()` and active transfer metadata accessors so applications and diagnostic tooling can avoid starting optional SDO work while a local server channel is occupied.
+
+## Fixed in the current working tree (2026-08-31 verification)
+
+These historical review findings no longer belong in the open backlog:
+
+- TPDO communication reset now clears inhibited asynchronous event latches via
+  `reset_communication_state()`; engine- and Node-level regressions cover it.
+- EDS PDO parameters treat absent and empty `DefaultValue=` as unspecified,
+  while non-empty out-of-range or invalid values still fail checked parsing.
+- `WebSocketTransportConfig::close_timeout` is separate from transmit age, and
+  the blocking-drop behavior is documented for async callers.
+- updater TX tracing occurs only after transport acceptance.
+- `OdGuard::drop()` no longer uses the old fixed address scratch loop.
+- `EmcyProducer::clear_error()` now derives/clears GENERIC consistently and is
+  a no-op when already clean; `clear_all()` remains intentionally unconditional
+  so an application can explicitly announce a healthy device.
+- block upload honours partial ACK sequence values, rewinds to the first
+  missing segment, recomputes CRC, and rejects invalid block sizes.
+
+The remaining block-*download* recovery and updater retry items are listed in
+Open above; fixing the corresponding upload path did not close them.
+
+## Current validation caveat
+
+`cargo test --workspace --locked` and `cargo fmt --check` pass in this working
+tree. The historical statement that formatting was already red no longer
+applies. Strict workspace-wide Clippy with warnings denied is still red under
+the current toolchain for multiple pre-existing/core/derive lints; the older
+review's single `approx_constant` example is no longer a complete description
+of that tooling debt. The separate prototype `canopen-gateway` crate does pass
+strict Clippy on its own.
 
 ## Fixed (SYNC integration)
 

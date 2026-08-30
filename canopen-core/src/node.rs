@@ -128,6 +128,7 @@ pub struct Node<
     event_queue: Deque<OdEvent, EVT_QUEUE>,
     dirty_set: Vec<(u16, u8), DIRTY_SET>,
     event_overflow_count: u32,
+    reset_event: Option<ResetType>,
     #[cfg(feature = "embassy")]
     event_signal: Option<&'static OdEventSignal>,
 }
@@ -211,6 +212,7 @@ impl<
             event_queue: Deque::new(),
             dirty_set: Vec::new(),
             event_overflow_count: 0,
+            reset_event: None,
             #[cfg(feature = "embassy")]
             event_signal: None,
         };
@@ -539,7 +541,7 @@ impl<
         self.pending_sync_tpdo.clear();
         self.sync_tpdo_last_attempt_us = None;
         self.rpdo.discard_pending();
-        self.tpdo.reset_sync_state();
+        self.tpdo.reset_communication_state();
     }
 
     /// COB-ID this node consumes SYNC on (OD 0x1005). A missing object uses
@@ -779,6 +781,7 @@ impl<
     /// Use `ResetApplication` for a full reset (e.g., after firmware update) or
     /// `ResetCommunication` to re-initialize only communication parameters.
     pub fn request_reset(&mut self, reset_type: ResetType) {
+        self.reset_event = Some(reset_type);
         self.booted = false;
         self.abort_all_sdo_transfers();
         self.sync_pdo_from_od();
@@ -794,11 +797,27 @@ impl<
         }
     }
 
+    /// Take the most recent CANopen reset observed by this node.
+    ///
+    /// Communication reinitialization is owned by the stack. Applications
+    /// use this event for state outside the OD that distinguishes Reset
+    /// Application from Reset Communication. Multiple unobserved resets
+    /// coalesce to the latest type.
+    pub fn take_reset_event(&mut self) -> Option<ResetType> {
+        self.reset_event.take()
+    }
+
     /// Mark an OD entry as changed by the application.
     ///
-    /// On the next `process()` call, if an event-driven TPDO (type 254/255)
-    /// maps this entry and the inhibit time has elapsed, the TPDO is sent.
+    /// On the next `process()` call, an asynchronous event-driven TPDO (type
+    /// 254/255) mapping this entry is sent when its inhibit time permits. A
+    /// synchronous acyclic TPDO (type 0) latches the event and sends at the
+    /// next SYNC. Synchronous cyclic TPDOs (types 1..=240) ignore it.
     pub fn notify_changed(&mut self, index: u16, subindex: u8) {
+        // The per-TPDO latch is authoritative. The address set remains as a
+        // compatibility/input surface for the PDO engine, but exhausting its
+        // bounded capacity must not lose a transmission trigger.
+        self.tpdo.notify_changed(index, subindex);
         if !self
             .dirty_set
             .iter()
@@ -953,6 +972,7 @@ impl<
             // first pulse after returning to Operational.
             self.rpdo.discard_pending();
             self.tpdo.discard_sync_events();
+            self.tpdo.discard_async_events();
             self.sync_window.reset();
             self.pending_sync_tpdo.clear();
             self.sync_tpdo_last_attempt_us = None;
@@ -1307,6 +1327,7 @@ impl<
                     let transition = self.nmt.process_command(cmd, data[1], self.node_id);
                     match transition {
                         NmtTransition::ResetApplication => {
+                            self.reset_event = Some(ResetType::Application);
                             self.booted = false;
                             self.abort_all_sdo_transfers();
                             self.sync_pdo_from_od();
@@ -1314,6 +1335,7 @@ impl<
                             self.reset_sync_state();
                         }
                         NmtTransition::ResetCommunication => {
+                            self.reset_event = Some(ResetType::Communication);
                             self.booted = false;
                             self.abort_all_sdo_transfers();
                             self.sync_pdo_from_od();
@@ -1427,12 +1449,13 @@ impl<
     > Drop for OdGuard<'_, OD, TPDO, RPDO, SDO, EVT_QUEUE, DIRTY_SET>
 {
     fn drop(&mut self) {
-        // Collect changed (index, subindex) pairs first to avoid borrow conflict
-        let mut changed: [(u16, u8); 32] = [(0, 0); 32];
-        let mut count = 0usize;
+        // Coalesce changes directly per TPDO. This is the behavior we need on
+        // drop, and unlike collecting addresses in a fixed scratch array it
+        // covers every valid mapping count and every declared TPDO.
+        let mut changed_tpdos = [false; TPDO];
 
-        for n in 0..TPDO {
-            if let Some(config) = self.node.tpdo.config_slot(n) {
+        for (slot, changed) in changed_tpdos.iter_mut().enumerate() {
+            if let Some(config) = self.node.tpdo.config_slot(slot) {
                 for mapping in config.mappings.iter() {
                     let mut old = [0u8; 8];
                     let mut new = [0u8; 8];
@@ -1446,28 +1469,30 @@ impl<
                         .read(mapping.index, mapping.subindex, &mut new)
                         .unwrap_or(0);
                     if old_len != new_len || old[..old_len] != new[..new_len] {
-                        if count < changed.len() {
-                            changed[count] = (mapping.index, mapping.subindex);
-                            count += 1;
-                        }
+                        *changed = true;
+                        break;
                     }
                 }
             }
         }
 
-        for i in 0..count {
-            self.node.notify_changed(changed[i].0, changed[i].1);
+        let mut any_changed = false;
+        for (slot, changed) in changed_tpdos.into_iter().enumerate() {
+            if changed {
+                self.node.tpdo.latch_slot_event(slot);
+                any_changed = true;
+            }
         }
 
         // Wake async waiters so process() runs sooner
         #[cfg(feature = "embassy")]
-        if count > 0 {
+        if any_changed {
             if let Some(signal) = self.node.event_signal {
                 signal.signal(());
             }
         }
 
-        let _ = count; // suppress unused warning when embassy feature is off
+        let _ = any_changed; // suppress unused warning when embassy feature is off
     }
 }
 
@@ -1805,7 +1830,10 @@ mod tests {
         }
     }
 
-    fn make_event_node() -> (Node<EventTestOd, 1, 1>, MailboxTransport<32, 32>) {
+    fn make_event_node_with_dirty<const DIRTY_SET: usize>() -> (
+        Node<EventTestOd, 1, 1, 0, 16, DIRTY_SET>,
+        MailboxTransport<32, 32>,
+    ) {
         let mut rpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
         rpdo_mappings
             .push(PdoMapping {
@@ -1861,7 +1889,7 @@ mod tests {
             output2: 0,
             input1: 0,
         };
-        let mut node: Node<EventTestOd, 1, 1> = Node::new(config, od);
+        let mut node: Node<EventTestOd, 1, 1, 0, 16, DIRTY_SET> = Node::new(config, od);
         let mut transport = MailboxTransport::<32, 32>::new();
 
         // Boot + auto-start
@@ -1871,6 +1899,10 @@ mod tests {
         assert_eq!(node.state(), NmtState::Operational);
 
         (node, transport)
+    }
+
+    fn make_event_node() -> (Node<EventTestOd, 1, 1>, MailboxTransport<32, 32>) {
+        make_event_node_with_dirty::<8>()
     }
 
     #[test]
@@ -2403,8 +2435,8 @@ mod tests {
                                                           // last_send_us[0] is 0, elapsed = 50ms < 100ms inhibit, should NOT send
         assert!(transport.next_to_transmit().is_none());
 
-        // At 100ms, should send
-        node.notify_changed(0x6000, 1);
+        // At 100ms, the original event should still be pending; no second
+        // notification is needed merely because inhibit time elapsed.
         node.process(&mut transport, &TestClock(100_000));
         let frame = transport.next_to_transmit().unwrap();
         assert_eq!(frame.data()[0], 0x11);
@@ -2414,6 +2446,91 @@ mod tests {
         node.notify_changed(0x6000, 1);
         node.process(&mut transport, &TestClock(150_000)); // 50ms after last send
         assert!(transport.next_to_transmit().is_none());
+
+        // The coalesced event samples the newest value when inhibit expires.
+        node.process(&mut transport, &TestClock(200_000));
+        let frame = transport.next_to_transmit().unwrap();
+        assert_eq!(frame.data()[0], 0x22);
+    }
+
+    #[test]
+    fn reset_discards_an_inhibited_event_driven_tpdo() {
+        let mut tpdo_mappings = heapless::Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        tpdo_mappings
+            .push(PdoMapping {
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+
+        let config = NodeConfig::<1, 1> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 0,
+            // auto_start re-enters Operational in the same process() call that
+            // performs the reset, so the "left Operational" discard path never
+            // runs. The reset itself has to clear the latch.
+            auto_start: true,
+            tpdo: [TpdoConfig {
+                od_number: 0,
+                cob_id: 0x181,
+                transmission_type: 255,
+                inhibit_time_100us: 500, // 50ms inhibit
+                event_timer_ms: 0,
+                mappings: tpdo_mappings,
+                enabled: true,
+            }],
+            rpdo: [RpdoConfig::default()],
+            sdo_servers: [],
+            identity: LssIdentity::default(),
+        };
+        let od = EventTestOd {
+            device_type: 0x191,
+            output1: 0,
+            output2: 0,
+            input1: 0,
+        };
+        let mut node: Node<EventTestOd, 1, 1> = Node::new(config, od);
+        let mut transport = MailboxTransport::<32, 32>::new();
+
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+
+        node.od_mut().input1 = 0x11;
+        node.process(&mut transport, &TestClock(100_000));
+        assert_eq!(transport.next_to_transmit().unwrap().data(), &[0x11]);
+
+        // Second change inside the inhibit window: latched, not yet sent.
+        node.od_mut().input1 = 0x22;
+        node.process(&mut transport, &TestClock(110_000));
+        assert!(transport.next_to_transmit().is_none());
+
+        node.request_reset(ResetType::Application);
+        node.process(&mut transport, &TestClock(120_000));
+        while transport.next_to_transmit().is_some() {}
+
+        // Well past the inhibit time, with no post-reset application change.
+        node.process(&mut transport, &TestClock(400_000));
+        let leftover = transport.next_to_transmit();
+        assert!(
+            leftover.is_none(),
+            "pre-reset TPDO event transmitted after reset: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn od_guard_tpdo_trigger_does_not_depend_on_dirty_address_capacity() {
+        let (mut node, mut transport) = make_event_node_with_dirty::<0>();
+
+        {
+            let mut od = node.od_mut();
+            od.input1 = 0x66;
+        }
+        node.process(&mut transport, &TestClock(1_000));
+
+        let frame = transport.next_to_transmit().expect("latched TPDO event");
+        assert_eq!(frame.raw_id(), 0x181);
+        assert_eq!(frame.data(), &[0x66]);
     }
 
     #[test]
@@ -2520,6 +2637,8 @@ mod tests {
         // Request reset — should go back to Initializing
         node.request_reset(ResetType::Application);
         assert_eq!(node.state(), NmtState::Initializing);
+        assert_eq!(node.take_reset_event(), Some(ResetType::Application));
+        assert_eq!(node.take_reset_event(), None);
 
         // Next process() should re-boot (send boot heartbeat, transition to PreOp)
         node.process(&mut transport, &TestClock(100_000));
@@ -2527,6 +2646,39 @@ mod tests {
         assert_eq!(frame.raw_id(), 0x701);
         assert_eq!(frame.data()[0], 0x00); // boot heartbeat
         assert_eq!(node.state(), NmtState::PreOperational);
+    }
+
+    #[test]
+    fn nmt_reset_event_distinguishes_application_and_communication() {
+        let config = NodeConfig::<1, 1> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 100,
+            auto_start: false,
+            tpdo: [TpdoConfig::default()],
+            rpdo: [RpdoConfig::default()],
+            sdo_servers: [],
+            identity: LssIdentity::default(),
+        };
+        let od = MinimalOd {
+            device_type: 0x191,
+            error_reg: 0,
+        };
+        let mut node: Node<MinimalOd, 1, 1> = Node::new(config, od);
+        let mut transport = MailboxTransport::<16, 16>::new();
+        node.process(&mut transport, &TestClock(0));
+        while transport.next_to_transmit().is_some() {}
+
+        transport
+            .store_received(NmtCommand::ResetCommunication.to_frame(1))
+            .unwrap();
+        node.process(&mut transport, &TestClock(1));
+        assert_eq!(node.take_reset_event(), Some(ResetType::Communication));
+
+        transport
+            .store_received(NmtCommand::ResetNode.to_frame(1))
+            .unwrap();
+        node.process(&mut transport, &TestClock(2));
+        assert_eq!(node.take_reset_event(), Some(ResetType::Application));
     }
 
     #[test]

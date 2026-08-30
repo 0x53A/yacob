@@ -25,6 +25,14 @@ pub struct WebSocketTransportConfig {
     /// Maximum time from [`embedded_can::nb::Can::transmit`] accepting a frame
     /// until the WebSocket write completes.
     pub max_transmit_age: Duration,
+    /// Upper bound on how long dropping the transport waits for the graceful
+    /// WebSocket close to reach an unresponsive peer.
+    ///
+    /// This bounds a *blocking* wait in `Drop`, so it is deliberately separate
+    /// from [`Self::max_transmit_age`]: how long a data frame stays useful and
+    /// how long a caller is willing to stall on teardown are unrelated
+    /// questions. Zero skips the graceful close.
+    pub close_timeout: Duration,
 }
 
 impl Default for WebSocketTransportConfig {
@@ -32,6 +40,7 @@ impl Default for WebSocketTransportConfig {
         Self {
             transmit_queue_capacity: 32,
             max_transmit_age: Duration::from_millis(250),
+            close_timeout: Duration::from_millis(250),
         }
     }
 }
@@ -49,10 +58,16 @@ struct QueuedFrame {
 /// ```ignore
 /// let mut can = WebSocketTransport::connect("ws://127.0.0.1:8080/api/networks/vcan0")?;
 /// ```
+///
+/// **Dropping this type blocks.** It closes the connection and joins the
+/// background thread so that a caller can immediately reconnect to a
+/// single-client server, which costs at most
+/// [`WebSocketTransportConfig::close_timeout`]. Do not drop it on an async
+/// executor thread without `spawn_blocking`.
 pub struct WebSocketTransport {
-    tx: tokio::sync::mpsc::Sender<QueuedFrame>,
+    tx: Option<tokio::sync::mpsc::Sender<QueuedFrame>>,
     rx: mpsc::Receiver<CanFrame>,
-    _thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -121,6 +136,7 @@ impl WebSocketTransport {
                     tokio::select! {
                         queued = tx_rx.recv() => {
                             let Some(queued) = queued else {
+                                let _ = close_before_timeout(&mut ws_tx, config.close_timeout).await;
                                 break;
                             };
                             match send_before_expiry(&mut ws_tx, queued, config.max_transmit_age).await {
@@ -147,9 +163,9 @@ impl WebSocketTransport {
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
-                tx,
+                tx: Some(tx),
                 rx,
-                _thread: thread,
+                thread: Some(thread),
             }),
             Ok(Err(e)) => Err(WebSocketTransportError::Connect(e)),
             Err(e) => Err(WebSocketTransportError::Connect(e.to_string())),
@@ -162,7 +178,10 @@ impl embedded_can::nb::Can for WebSocketTransport {
     type Error = CanError;
 
     fn transmit(&mut self, frame: &Self::Frame) -> nb::Result<Option<Self::Frame>, Self::Error> {
-        enqueue_frame(&self.tx, frame)
+        let Some(tx) = &self.tx else {
+            return Err(nb::Error::Other(CanError::BusError));
+        };
+        enqueue_frame(tx, frame)
     }
 
     fn receive(&mut self) -> nb::Result<Self::Frame, Self::Error> {
@@ -170,6 +189,22 @@ impl embedded_can::nb::Can for WebSocketTransport {
             Ok(frame) => Ok(frame),
             Err(mpsc::TryRecvError::Empty) => Err(nb::Error::WouldBlock),
             Err(mpsc::TryRecvError::Disconnected) => Err(nb::Error::Other(CanError::BusError)),
+        }
+    }
+}
+
+impl Drop for WebSocketTransport {
+    fn drop(&mut self) {
+        // Closing the producer wakes the background task, which drops the
+        // WebSocket/TCP stream. Join it so a caller can immediately reconnect
+        // to a single-client server without racing the old connection.
+        //
+        // The join is bounded because the task's only remaining await is the
+        // graceful close, capped by `close_timeout`. It still blocks the
+        // calling thread — see the type-level docs.
+        self.tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -227,6 +262,18 @@ where
         Ok(Err(_)) => SendOutcome::Failed,
         Err(_) => SendOutcome::TimedOut,
     }
+}
+
+/// Try to send a graceful close without allowing synchronous transport
+/// destruction to wait forever on an unresponsive peer.
+async fn close_before_timeout<S>(sink: &mut S, max_wait: Duration) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    matches!(
+        tokio::time::timeout(max_wait, sink.send(Message::Close(None))).await,
+        Ok(Ok(()))
+    )
 }
 
 /// Decode one WebSocket message into a CANopen frame. Frames with EFF/RTR/ERR
@@ -332,6 +379,14 @@ mod tests {
         assert_eq!(
             send_before_expiry(&mut StalledSink, queued, Duration::from_millis(1)).await,
             SendOutcome::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn bounds_the_graceful_close_wait() {
+        assert!(
+            !close_before_timeout(&mut StalledSink, Duration::from_millis(1)).await,
+            "a stalled close must time out"
         );
     }
 }
