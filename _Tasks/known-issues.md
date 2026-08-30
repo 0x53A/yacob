@@ -159,14 +159,6 @@ There are tests for ordinary transfers and some block sequence errors, but not f
 - ~~abort filtering in `SdoClient`~~ (done 2026-07-06, see Fixed section),
 - valid-looking continuation frame collision behavior.
 
-### Unknown SDO abort codes lose their raw wire value
-
-`SdoClient` and `SdoDriver` expose `Aborted(AbortCode)`. The decoder maps only
-the library's closed enum, so manufacturer-specific or newly standardised raw
-abort values cannot be preserved for diagnostics. A separate gateway
-prototype changes this to an `SdoAbort` value with `raw()`/`known()`, but that
-API is not in this working tree's main implementation.
-
 ## Ergonomic Improvements (backlog)
 
 ### No DSL syntax for dummy PDO mappings
@@ -239,6 +231,9 @@ These historical review findings no longer belong in the open backlog:
   so an application can explicitly announce a healthy device.
 - block upload honours partial ACK sequence values, rewinds to the first
   missing segment, recomputes CRC, and rejects invalid block sizes.
+- SDO clients preserve manufacturer-specific and newly standardised abort
+  values in `SdoAbort`; callers can inspect the exact `raw()` value or decode
+  known CiA 301 values with `known()`.
 
 The remaining block-*download* recovery and updater retry items are listed in
 Open above; fixing the corresponding upload path did not close them.
