@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "canopen-core",
     "canopen-derive",
+    "canopen-gateway",
     "canopen-linux",
     "canopen-web",
     "canwsd-proto",

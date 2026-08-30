@@ -6,14 +6,14 @@
 use canopen_core::can_router::SdoPort;
 use canopen_core::cobid::{CobId, NodeId};
 use canopen_core::sdo::driver::{SdoDriver, SdoError as AsyncSdoError};
-use canopen_core::sdo::AbortCode;
+use canopen_core::sdo::SdoAbort;
 use canopen_core::transport::CanFrame;
 use std::time::{Duration, Instant};
 
 /// Error from a high-level SDO operation.
 #[derive(Debug)]
 pub enum SdoError {
-    Aborted(AbortCode),
+    Aborted(SdoAbort),
     Timeout,
     ProtocolError,
     TransportError,
@@ -24,7 +24,7 @@ pub enum SdoError {
 impl std::fmt::Display for SdoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Aborted(code) => write!(f, "SDO aborted: {:?}", code),
+            Self::Aborted(code) => write!(f, "SDO aborted: {code}"),
             Self::Timeout => write!(f, "SDO timeout"),
             Self::ProtocolError => write!(f, "SDO protocol error"),
             Self::TransportError => write!(f, "CAN transport error"),

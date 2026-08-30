@@ -444,6 +444,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "canopen-gateway"
+version = "0.1.0"
+dependencies = [
+ "canopen-core",
+ "canopen-derive",
+]
+
+[[package]]
 name = "canopen-linux"
 version = "0.1.0"
 dependencies = [

@@ -35,6 +35,72 @@ impl AbortCode {
     pub fn to_le_bytes(self) -> [u8; 4] {
         (self as u32).to_le_bytes()
     }
+
+    pub const fn from_u32(code: u32) -> Option<Self> {
+        Some(match code {
+            0x0503_0000 => Self::ToggleBitNotAlternated,
+            0x0504_0000 => Self::SdoProtocolTimeout,
+            0x0504_0001 => Self::InvalidCommandSpecifier,
+            0x0504_0002 => Self::InvalidBlockSize,
+            0x0504_0003 => Self::InvalidSequenceNumber,
+            0x0504_0004 => Self::CrcError,
+            0x0504_0005 => Self::OutOfMemory,
+            0x0601_0000 => Self::UnsupportedAccess,
+            0x0601_0001 => Self::WriteOnlyObject,
+            0x0601_0002 => Self::ReadOnlyObject,
+            0x0602_0000 => Self::ObjectNotFound,
+            0x0604_0041 => Self::ObjectCannotBeMapped,
+            0x0604_0042 => Self::PdoLengthExceeded,
+            0x0604_0043 => Self::ParameterIncompatibility,
+            0x0609_0011 => Self::SubindexNotFound,
+            0x0609_0030 => Self::ValueRangeExceeded,
+            0x0609_0031 => Self::ValueTooHigh,
+            0x0609_0032 => Self::ValueTooLow,
+            0x0609_0043 => Self::DataTypeMismatch,
+            0x0800_0000 => Self::GeneralError,
+            0x0800_0020 => Self::DataTransferError,
+            0x0800_0021 => Self::DataTransferLocalControl,
+            0x0800_0022 => Self::DataTransferDeviceState,
+            _ => return None,
+        })
+    }
+}
+
+/// Raw SDO abort received from a remote server.
+///
+/// CiA 301 defines standard values, but profiles and manufacturers may add
+/// their own. Gateways must retain the raw value; [`known`](Self::known)
+/// provides the typed standard-code view when one exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SdoAbort(u32);
+
+impl SdoAbort {
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    pub const fn known(self) -> Option<AbortCode> {
+        AbortCode::from_u32(self.0)
+    }
+}
+
+impl From<AbortCode> for SdoAbort {
+    fn from(code: AbortCode) -> Self {
+        Self(code.to_u32())
+    }
+}
+
+impl core::fmt::Display for SdoAbort {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.known() {
+            Some(known) => write!(f, "{known:?} (0x{:08X})", self.raw()),
+            None => write!(f, "0x{:08X}", self.raw()),
+        }
+    }
 }
 
 /// Client Command Specifier (CCS) - upper 3 bits of byte 0 in client→server SDO frames.

@@ -6,6 +6,7 @@ CANopen protocol stack for embedded Rust. `no_std`, `no_alloc`, uses `embedded-c
 
 - `canopen-core/` — protocol implementation (NMT, SDO, PDO, heartbeat, EMCY, SYNC, LSS)
 - `canopen-derive/` — proc macros (`object_dictionary!`, `object_dictionary_from_eds!`, `sdo_client_from_eds!`, `pdo_client_from_eds!`, `device_from_eds!`, EDS export)
+- `canopen-gateway/` — code-first, middleware-neutral PDO/topic and service/SDO mapping primitives
 - `canopen-linux/` — socketcan, SLCAN, UDP multicast, and canwsd WebSocket transports + SDO client helpers
 - `canwsd-proto/` — shared canwsd interface definition (no_std): WS wire format, filter syntax, REST paths, JSON command/status types, WS close codes. Implemented by `tools/canwsd` (Linux server), consumed by `canopen-web`/`canopen-linux` clients and embedded servers
 - `tools/canwsd/` — Linux canwsd server (`expose`/`attach`/`list`); socketCAN over WebSocket. See `tools/canwsd/CLAUDE.md`
