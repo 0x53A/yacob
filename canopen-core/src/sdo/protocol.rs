@@ -67,11 +67,12 @@ impl AbortCode {
     }
 }
 
-/// Raw SDO abort received from a remote server.
+/// Raw SDO abort code preserved exactly as it appears on the wire.
 ///
 /// CiA 301 defines standard values, but profiles and manufacturers may add
-/// their own. Clients and gateways retain the raw value; [`known`](Self::known)
-/// provides the typed standard-code view when one exists.
+/// their own. Clients, gateways, and application validation hooks retain the
+/// raw value; [`known`](Self::known) provides the typed standard-code view when
+/// one exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SdoAbort(u32);
 
@@ -148,12 +149,17 @@ pub const fn command_specifier(byte0: u8) -> u8 {
 
 /// Encode an SDO abort frame.
 pub fn encode_abort(index: u16, subindex: u8, code: AbortCode) -> [u8; 8] {
+    encode_sdo_abort(index, subindex, code.into())
+}
+
+/// Encode an SDO abort frame from a raw-preserving abort code.
+pub fn encode_sdo_abort(index: u16, subindex: u8, code: SdoAbort) -> [u8; 8] {
     let mut data = [0u8; 8];
     data[0] = (Scs::AbortTransfer as u8) << 5; // 0x80
     data[1] = (index & 0xFF) as u8;
     data[2] = (index >> 8) as u8;
     data[3] = subindex;
-    let abort_bytes = code.to_le_bytes();
+    let abort_bytes = code.raw().to_le_bytes();
     data[4..8].copy_from_slice(&abort_bytes);
     data
 }
@@ -235,6 +241,15 @@ mod tests {
         assert_eq!(data[3], 0x00); // subindex
         let code = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         assert_eq!(code, 0x0602_0000);
+    }
+
+    #[test]
+    fn raw_abort_frame_encoding_preserves_unknown_code() {
+        let data = encode_sdo_abort(0x2000, 1, SdoAbort::new(0x0F00_0042));
+        assert_eq!(
+            u32::from_le_bytes(data[4..8].try_into().unwrap()),
+            0x0F00_0042
+        );
     }
 
     #[test]

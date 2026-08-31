@@ -73,12 +73,12 @@ The bootloader sets VTOR before `cortex_m::asm::bootload()`, which does not.
 
 ## Metadata log
 
-One page, 64 append-only 32-byte records. Newest valid record with the highest
-sequence number wins; a record whose own CRC fails is skipped, so a write torn
-by a power loss is ignored rather than misread. The page is only erased when no
-erased slot is left — the one window where metadata can be lost, and it fails
-safe, because a device with no valid record stays in the updater. See
-"Installing over some other firmware" for why the free slot is found by
+One page, 64 append-only 32-byte records. Newest valid record wins using
+wrap-safe sequence ordering; a record whose own CRC fails is skipped, so a
+write torn by a power loss is ignored rather than misread. The page is only
+erased when no erased slot is left — the one window where metadata can be lost,
+and it fails safe, because a device with no valid record stays in the updater.
+See "Installing over some other firmware" for why the free slot is found by
 scanning for `0xFF` rather than by counting records.
 
 Records are 32 bytes because that is a multiple of the STM32G4 64-bit write
@@ -132,6 +132,9 @@ is acceptable for a PoC on a closed bus and would not be for a product.
 
 Validation CRCs the memory-mapped slot, not the bytes as they arrived, so a
 write that failed silently is caught before the image can ever be booted.
+The accepted-byte counter is kept separately from the number of bytes committed
+to flash, so padding the final partial doubleword with `0xFF` does not make a
+valid, non-8-byte-aligned image look longer than the host declared.
 
 Application side: write `ENTER_UPDATE_MAGIC` (`"UPDT"`) to `0x2F00:0`. Any
 other value is rejected with an SDO value-range abort.

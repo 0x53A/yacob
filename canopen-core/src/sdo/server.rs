@@ -376,7 +376,7 @@ impl SdoServer {
         let len = match od.read(index, subindex, &mut buf) {
             Ok(n) => n,
             Err(e) => {
-                *response = encode_abort(index, subindex, od_error_to_abort(e));
+                *response = encode_sdo_abort(index, subindex, od_error_to_abort(e));
                 return Ok(());
             }
         };
@@ -477,7 +477,7 @@ impl SdoServer {
             let data = &request[4..4 + data_len];
 
             if let Err(code) = validate_download(od, validation_ctx, index, subindex, data) {
-                *response = encode_abort(index, subindex, code);
+                *response = encode_sdo_abort(index, subindex, code);
                 self.transfer = None;
                 return Ok(());
             }
@@ -496,7 +496,7 @@ impl SdoServer {
                     );
                 }
                 Err(e) => {
-                    *response = encode_abort(index, subindex, od_error_to_abort(e));
+                    *response = encode_sdo_abort(index, subindex, od_error_to_abort(e));
                 }
             }
             self.transfer = None;
@@ -584,7 +584,7 @@ impl SdoServer {
             if let Err(code) =
                 validate_download(od, validation_ctx, index, subindex, &write_buf[..data_len])
             {
-                *response = encode_abort(index, subindex, code);
+                *response = encode_sdo_abort(index, subindex, code);
                 return Ok(());
             }
 
@@ -601,7 +601,7 @@ impl SdoServer {
                     );
                 }
                 Err(e) => {
-                    *response = encode_abort(index, subindex, od_error_to_abort(e));
+                    *response = encode_sdo_abort(index, subindex, od_error_to_abort(e));
                 }
             }
         }
@@ -637,7 +637,7 @@ impl SdoServer {
                 let len = match od.read(index, subindex, &mut buf) {
                     Ok(n) => n,
                     Err(e) => {
-                        *response = encode_abort(index, subindex, od_error_to_abort(e));
+                        *response = encode_sdo_abort(index, subindex, od_error_to_abort(e));
                         return Ok(());
                     }
                 };
@@ -876,7 +876,7 @@ impl SdoServer {
                             subindex,
                             &write_buf[..data_len],
                         ) {
-                            *response = encode_abort(index, subindex, code);
+                            *response = encode_sdo_abort(index, subindex, code);
                             return Ok(());
                         }
 
@@ -893,7 +893,7 @@ impl SdoServer {
                                 );
                             }
                             Err(e) => {
-                                *response = encode_abort(index, subindex, od_error_to_abort(e));
+                                *response = encode_sdo_abort(index, subindex, od_error_to_abort(e));
                             }
                         }
 
@@ -1006,7 +1006,7 @@ fn validate_download<OD: ObjectDictionary>(
     index: u16,
     subindex: u8,
     data: &[u8],
-) -> Result<(), AbortCode> {
+) -> Result<(), SdoAbort> {
     validate_heartbeat_consumer_write(
         od,
         ctx.cob_ids,
@@ -1169,15 +1169,16 @@ fn is_pdo_config_index(index: u16) -> bool {
     index >= 0x1400 && index <= 0x1BFF
 }
 
-fn od_error_to_abort(e: OdError) -> AbortCode {
+fn od_error_to_abort(e: OdError) -> SdoAbort {
     match e {
-        OdError::NotFound => AbortCode::ObjectNotFound,
-        OdError::ReadOnly => AbortCode::ReadOnlyObject,
-        OdError::WriteOnly => AbortCode::WriteOnlyObject,
-        OdError::DataTypeMismatch => AbortCode::DataTypeMismatch,
-        OdError::ValueTooLong => AbortCode::OutOfMemory,
-        OdError::ValueRange => AbortCode::ValueRangeExceeded,
-        OdError::HardwareError => AbortCode::GeneralError,
+        OdError::NotFound => AbortCode::ObjectNotFound.into(),
+        OdError::ReadOnly => AbortCode::ReadOnlyObject.into(),
+        OdError::WriteOnly => AbortCode::WriteOnlyObject.into(),
+        OdError::DataTypeMismatch => AbortCode::DataTypeMismatch.into(),
+        OdError::ValueTooLong => AbortCode::OutOfMemory.into(),
+        OdError::ValueRange => AbortCode::ValueRangeExceeded.into(),
+        OdError::HardwareError => AbortCode::GeneralError.into(),
+        OdError::Abort(code) => code,
     }
 }
 

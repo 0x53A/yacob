@@ -852,6 +852,11 @@ impl ValidatedOd {
             if val > 1000 {
                 return Err(canopen_core::od::OdError::ValueRange);
             }
+            if val == 999 {
+                return Err(canopen_core::od::OdError::Abort(
+                    canopen_core::sdo::AbortCode::DataTransferDeviceState.into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -923,6 +928,47 @@ fn validate_write_macro_sdo_server_rejects() {
     // Value should NOT have been written
     assert_eq!(od.level, 42);
     // No event should have been pushed
+    assert!(events.is_empty());
+}
+
+#[test]
+fn validate_write_macro_preserves_exact_sdo_abort() {
+    use canopen_core::nmt::NmtState;
+    use canopen_core::od::OdEvent;
+    use canopen_core::sdo::SdoServer;
+
+    let mut od = ValidatedOd::new();
+    od.level = 42;
+    let mut server = SdoServer::new();
+    let mut resp = [0u8; 8];
+    let mut events: heapless::Deque<OdEvent, 16> = heapless::Deque::new();
+
+    // Application state rejects this otherwise valid write with the exact
+    // CiA 301 present-device-state abort requested by the validator.
+    let req = [
+        0x2B, // expedited download, 2 bytes
+        0x00, 0x20, // index 0x2000
+        0x00, // subindex 0
+        0xE7, 0x03, // value 999 in LE
+        0x00, 0x00,
+    ];
+    server
+        .process(
+            &req,
+            &mut od,
+            &mut resp,
+            &mut events,
+            NmtState::Operational,
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(resp[0] & 0xE0, 0x80);
+    assert_eq!(
+        u32::from_le_bytes(resp[4..8].try_into().unwrap()),
+        0x0800_0022
+    );
+    assert_eq!(od.level, 42);
     assert!(events.is_empty());
 }
 

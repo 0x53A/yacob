@@ -200,6 +200,9 @@ impl BootOd {
 /// flash write granularity, so the tail of each chunk is carried over into the
 /// next write rather than padded in place.
 struct Programmer {
+    /// Logical image bytes accepted from the host. Unlike `flushed`, this
+    /// deliberately excludes the erased-value padding added by `finish`.
+    accepted: u32,
     /// Bytes already committed to flash. Always a multiple of `WRITE_SIZE`.
     flushed: u32,
     pending: [u8; WRITE_SIZE],
@@ -209,6 +212,7 @@ struct Programmer {
 impl Programmer {
     const fn new() -> Self {
         Self {
+            accepted: 0,
             flushed: 0,
             pending: [0xFF; WRITE_SIZE],
             pending_len: 0,
@@ -219,12 +223,13 @@ impl Programmer {
         *self = Self::new();
     }
 
-    /// Logical number of bytes accepted so far, including the carried tail.
+    /// Logical number of image bytes accepted so far.
     fn received(&self) -> u32 {
-        self.flushed + self.pending_len as u32
+        self.accepted
     }
 
     fn push(&mut self, nvm: &mut Nvm<'_>, mut data: &[u8]) -> Result<(), ProgramError> {
+        let accepted = data.len() as u32;
         if self.received() as usize + data.len() > fw::APP_SIZE as usize {
             return Err(ProgramError::TooLarge);
         }
@@ -232,8 +237,7 @@ impl Programmer {
         // Top the carried tail back up to a full doubleword first.
         if self.pending_len > 0 {
             let take = core::cmp::min(WRITE_SIZE - self.pending_len, data.len());
-            self.pending[self.pending_len..self.pending_len + take]
-                .copy_from_slice(&data[..take]);
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&data[..take]);
             self.pending_len += take;
             data = &data[take..];
             if self.pending_len == WRITE_SIZE {
@@ -253,6 +257,7 @@ impl Programmer {
         let tail = &data[aligned..];
         self.pending[..tail.len()].copy_from_slice(tail);
         self.pending_len = tail.len();
+        self.accepted += accepted;
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use crate::datatypes::DataType;
+use crate::{datatypes::DataType, sdo::SdoAbort};
 
 /// Access type for an OD entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +40,13 @@ pub enum OdError {
     ValueTooLong,
     ValueRange,
     HardwareError,
+    /// Send an exact SDO abort code to the client.
+    ///
+    /// This is primarily useful from [`ObjectDictionary::validate_write`] when
+    /// a more specific standard or manufacturer-defined abort is required than
+    /// the generic OD error variants can express. The raw code is preserved on
+    /// the wire.
+    Abort(SdoAbort),
 }
 
 /// Emitted when the protocol stack modifies an OD entry.
@@ -129,6 +136,8 @@ pub trait ObjectDictionary {
     /// Common return errors:
     /// - `OdError::ValueRange` — value out of application-defined range
     /// - `OdError::HardwareError` — device not ready (e.g., flash in error state)
+    /// - `OdError::Abort(SdoAbort::new(code))` — send an exact standard or
+    ///   manufacturer-defined SDO abort code
     fn validate_write(&self, _index: u16, _subindex: u8, _data: &[u8]) -> Result<(), OdError> {
         Ok(())
     }

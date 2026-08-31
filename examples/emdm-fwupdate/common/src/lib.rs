@@ -63,10 +63,10 @@ pub const META_SLOTS: usize = META_SIZE as usize / META_RECORD_SIZE;
 
 /// One generation of update state.
 ///
-/// Records are appended, never modified: the newest valid record with the
-/// highest sequence number wins. A record is only considered at all once its
-/// own CRC checks out, so a write torn by a power loss is ignored rather than
-/// misread.
+/// Records are appended, never modified: the newest valid record wins, with
+/// wrapping sequence-number ordering. A record is only considered at all once
+/// its own CRC checks out, so a write torn by a power loss is ignored rather
+/// than misread.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct MetaRecord {
@@ -161,7 +161,7 @@ fn scan_meta(page: &[u8]) -> (MetaRecord, usize) {
             next_free = slot;
         }
         if let Some(rec) = MetaRecord::decode(raw) {
-            if best.is_none_or(|b| rec.seq > b.seq) {
+            if best.is_none_or(|b| rec.seq != b.seq && rec.seq.wrapping_sub(b.seq) < (1 << 31)) {
                 best = Some(rec);
             }
         }
@@ -360,6 +360,18 @@ mod tests {
         let b = a.next(|r| r.app_len = 99);
         let (found, next_free) = scan_meta(&page_with(&[a, b]));
         assert_eq!(found, b);
+        assert_eq!(next_free, 2);
+    }
+
+    #[test]
+    fn sequence_order_survives_wraparound() {
+        let before_wrap = MetaRecord {
+            seq: u32::MAX,
+            ..MetaRecord::BLANK
+        };
+        let after_wrap = before_wrap.next(|r| r.app_len = 99);
+        let (found, next_free) = scan_meta(&page_with(&[before_wrap, after_wrap]));
+        assert_eq!(found, after_wrap);
         assert_eq!(next_free, 2);
     }
 

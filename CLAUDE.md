@@ -135,6 +135,9 @@ object_dictionary! {
 impl MyOd {
     fn check_value(&self, index: u16, sub: u8, data: &[u8]) -> Result<(), OdError> {
         // Return Err(OdError::ValueRange) to abort the SDO write
+        // with 0x0609_0030. Return
+        // Err(OdError::Abort(AbortCode::DataTransferDeviceState.into()))
+        // for an exact standard abort, or wrap SdoAbort::new(raw_code).
         Ok(())
     }
 }
