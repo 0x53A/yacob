@@ -666,6 +666,19 @@ fn apply_mapped<OD: ObjectDictionary, const EVT_QUEUE: usize>(
     dropped
 }
 
+/// Exact classic-CAN payload length implied by an RPDO mapping.
+///
+/// A configuration exceeding the 64-bit PDO budget is structurally invalid
+/// and therefore has no acceptable wire length.
+fn mapped_payload_len(pdo: &RpdoConfig) -> Option<usize> {
+    let total_bits = pdo
+        .mappings
+        .iter()
+        .map(|mapping| mapping.bit_length as usize)
+        .sum::<usize>();
+    (total_bits <= PDO_MAX_PAYLOAD_BITS).then_some(bytes_for_bits(total_bits))
+}
+
 /// RPDO engine. Manages up to N receive PDOs.
 ///
 /// Synchronous RPDOs (transmission type 0..=240) do not write the OD at
@@ -735,8 +748,14 @@ impl<const N: usize> RpdoEngine<N> {
     /// Returns true if the frame was consumed by an RPDO.
     ///
     /// Pushes one `OdEvent` per successfully written mapped entry.
-    /// `now_us` stamps the reception time for deadline monitoring; reception
-    /// re-arms an expired deadline.
+    /// A matching frame is consumed even when its payload length does not
+    /// exactly match the configured mapping. Such a malformed frame is
+    /// otherwise ignored: it neither writes/buffers data nor refreshes the
+    /// deadline. For a structurally valid frame, mapped OD writes remain
+    /// independent; one rejected write does not suppress the other entries.
+    ///
+    /// `now_us` stamps a structurally valid reception for deadline monitoring;
+    /// reception re-arms an expired deadline.
     ///
     /// A frame for a *synchronous* RPDO is consumed (returns true) but only
     /// buffered — it writes the OD and emits its events on the next
@@ -765,6 +784,10 @@ impl<const N: usize> RpdoEngine<N> {
         else {
             return (false, 0);
         };
+
+        if mapped_payload_len(&self.pdos[slot]) != Some(frame.data().len()) {
+            return (true, 0);
+        }
 
         // Deadline monitoring watches the bus, so it is stamped here even when
         // the data itself waits for a SYNC.
@@ -1381,6 +1404,101 @@ mod tests {
         }
     }
 
+    fn two_entry_rpdo(transmission_type: u8, deadline_ms: u16) -> RpdoEngine<1> {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6201,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        RpdoEngine::new([RpdoConfig {
+            od_number: 0,
+            cob_id: 0x201,
+            transmission_type,
+            deadline_ms,
+            mappings,
+            enabled: true,
+        }])
+    }
+
+    #[test]
+    fn malformed_rpdo_length_changes_nothing_and_does_not_refresh_deadline() {
+        let mut engine = two_entry_rpdo(EVENT_DRIVEN, 100);
+        let mut od = deadline_test_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        let valid = CanFrame::new(0x201, &[0x11, 1]).unwrap();
+        assert!(engine.process(&valid, &mut od, &mut events, 0));
+        assert_eq!(od.output1, 0x11);
+        assert!(od.output_flag1);
+        events.clear();
+
+        let mut expired = Vec::<PdoNumber, 1>::new();
+        engine.check_deadlines(100_001, &mut expired);
+        assert!(engine.deadline_expired(PdoNumber::of::<1>()));
+
+        // Both frames match the RPDO COB-ID and are consumed, but neither is
+        // a complete two-byte process image.
+        let short = CanFrame::new(0x201, &[0x22]).unwrap();
+        assert!(engine.process(&short, &mut od, &mut events, 200_000));
+        let long = CanFrame::new(0x201, &[0x33, 0, 0x44]).unwrap();
+        assert!(engine.process(&long, &mut od, &mut events, 300_000));
+
+        assert_eq!(od.output1, 0x11);
+        assert!(od.output_flag1);
+        assert!(events.is_empty());
+        assert!(engine.deadline_expired(PdoNumber::of::<1>()));
+    }
+
+    #[test]
+    fn structurally_valid_rpdo_continues_after_one_od_write_is_rejected() {
+        let mut mappings = Vec::<PdoMapping, PDO_MAX_MAPPINGS>::new();
+        mappings
+            .push(PdoMapping {
+                // PdoTestOd rejects writes to this read-only input.
+                index: 0x6000,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        mappings
+            .push(PdoMapping {
+                index: 0x6200,
+                subindex: 1,
+                bit_length: 8,
+            })
+            .unwrap();
+        let mut engine = RpdoEngine::new([RpdoConfig {
+            od_number: 0,
+            cob_id: 0x201,
+            transmission_type: EVENT_DRIVEN,
+            deadline_ms: 100,
+            mappings,
+            enabled: true,
+        }]);
+        let mut od = deadline_test_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        let frame = CanFrame::new(0x201, &[0xAA, 0x55]).unwrap();
+        assert!(engine.process(&frame, &mut od, &mut events, 10_000));
+
+        assert_eq!(od.input1, 0);
+        assert_eq!(od.output1, 0x55);
+        assert_eq!(events.len(), 1);
+        let event = events.pop_front().unwrap();
+        assert_eq!((event.index, event.subindex), (0x6200, 1));
+        assert!(!engine.deadline_expired(PdoNumber::of::<1>()));
+    }
+
     #[test]
     fn pdo_number_bounds_and_offset() {
         assert!(PdoNumber::new(0).is_none());
@@ -1665,6 +1783,28 @@ mod tests {
         assert_eq!(od.output1, 0x33);
         // One commit, so one event — not one per frame received.
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn malformed_synchronous_rpdo_does_not_replace_pending_or_refresh_deadline() {
+        let mut engine = two_entry_rpdo(SYNC_CYCLIC_1, 100);
+        let mut od = zeroed_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+
+        let valid = CanFrame::new(0x201, &[0x11, 1]).unwrap();
+        assert!(engine.process(&valid, &mut od, &mut events, 0));
+        let short = CanFrame::new(0x201, &[0x22]).unwrap();
+        assert!(engine.process(&short, &mut od, &mut events, 50_000));
+
+        assert!(engine.has_pending(PdoNumber::of::<1>()));
+        engine.on_sync(&mut od, &mut events);
+        assert_eq!(od.output1, 0x11);
+        assert!(od.output_flag1);
+        assert_eq!(events.len(), 2);
+
+        let mut expired = Vec::<PdoNumber, 1>::new();
+        engine.check_deadlines(100_001, &mut expired);
+        assert_eq!(expired.as_slice(), &[PdoNumber::of::<1>()]);
     }
 
     #[test]

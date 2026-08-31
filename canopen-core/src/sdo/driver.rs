@@ -397,10 +397,13 @@ impl SdoDriver {
     ) -> Result<CanFrame, SdoError<E>> {
         loop {
             let frame = can.receive().await.map_err(SdoError::Transport)?;
-            if frame.raw_id() == self.response_cob && frame.raw_dlc() == 8 {
-                return Ok(frame);
+            if frame.raw_id() != self.response_cob {
+                continue;
             }
-            // Skip non-SDO frames (heartbeat, PDO, etc.)
+            if frame.raw_dlc() != 8 {
+                return Err(SdoError::ProtocolError);
+            }
+            return Ok(frame);
         }
     }
 
@@ -445,9 +448,13 @@ impl SdoDriver {
             })
             .await?;
 
-            if frame.raw_id() == self.response_cob && frame.raw_dlc() == 8 {
-                return Ok(frame);
+            if frame.raw_id() != self.response_cob {
+                continue;
             }
+            if frame.raw_dlc() != 8 {
+                return Err(SdoError::ProtocolError);
+            }
+            return Ok(frame);
         }
     }
 }
@@ -549,6 +556,30 @@ mod tests {
 
         async fn receive(&mut self) -> Result<CanFrame, MockError> {
             core::future::pending().await
+        }
+    }
+
+    struct MalformedResponseCan {
+        response: CanFrame,
+    }
+
+    impl MalformedResponseCan {
+        fn with_dlc(dlc: usize) -> Self {
+            Self {
+                response: CanFrame::new(0x581, &[0; 8][..dlc]).unwrap(),
+            }
+        }
+    }
+
+    impl AsyncCan for MalformedResponseCan {
+        type Error = MockError;
+
+        async fn transmit(&mut self, _frame: &CanFrame) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        async fn receive(&mut self) -> Result<CanFrame, MockError> {
+            Ok(self.response)
         }
     }
 
@@ -718,6 +749,57 @@ mod tests {
             let val = driver.read_u32(0x1000, 0, &mut can).await.unwrap();
             assert_eq!(val, 0xDEAD_BEEF);
         });
+    }
+
+    #[test]
+    fn malformed_matching_response_dlc_is_a_protocol_error() {
+        let target = NodeId::new(1).unwrap();
+        let driver = SdoDriver::new(target);
+
+        for dlc in 0..8 {
+            let mut upload_can = MalformedResponseCan::with_dlc(dlc);
+            let upload = block_on(driver.upload(0x1000, 0, &mut [0; 4], &mut upload_can));
+            assert!(
+                matches!(upload, Err(SdoError::ProtocolError)),
+                "upload DLC {dlc}"
+            );
+
+            let mut download_can = MalformedResponseCan::with_dlc(dlc);
+            let download = block_on(driver.download(0x2000, 0, &[1], &mut download_can));
+            assert!(
+                matches!(download, Err(SdoError::ProtocolError)),
+                "download DLC {dlc}"
+            );
+
+            let clock = CellClock(core::cell::Cell::new(0));
+            let mut timed_upload_can = MalformedResponseCan::with_dlc(dlc);
+            let timed_upload = block_on(driver.upload_timed(
+                0x1000,
+                0,
+                &mut [0; 4],
+                &mut timed_upload_can,
+                1_000_000,
+                &clock,
+            ));
+            assert!(
+                matches!(timed_upload, Err(SdoError::ProtocolError)),
+                "timed upload DLC {dlc}"
+            );
+
+            let mut timed_download_can = MalformedResponseCan::with_dlc(dlc);
+            let timed_download = block_on(driver.download_timed(
+                0x2000,
+                0,
+                &[1],
+                &mut timed_download_can,
+                1_000_000,
+                &clock,
+            ));
+            assert!(
+                matches!(timed_download, Err(SdoError::ProtocolError)),
+                "timed download DLC {dlc}"
+            );
+        }
     }
 
     #[test]

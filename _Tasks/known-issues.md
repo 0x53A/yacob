@@ -14,29 +14,6 @@ revision rather than infer behavior from this file's date.
 
 ## Open
 
-### RPDO reception is not atomic and accepts malformed process images
-
-Severity: critical for command/safety RPDOs.
-
-`RpdoEngine::process_with_drop_count()` currently identifies an RPDO only by
-enabled COB-ID, refreshes its deadline state immediately, and then calls
-`apply_mapped()`. The latter writes mapped entries one at a time, stops when a
-short frame runs out of bits, and does not roll back earlier writes when a
-later mapping is missing or an OD write is rejected. Synchronous RPDOs buffer
-the same unvalidated frame and fail in the same incremental way on SYNC.
-
-Consequences:
-
-- a short frame can partially update an otherwise atomic command image;
-- an invalid/unwritable mapping can leave preceding fields committed;
-- any matching frame, including a malformed one, refreshes the RPDO deadline;
-- callers receive `true` (“consumed”) and cannot distinguish full acceptance.
-
-**Fix:** preflight the exact expected DLC/bit length and every mapped target,
-decode into a temporary transaction, then commit all writes and deadline state
-only if the complete process image is valid. Add event-driven and synchronous
-regressions for short, long, unwritable, and mixed-validity mappings.
-
 ### Nonblocking transmit refusal can lose protocol work
 
 Severity: high. `embedded_can::nb::Can::transmit()` may return `WouldBlock`,
@@ -129,6 +106,26 @@ The raw `SdoClient` state machine has no built-in timeout. This is largely mitig
 
 **Note:** The SDO *server* does have a 5s timeout. This issue is about the low-level *client* only. Prefer `SdoDriver` for new code.
 
+### Linux blocking SDO timeout is a whole-transfer deadline
+
+Severity: medium API/operational hazard.
+
+`canopen_linux::sdo_helpers::block_on_with_timeout()` sets one deadline around
+the complete future. Successful segmented progress does not restart it. This
+is a valid whole-operation deadline, but the helper offers no progress-reset
+response-timeout mode and callers can easily label it as a per-response
+timeout. A responsive transfer can then fail solely because its total elapsed
+time crosses the configured duration.
+
+**Fix:** make the timeout semantics explicit in API names/documentation and
+provide a progress-aware option if gateways need a silence timeout. Test a
+segmented transfer whose total duration exceeds the threshold while each
+individual response stays within it.
+
+**Affected downstream:** the
+[TurnGrip/EE gateway](https://gitlab.com/frost-main-group/frost-pcb-dev/frost-pcb-endeffector/-/blob/main/docs/known-defects.md#gw-08--the-sdo-response-timeout-is-one-whole-transfer-deadline)
+currently names a two-second whole-operation wrapper `SDO_RESPONSE_TIMEOUT`.
+
 ### LSS FastScan not implemented
 
 The LSS slave supports Switch Mode Global, Switch Mode Selective, Configure Node ID, Store Configuration, and identity inquiries. FastScan (command 0x51) is not implemented.
@@ -218,6 +215,12 @@ hand after `Default::default()`.
 
 These historical review findings no longer belong in the open backlog:
 
+- RPDO reception now requires the frame length to exactly match the mapped
+  process image before it updates the OD, refreshes deadline monitoring, or
+  replaces a synchronous pending frame. Structurally valid frames retain PDO
+  semantics: each mapped OD write is independent, and a rejected entry does
+  not roll back or suppress other entries. Immediate and synchronous tests
+  cover short/long rejection, deadlines, pending frames, and rejected writes.
 - TPDO communication reset now clears inhibited asynchronous event latches via
   `reset_communication_state()`; engine- and Node-level regressions cover it.
 - EDS PDO parameters treat absent and empty `DefaultValue=` as unspecified,
@@ -231,9 +234,21 @@ These historical review findings no longer belong in the open backlog:
   so an application can explicitly announce a healthy device.
 - block upload honours partial ACK sequence values, rewinds to the first
   missing segment, recomputes CRC, and rejects invalid block sizes.
+- `SdoDriver` now rejects a matching response whose DLC is not exactly 8 with
+  `ProtocolError` in the common receive boundary, before the payload enters the
+  SDO state machine. The timed and untimed upload/download paths are covered
+  for every classic-CAN short length (0..7). The prior code was also re-audited:
+  it checked DLC before converting to `[u8; 8]`, so the historical claim that
+  these frames panicked was incorrect; its actual defect was silently ignoring
+  the malformed matching response until timeout.
 - SDO clients preserve manufacturer-specific and newly standardised abort
   values in `SdoAbort`; callers can inspect the exact `raw()` value or decode
-  known CiA 301 values with `known()`.
+  known CiA 301 values with `known()`. The
+  [TurnGrip/EE gateway](https://gitlab.com/frost-main-group/frost-pcb-dev/frost-pcb-endeffector/-/blob/main/docs/known-defects.md#gw-07--the-pinned-stack-loses-unknown-sdo-abort-values)
+  and
+  [RES gateway](https://gitlab.com/frost-main-group/frost-incubator/frost-res-ros2-gateway/-/blob/main/docs/known-defects.md#res-gw-06--the-pinned-stack-loses-unknown-sdo-abort-values)
+  still pin the older lossy revision and must update before claiming exact raw
+  abort reporting.
 
 The remaining block-*download* recovery and updater retry items are listed in
 Open above; fixing the corresponding upload path did not close them.
