@@ -7,7 +7,8 @@ use canopen_core::transport::{CanError, CanFrame};
 use canwsd_proto::wire::{CAN_EFF_FLAG, CAN_ERR_FLAG, CAN_RTR_FLAG};
 use canwsd_proto::WireFrame;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::connect_async;
@@ -33,6 +34,11 @@ pub struct WebSocketTransportConfig {
     /// how long a caller is willing to stall on teardown are unrelated
     /// questions. Zero skips the graceful close.
     pub close_timeout: Duration,
+    /// Maximum number of received frames waiting for
+    /// [`embedded_can::nb::Can::receive`]. When the application stops
+    /// polling, newer frames are dropped and counted
+    /// ([`WebSocketTransport::rx_dropped`]) instead of growing memory.
+    pub receive_queue_capacity: usize,
 }
 
 impl Default for WebSocketTransportConfig {
@@ -41,6 +47,7 @@ impl Default for WebSocketTransportConfig {
             transmit_queue_capacity: 32,
             max_transmit_age: Duration::from_millis(250),
             close_timeout: Duration::from_millis(250),
+            receive_queue_capacity: 4096,
         }
     }
 }
@@ -68,6 +75,16 @@ pub struct WebSocketTransport {
     tx: Option<tokio::sync::mpsc::Sender<QueuedFrame>>,
     rx: mpsc::Receiver<CanFrame>,
     thread: Option<thread::JoinHandle<()>>,
+    counters: Arc<RxCounters>,
+}
+
+#[derive(Default)]
+struct RxCounters {
+    /// Frames dropped because the receive queue was full.
+    dropped: AtomicU64,
+    /// Binary messages that are not a classic 11-bit data frame (EFF, RTR,
+    /// error frames) or do not decode at all.
+    undecodable: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -106,6 +123,11 @@ impl WebSocketTransport {
                 "transmit_queue_capacity must be nonzero",
             ));
         }
+        if config.receive_queue_capacity == 0 {
+            return Err(WebSocketTransportError::InvalidConfig(
+                "receive_queue_capacity must be nonzero",
+            ));
+        }
         if config.max_transmit_age.is_zero() {
             return Err(WebSocketTransportError::InvalidConfig(
                 "max_transmit_age must be nonzero",
@@ -115,8 +137,14 @@ impl WebSocketTransport {
         let url = url.into();
         let (tx, mut tx_rx) =
             tokio::sync::mpsc::channel::<QueuedFrame>(config.transmit_queue_capacity);
-        let (rx_tx, rx) = mpsc::channel::<CanFrame>();
-        let runtime = tokio::runtime::Runtime::new().map_err(WebSocketTransportError::Runtime)?;
+        let (rx_tx, rx) = mpsc::sync_channel::<CanFrame>(config.receive_queue_capacity);
+        let counters = Arc::new(RxCounters::default());
+        let task_counters = Arc::clone(&counters);
+        // One socket needs no worker pool.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(WebSocketTransportError::Runtime)?;
 
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || {
@@ -147,8 +175,17 @@ impl WebSocketTransport {
                         msg = ws_rx.next() => {
                             match msg {
                                 Some(Ok(Message::Binary(data))) => {
-                                    if let Ok(frame) = decode_frame(&data) {
-                                        let _ = rx_tx.send(frame);
+                                    match decode_frame(&data) {
+                                        Ok(frame) => match rx_tx.try_send(frame) {
+                                            Ok(()) => {}
+                                            Err(mpsc::TrySendError::Full(_)) => {
+                                                task_counters.dropped.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            Err(mpsc::TrySendError::Disconnected(_)) => break,
+                                        },
+                                        Err(()) => {
+                                            task_counters.undecodable.fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
                                 }
                                 Some(Ok(Message::Close(_))) | None => break,
@@ -166,10 +203,24 @@ impl WebSocketTransport {
                 tx: Some(tx),
                 rx,
                 thread: Some(thread),
+                counters,
             }),
             Ok(Err(e)) => Err(WebSocketTransportError::Connect(e)),
             Err(e) => Err(WebSocketTransportError::Connect(e.to_string())),
         }
+    }
+}
+
+impl WebSocketTransport {
+    /// Received frames dropped because the receive queue was full.
+    pub fn rx_dropped(&self) -> u64 {
+        self.counters.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Received binary messages discarded because they are not a classic
+    /// 11-bit data frame (extended, remote or error frames) or are malformed.
+    pub fn rx_undecodable(&self) -> u64 {
+        self.counters.undecodable.load(Ordering::Relaxed)
     }
 }
 

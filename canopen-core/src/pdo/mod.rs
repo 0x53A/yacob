@@ -74,3 +74,22 @@ pub fn heapless_vec_new<T, const N: usize>() -> heapless::Vec<T, N> {
 pub fn heapless_vec_push<T, const N: usize>(v: &mut heapless::Vec<T, N>, val: T) -> Result<(), T> {
     v.push(val)
 }
+
+/// Sign-extend a little-endian value whose low `bits` bits were received
+/// through a partial PDO mapping (the remaining bits must be zero).
+///
+/// Shared by the RPDO engine and the generated PDO codecs so both sides
+/// widen signed partial mappings the same way.
+#[doc(hidden)]
+pub fn sign_extend_pdo_bits(value: &mut [u8], bits: usize) {
+    if bits == 0 || bits >= value.len() * 8 {
+        return;
+    }
+    let sign = (value[(bits - 1) / 8] >> ((bits - 1) % 8)) & 1;
+    if sign == 0 {
+        return;
+    }
+    for bit in bits..value.len() * 8 {
+        value[bit / 8] |= 1 << (bit % 8);
+    }
+}

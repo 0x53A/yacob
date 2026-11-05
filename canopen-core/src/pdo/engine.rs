@@ -636,25 +636,16 @@ impl<const N: usize> TpdoEngine<N> {
                 bit_offset = end_bit;
                 continue;
             }
-            let object_len = bytes_for_bits(bit_len);
-            if od
-                .read(
-                    mapping.index,
-                    mapping.subindex,
-                    &mut object_data[..object_len],
-                )
-                .is_err()
-            {
+            // Read the whole object (a partial mapping transmits its low
+            // bits); the OD rejects buffers narrower than the object.
+            let Ok(read_len) = od.read(mapping.index, mapping.subindex, &mut object_data) else {
+                return None;
+            };
+            if read_len * 8 < bit_len {
                 return None;
             }
-            super::copy_pdo_bits(
-                &object_data[..object_len],
-                0,
-                &mut data,
-                bit_offset,
-                bit_len,
-            );
-            object_data[..object_len].fill(0);
+            super::copy_pdo_bits(&object_data, 0, &mut data, bit_offset, bit_len);
+            object_data.fill(0);
             bit_offset = end_bit;
         }
 
@@ -691,8 +682,23 @@ fn apply_mapped<OD: ObjectDictionary, const EVT_QUEUE: usize>(
             continue;
         }
         super::copy_pdo_bits(data, bit_offset, &mut object_data, 0, bit_len);
+        // A partial mapping carries the low `bit_len` bits of the object.
+        // Widen to the object's full size (sign-extending signed integers),
+        // because OD writes of fixed-size objects require the exact width.
+        let write_len = match od
+            .lookup(mapping.index, mapping.subindex)
+            .and_then(|meta| meta.data_type.size().map(|size| (meta.data_type, size)))
+        {
+            Some((data_type, size)) if size >= object_len && size <= object_data.len() => {
+                if is_signed_integer(data_type) {
+                    super::sign_extend_pdo_bits(&mut object_data[..size], bit_len);
+                }
+                size
+            }
+            _ => object_len,
+        };
         if od
-            .write(mapping.index, mapping.subindex, &object_data[..object_len])
+            .write(mapping.index, mapping.subindex, &object_data[..write_len])
             .is_ok()
         {
             if events.is_full() {
@@ -705,10 +711,18 @@ fn apply_mapped<OD: ObjectDictionary, const EVT_QUEUE: usize>(
                 source: OdEventSource::Rpdo,
             });
         }
-        object_data[..object_len].fill(0);
+        object_data.fill(0);
         bit_offset = end_bit;
     }
     dropped
+}
+
+fn is_signed_integer(data_type: crate::datatypes::DataType) -> bool {
+    use crate::datatypes::DataType;
+    matches!(
+        data_type,
+        DataType::I8 | DataType::I16 | DataType::I24 | DataType::I32 | DataType::I64
+    )
 }
 
 /// Exact classic-CAN payload length implied by an RPDO mapping.
@@ -751,6 +765,8 @@ pub struct RpdoEngine<const N: usize = 4> {
     /// Deadline currently expired (set by `check_deadlines`, cleared by the
     /// next reception). Mapped OD entries keep their last received values.
     expired: [bool; N],
+    /// Matching frames dropped because they were shorter than the mapping.
+    length_errors: u32,
 }
 
 impl<const N: usize> RpdoEngine<N> {
@@ -761,7 +777,14 @@ impl<const N: usize> RpdoEngine<N> {
             last_rx_us: [0; N],
             armed: [false; N],
             expired: [false; N],
+            length_errors: 0,
         }
+    }
+
+    /// Number of RPDO frames not processed because they carried fewer bytes
+    /// than their mapping requires (CiA 301 EMCY 0x8210 condition).
+    pub fn length_errors(&self) -> u32 {
+        self.length_errors
     }
 
     /// Config of the RPDO with the given CANopen number (RPDO1 = 1), if declared.
@@ -793,10 +816,11 @@ impl<const N: usize> RpdoEngine<N> {
     /// Returns true if the frame was consumed by an RPDO.
     ///
     /// Pushes one `OdEvent` per successfully written mapped entry.
-    /// A matching frame is consumed even when its payload length does not
-    /// exactly match the configured mapping. Such a malformed frame is
-    /// otherwise ignored: it neither writes/buffers data nor refreshes the
-    /// deadline. For a structurally valid frame, mapped OD writes remain
+    /// A matching frame longer than the configured mapping is processed using
+    /// its leading bytes (CiA 301). A shorter frame is consumed but otherwise
+    /// ignored: it neither writes/buffers data nor refreshes the deadline, and
+    /// is counted in [`length_errors`](Self::length_errors) so the application
+    /// can report EMCY 0x8210. For a structurally valid frame, mapped OD writes remain
     /// independent; one rejected write does not suppress the other entries.
     ///
     /// `now_us` stamps a structurally valid reception for deadline monitoring;
@@ -830,7 +854,10 @@ impl<const N: usize> RpdoEngine<N> {
             return (false, 0);
         };
 
-        if mapped_payload_len(&self.pdos[slot]) != Some(frame.data().len()) {
+        // CiA 301: a PDO longer than its mapping is processed using the
+        // leading bytes; a shorter one is not processed (length error).
+        if mapped_payload_len(&self.pdos[slot]).is_none_or(|len| frame.data().len() < len) {
+            self.length_errors = self.length_errors.saturating_add(1);
             return (true, 0);
         }
 
@@ -1476,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_rpdo_length_changes_nothing_and_does_not_refresh_deadline() {
+    fn short_rpdo_changes_nothing_and_does_not_refresh_deadline() {
         let mut engine = two_entry_rpdo(EVENT_DRIVEN, 100);
         let mut od = deadline_test_od();
         let mut events: Deque<OdEvent, 16> = Deque::new();
@@ -1491,17 +1518,30 @@ mod tests {
         engine.check_deadlines(100_001, &mut expired);
         assert!(engine.deadline_expired(PdoNumber::of::<1>()));
 
-        // Both frames match the RPDO COB-ID and are consumed, but neither is
-        // a complete two-byte process image.
+        // The frame matches the RPDO COB-ID and is consumed, but is not a
+        // complete two-byte process image.
         let short = CanFrame::new(0x201, &[0x22]).unwrap();
         assert!(engine.process(&short, &mut od, &mut events, 200_000));
-        let long = CanFrame::new(0x201, &[0x33, 0, 0x44]).unwrap();
-        assert!(engine.process(&long, &mut od, &mut events, 300_000));
 
         assert_eq!(od.output1, 0x11);
         assert!(od.output_flag1);
         assert!(events.is_empty());
         assert!(engine.deadline_expired(PdoNumber::of::<1>()));
+        assert_eq!(engine.length_errors(), 1);
+    }
+
+    #[test]
+    fn long_rpdo_is_processed_using_the_leading_bytes() {
+        let mut engine = two_entry_rpdo(EVENT_DRIVEN, 100);
+        let mut od = deadline_test_od();
+        let mut events: Deque<OdEvent, 16> = Deque::new();
+        // Mapping is two bytes; masters may pad PDOs to eight.
+        let long = CanFrame::new(0x201, &[0x33, 0, 0x44, 0, 0, 0, 0, 0]).unwrap();
+        assert!(engine.process(&long, &mut od, &mut events, 0));
+        assert_eq!(od.output1, 0x33);
+        assert!(!od.output_flag1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(engine.length_errors(), 0);
     }
 
     #[test]

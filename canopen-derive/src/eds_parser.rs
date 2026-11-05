@@ -64,6 +64,25 @@ impl Parse for EdsDefinition {
     }
 }
 
+/// Absolute path of a file-based EDS declaration.
+fn source_path(def: &EdsDefinition) -> Option<std::path::PathBuf> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    Some(std::path::Path::new(&manifest_dir).join(&def.source))
+}
+
+/// Tokens that make cargo rebuild the invoking crate when the EDS file
+/// changes. A proc macro reading a file directly is otherwise invisible to
+/// cargo's dependency tracking, and edits would leave stale generated code.
+pub fn track_source(def: &EdsDefinition) -> proc_macro2::TokenStream {
+    match source_path(def).filter(|path| path.is_file()) {
+        Some(path) => {
+            let path = path.to_string_lossy().into_owned();
+            quote::quote! { const _: &[u8] = include_bytes!(#path); }
+        }
+        None => proc_macro2::TokenStream::new(),
+    }
+}
+
 /// Parse an EDS file and convert it to an OdDefinition for codegen.
 pub fn parse_eds_to_od(def: EdsDefinition) -> std::result::Result<OdDefinition, syn::Error> {
     let EdsDefinition {
@@ -188,7 +207,8 @@ fn parse_eds_content_with_overrides(
         // Try to parse as a hex index
         if let Some((index, subindex)) = parse_section_index(section_name) {
             // Skip PDO comm/mapping indices — handled separately in extract_pdos
-            if is_pdo_index(index) {
+            // PDO records and 0x1021/0x1022 (Store EDS/Format) are generated.
+            if is_pdo_index(index) || index == 0x1021 || index == 0x1022 {
                 continue;
             }
             if let Some(sub) = subindex {
@@ -205,7 +225,7 @@ fn parse_eds_content_with_overrides(
 
                 if obj_type == 0x07 {
                     // VAR object
-                    if let Some(entry) = parse_var_entry(index, 0, props, capacity_overrides) {
+                    if let Some(entry) = parse_var_entry(index, 0, props, capacity_overrides)? {
                         entries.push(OdEntry {
                             index,
                             name: entry.name,
@@ -226,7 +246,7 @@ fn parse_eds_content_with_overrides(
             if *subindex == 0 {
                 continue;
             }
-            if let Some(entry) = parse_var_entry(*index, *subindex, props, capacity_overrides) {
+            if let Some(entry) = parse_var_entry(*index, *subindex, props, capacity_overrides)? {
                 sub_entries.push(entry);
             }
         }
@@ -724,10 +744,19 @@ fn parse_var_entry(
     subindex: u8,
     props: &[(String, String)],
     capacity_overrides: &std::collections::HashMap<u16, usize>,
-) -> Option<SubEntry> {
-    let name_str = get_prop(props, "ParameterName")?;
-    let data_type_code =
-        u16::try_from(get_prop(props, "DataType").and_then(|v| parse_int(&v))?).ok()?;
+) -> std::result::Result<Option<SubEntry>, String> {
+    // Entries without a name or with a data type outside the supported set
+    // are skipped (vendor EDS files commonly contain e.g. UNICODE_STRING or
+    // TIME_OF_DAY objects that this stack cannot represent).
+    let Some(name_str) = get_prop(props, "ParameterName") else {
+        return Ok(None);
+    };
+    let Some(data_type_code) = get_prop(props, "DataType")
+        .and_then(|v| parse_int(&v))
+        .and_then(|v| u16::try_from(v).ok())
+    else {
+        return Ok(None);
+    };
     let access_str = get_prop(props, "AccessType").unwrap_or_else(|| "ro".to_string());
     let default_str = get_prop(props, "DefaultValue").unwrap_or_else(|| "0".to_string());
     let pdo_mapping = get_prop(props, "PDOMapping")
@@ -735,14 +764,21 @@ fn parse_var_entry(
         .unwrap_or(0)
         != 0;
 
-    let (rust_type, _size) = datatype_to_rust(data_type_code)?;
+    let Some((rust_type, _size)) = datatype_to_rust(data_type_code) else {
+        return Ok(None);
+    };
     let is_varlen = crate::dsl::is_variable_length_type(rust_type);
-    let access = match access_str.to_lowercase().as_str() {
-        "ro" | "const" => AccessKind::Ro,
+    let access = match access_str.trim().to_lowercase().as_str() {
+        "ro" => AccessKind::Ro,
+        "const" => AccessKind::Const,
         // CiA 306: rwr/rww are read-write; the suffix only marks TPDO/RPDO mappability
         "rw" | "rwr" | "rww" => AccessKind::Rw,
         "wo" => AccessKind::Wo,
-        _ => AccessKind::Ro,
+        other => {
+            return Err(format!(
+                "unknown AccessType `{other}` at 0x{_index:04X}:{subindex:02X} ({name_str})"
+            ))
+        }
     };
 
     let capacity = if is_varlen {
@@ -775,14 +811,16 @@ fn parse_var_entry(
             None
         }
     } else {
-        let normalized = normalize_default(&default_str, data_type_code);
-        syn::parse_str::<syn::Expr>(&normalized).ok().or_else(|| {
-            // Fallback: if we can't parse the default, use 0
-            syn::parse_str::<syn::Expr>("0").ok()
-        })
+        let normalized = normalize_default(&default_str, data_type_code).ok_or_else(|| {
+            format!(
+                "invalid DefaultValue `{}` for {rust_type} at 0x{_index:04X}:{subindex:02X} ({name_str})",
+                default_str.trim()
+            )
+        })?;
+        Some(syn::parse_str::<syn::Expr>(&normalized).map_err(|e| e.to_string())?)
     };
 
-    Some(SubEntry {
+    Ok(Some(SubEntry {
         subindex,
         name: Ident::new(&sanitize_name(&name_str), Span::call_site()),
         var: VarDef {
@@ -792,7 +830,7 @@ fn parse_var_entry(
             access,
             pdo_mappable: pdo_mapping,
         },
-    })
+    }))
 }
 
 fn get_prop(props: &[(String, String)], key: &str) -> Option<String> {
@@ -854,51 +892,80 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
-fn normalize_default(value: &str, data_type: u16) -> String {
+/// Turn an EDS `DefaultValue` into a Rust literal for `data_type`, or `None`
+/// if it is not a valid value of that type.
+///
+/// `$NODEID` expressions on non-PDO objects become 0: the generated OD has
+/// no node-relative initializers outside the PDO COB-IDs.
+fn normalize_default(value: &str, data_type: u16) -> Option<String> {
     let v = value.trim();
-    if v.is_empty() {
-        // Use type-appropriate zero
-        return match data_type {
-            0x0008 => "0.0f32".to_string(),
-            0x0011 => "0.0f64".to_string(),
-            _ => "0".to_string(),
-        };
+    let float_zero = || match data_type {
+        0x0008 => Some("0.0f32".to_string()),
+        0x0011 => Some("0.0f64".to_string()),
+        0x0001 => Some("false".to_string()),
+        _ => Some("0".to_string()),
+    };
+    if v.is_empty() || v.to_ascii_uppercase().contains("$NODEID") {
+        return float_zero();
     }
-    // $NODEID expressions can't be represented as Rust literals — use 0
-    if v.contains("$NODEID") || v.contains("$nodeid") {
-        return match data_type {
-            0x0008 => "0.0f32".to_string(),
-            0x0011 => "0.0f64".to_string(),
-            _ => "0".to_string(),
-        };
-    }
-    // Strip quotes from string defaults
-    if v.starts_with('"') && v.ends_with('"') {
-        return v.to_string();
-    }
-    // Float types: hex values are IEEE 754 bit patterns, convert to f32/f64
-    if data_type == 0x0008 {
-        if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
-            if u32::from_str_radix(hex, 16).is_ok() {
-                return format!("f32::from_bits(0x{hex})");
-            }
+    let hex = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X"));
+    match data_type {
+        // BOOLEAN
+        0x0001 => match v.to_ascii_lowercase().as_str() {
+            "0" | "false" => Some("false".into()),
+            "1" | "true" => Some("true".into()),
+            _ => None,
+        },
+        // REAL32 / REAL64: hex values are IEEE 754 bit patterns.
+        0x0008 => match hex {
+            Some(hex) => u32::from_str_radix(hex, 16)
+                .ok()
+                .map(|_| format!("f32::from_bits(0x{hex})")),
+            None => v.parse::<f32>().ok().map(|_| format!("{v}f32")),
+        },
+        0x0011 => match hex {
+            Some(hex) => u64::from_str_radix(hex, 16)
+                .ok()
+                .map(|_| format!("f64::from_bits(0x{hex})")),
+            None => v.parse::<f64>().ok().map(|_| format!("{v}f64")),
+        },
+        _ => {
+            let (bits, signed) = match data_type {
+                0x0002 => (8, true),
+                0x0003 => (16, true),
+                0x0010 => (24, true),
+                0x0004 => (32, true),
+                0x0015 => (64, true),
+                0x0005 => (8, false),
+                0x0006 => (16, false),
+                0x0016 => (24, false),
+                0x0007 => (32, false),
+                0x001B => (64, false),
+                _ => return Some(v.to_string()),
+            };
+            let value: i128 = match hex {
+                Some(hex) => {
+                    // Hex is the raw bit pattern; reinterpret for signed types.
+                    let raw = u64::from_str_radix(hex, 16).ok()?;
+                    if bits < 64 && raw >> bits != 0 {
+                        return None;
+                    }
+                    if signed && raw >> (bits - 1) & 1 == 1 {
+                        raw as i128 - (1i128 << bits)
+                    } else {
+                        raw as i128
+                    }
+                }
+                None => v.parse::<i128>().ok()?,
+            };
+            let (min, max) = if signed {
+                (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+            } else {
+                (0, (1i128 << bits) - 1)
+            };
+            (min..=max).contains(&value).then(|| value.to_string())
         }
-        // Plain numeric — pass through as f32
-        return format!("{v}f32");
     }
-    if data_type == 0x0011 {
-        if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
-            if u64::from_str_radix(hex, 16).is_ok() {
-                return format!("f64::from_bits(0x{hex})");
-            }
-        }
-        return format!("{v}f64");
-    }
-    // Handle hex values
-    if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
-        return format!("0x{hex}");
-    }
-    v.to_string()
 }
 
 #[cfg(test)]
@@ -946,6 +1013,47 @@ mod tests {
     fn datatype_code_does_not_wrap_into_a_supported_type() {
         let eds = "[2000]\nParameterName=Value\nDataType=0x10005\n";
         assert!(parse_eds_content(eds).is_err());
+    }
+
+    #[test]
+    fn default_values_are_checked_against_their_type() {
+        for (ty, value, expected) in [
+            (0x0005, "255", Some("255")),
+            (0x0005, "256", None),
+            (0x0005, "-1", None),
+            (0x0002, "-128", Some("-128")),
+            (0x0002, "0xFF", Some("-1")),
+            (0x0003, "0x8000", Some("-32768")),
+            (0x0007, "0x1_0000_0000", None),
+            (0x0007, "abc", None),
+            (0x0001, "1", Some("true")),
+            (0x0001, "0", Some("false")),
+            (0x0001, "2", None),
+            (0x0008, "1.5", Some("1.5f32")),
+            (0x0008, "x", None),
+            (0x0007, "$NODEID+0x80", Some("0")),
+            (0x0007, "", Some("0")),
+        ] {
+            assert_eq!(
+                normalize_default(value, ty).as_deref(),
+                expected,
+                "{value} as 0x{ty:04X}"
+            );
+        }
+        let eds = "[2000]\nParameterName=Value\nDataType=0x0005\nDefaultValue=300\n";
+        assert!(parse_eds_content(eds).unwrap_err().contains("invalid DefaultValue"));
+    }
+
+    #[test]
+    fn access_type_is_checked_and_const_is_kept() {
+        let eds = "[2000]\nParameterName=Value\nDataType=0x0005\nAccessType=xx\n";
+        assert!(parse_eds_content(eds).unwrap_err().contains("unknown AccessType"));
+        let eds = "[2000]\nParameterName=Value\nDataType=0x0005\nAccessType=const\n";
+        let (entries, _) = parse_eds_content(eds).unwrap();
+        match &entries[0].kind {
+            EntryKind::Var(var) => assert_eq!(var.access, AccessKind::Const),
+            _ => panic!("expected VAR"),
+        }
     }
 
     #[test]

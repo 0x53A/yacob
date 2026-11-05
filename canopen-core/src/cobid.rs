@@ -155,26 +155,22 @@ impl CobId {
         Self(0x080 + node.raw() as u16)
     }
 
-    pub const fn tpdo(pdo_num: u8, node: NodeId) -> Self {
-        let base = match pdo_num {
-            0 => 0x180,
-            1 => 0x280,
-            2 => 0x380,
-            3 => 0x480,
-            _ => 0x180, // default to TPDO1
-        };
-        Self(base + node.raw() as u16)
+    /// Pre-defined-connection-set COB-ID of TPDO `pdo` (1..=4), or `None`
+    /// for TPDO5+, which have no pre-defined COB-ID.
+    pub const fn tpdo(pdo: crate::pdo::PdoNumber, node: NodeId) -> Option<Self> {
+        match pdo.raw() {
+            n @ 1..=4 => Some(Self(0x80 + 0x100 * n + node.raw() as u16)),
+            _ => None,
+        }
     }
 
-    pub const fn rpdo(pdo_num: u8, node: NodeId) -> Self {
-        let base = match pdo_num {
-            0 => 0x200,
-            1 => 0x300,
-            2 => 0x400,
-            3 => 0x500,
-            _ => 0x200,
-        };
-        Self(base + node.raw() as u16)
+    /// Pre-defined-connection-set COB-ID of RPDO `pdo` (1..=4), or `None`
+    /// for RPDO5+, which have no pre-defined COB-ID.
+    pub const fn rpdo(pdo: crate::pdo::PdoNumber, node: NodeId) -> Option<Self> {
+        match pdo.raw() {
+            n @ 1..=4 => Some(Self(0x100 + 0x100 * n + node.raw() as u16)),
+            _ => None,
+        }
     }
 
     pub const fn sdo_tx(node: NodeId) -> Self {
@@ -193,6 +189,7 @@ impl CobId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdo::PdoNumber;
 
     #[test]
     fn node_id_range() {
@@ -209,11 +206,11 @@ mod tests {
         assert_eq!(CobId::sdo_rx(node).parse(), ParsedCobId::SdoRequest(node));
         assert_eq!(CobId::sdo_tx(node).parse(), ParsedCobId::SdoResponse(node));
         assert_eq!(
-            CobId::tpdo(2, node).parse(),
+            CobId::tpdo(PdoNumber::of::<3>(), node).unwrap().parse(),
             ParsedCobId::Tpdo { pdo_num: 2, node }
         );
         assert_eq!(
-            CobId::rpdo(1, node).parse(),
+            CobId::rpdo(PdoNumber::of::<2>(), node).unwrap().parse(),
             ParsedCobId::Rpdo { pdo_num: 1, node }
         );
         assert_eq!(CobId::nmt().parse(), ParsedCobId::Nmt);
@@ -226,7 +223,10 @@ mod tests {
         assert_eq!(CobId::heartbeat(node).raw(), 0x701);
         assert_eq!(CobId::sdo_rx(node).raw(), 0x601);
         assert_eq!(CobId::sdo_tx(node).raw(), 0x581);
-        assert_eq!(CobId::tpdo(0, node).raw(), 0x181);
-        assert_eq!(CobId::rpdo(0, node).raw(), 0x201);
+        assert_eq!(CobId::tpdo(PdoNumber::of::<1>(), node).unwrap().raw(), 0x181);
+        assert_eq!(CobId::rpdo(PdoNumber::of::<1>(), node).unwrap().raw(), 0x201);
+        assert_eq!(CobId::tpdo(PdoNumber::of::<4>(), node).unwrap().raw(), 0x481);
+        assert_eq!(CobId::rpdo(PdoNumber::of::<4>(), node).unwrap().raw(), 0x501);
+        assert_eq!(CobId::tpdo(PdoNumber::of::<5>(), node), None);
     }
 }

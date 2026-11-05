@@ -104,7 +104,7 @@ where
     let driver = SdoDriver::new(target);
     let mut wrapper = NbCanWrapper(transport);
     let mut port = SdoPort::new(&mut wrapper, target);
-    let mut buf = vec![0u8; 889]; // max SDO transfer
+    let mut buf = vec![0u8; SdoDriver::MAX_TRANSFER];
 
     let len = block_on_with_timeout(driver.upload(index, subindex, &mut buf, &mut port), timeout)??;
     buf.truncate(len);

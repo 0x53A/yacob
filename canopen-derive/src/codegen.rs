@@ -155,7 +155,9 @@ pub(crate) fn resolve_pdo_mappings(pdo: &PdoDef, flat: &[FlatEntry]) -> Vec<Reso
 
 pub fn generate(od: OdDefinition) -> TokenStream {
     if let Some(path) = &od.export_eds_path {
-        crate::eds_export::export_eds_file(&od, path);
+        if let Err(message) = crate::eds_export::export_eds_file(&od, path) {
+            return syn::Error::new(proc_macro2::Span::call_site(), message).to_compile_error();
+        }
     }
     let eds_content = crate::eds_export::generate_eds(&od);
     let eds_compressed = miniz_oxide::deflate::compress_to_vec(eds_content.as_bytes(), 6);
@@ -452,6 +454,31 @@ pub fn generate(od: OdDefinition) -> TokenStream {
     let mut array_read_arms: Vec<TokenStream> = Vec::new();
     let mut array_write_arms: Vec<TokenStream> = Vec::new();
     let mut array_meta_entries: Vec<TokenStream> = Vec::new();
+
+    // Record sub0 ("highest sub-index supported", u8, ro). CiA 301 requires
+    // it and the exported EDS declares it; the DSL rejects a declared `[0]`.
+    for entry in &od.entries {
+        if let EntryKind::Record(subs) = &entry.kind {
+            let index = entry.index;
+            let max_sub = subs.iter().map(|s| s.subindex).max().unwrap_or(0);
+            array_meta_entries.push(quote! {
+                canopen_core::od::OdEntryMeta {
+                    index: #index, subindex: 0,
+                    data_type: canopen_core::datatypes::DataType::U8,
+                    access: canopen_core::od::AccessType::Ro,
+                    pdo_mappable: false,
+                    name: "highest_sub_index_supported",
+                    max_size: None,
+                }
+            });
+            array_read_arms.push(quote! {
+                (#index, 0) => { buf[0] = #max_sub; Ok(1) }
+            });
+            array_write_arms.push(quote! {
+                (#index, 0) => Err(canopen_core::od::OdError::ReadOnly),
+            });
+        }
+    }
 
     for a in &arrays {
         let index = a.index;
@@ -771,6 +798,10 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         pdo_write_arms.push(quote! {
             (#comm_idx, 2) => {
                 if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                // 241..=251 are reserved; 252/253 (RTR) are not implemented.
+                if (241..=253).contains(&data[0]) {
+                    return Err(canopen_core::od::OdError::ValueRange);
+                }
                 self.tpdo_transmission_type[#n] = data[0];
                 Ok(())
             }
@@ -936,6 +967,10 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         pdo_write_arms.push(quote! {
             (#comm_idx, 2) => {
                 if data.len() != 1 { return Err(canopen_core::od::OdError::DataTypeMismatch); }
+                // 241..=251 are reserved; 252/253 (RTR) are not implemented.
+                if (241..=253).contains(&data[0]) {
+                    return Err(canopen_core::od::OdError::ValueRange);
+                }
                 self.rpdo_transmission_type[#n] = data[0];
                 Ok(())
             }
@@ -1182,6 +1217,10 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                             (#index, #subindex) => {
                                 let s = core::str::from_utf8(data)
                                     .map_err(|_| canopen_core::od::OdError::DataTypeMismatch)?;
+                                // Check before clearing: a rejected write must keep the old value.
+                                if s.len() > self.#fname.capacity() {
+                                    return Err(canopen_core::od::OdError::ValueTooLong);
+                                }
                                 self.#fname.clear();
                                 self.#fname.push_str(s)
                                     .map_err(|_| canopen_core::od::OdError::ValueTooLong)?;
@@ -1191,6 +1230,10 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     } else {
                         return quote! {
                             (#index, #subindex) => {
+                                // Check before clearing: a rejected write must keep the old value.
+                                if data.len() > self.#fname.capacity() {
+                                    return Err(canopen_core::od::OdError::ValueTooLong);
+                                }
                                 self.#fname.clear();
                                 self.#fname.extend_from_slice(data)
                                     .map_err(|_| canopen_core::od::OdError::ValueTooLong)?;
@@ -1438,7 +1481,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
     });
     pdo_read_arms.push(quote! {
         (0x1022, 0) => {
-            buf[0] = 1; // 1 = zlib/deflate compressed
+            buf[0] = canopen_core::od::STORE_FORMAT_DEFLATE;
             Ok(1)
         }
     });
@@ -1611,6 +1654,23 @@ pub fn generate(od: OdDefinition) -> TokenStream {
         quote! {}
     };
 
+    // 0x1001 (error register) is owned by the stack's EMCY producer.
+    let error_register_impl = od
+        .entries
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            EntryKind::Var(var) if entry.index == 0x1001 && var.type_name == "u8" => {
+                let field = &entry.name;
+                Some(quote! {
+                    fn store_error_register(&mut self, value: u8) {
+                        self.#field = value;
+                    }
+                })
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+
     // ---- Assemble output ----
     let meta_len = all_meta_entries.len();
 
@@ -1715,6 +1775,8 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             #validate_write_impl
 
             #sdo_store_impl
+
+            #error_register_impl
         }
 
         #[doc = #change_doc]

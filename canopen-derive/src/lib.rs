@@ -50,10 +50,15 @@ pub fn object_dictionary(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn object_dictionary_from_eds(input: TokenStream) -> TokenStream {
     let eds_def = syn::parse_macro_input!(input as eds_parser::EdsDefinition);
-    match eds_parser::parse_eds_to_od(eds_def) {
-        Ok(od_def) => codegen::generate(od_def).into(),
-        Err(e) => e.to_compile_error().into(),
-    }
+    let track = eds_parser::track_source(&eds_def);
+    let generated = match eds_parser::parse_eds_to_od(eds_def).and_then(|od| {
+        od.validate()?;
+        Ok(od)
+    }) {
+        Ok(od_def) => codegen::generate(od_def),
+        Err(e) => e.to_compile_error(),
+    };
+    quote::quote! { #track #generated }.into()
 }
 
 /// Generate a typed async SDO client from an EDS file.
@@ -76,7 +81,9 @@ pub fn object_dictionary_from_eds(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn sdo_client_from_eds(input: TokenStream) -> TokenStream {
     let eds_def = syn::parse_macro_input!(input as eds_parser::EdsDefinition);
-    sdo_client_codegen::generate(eds_def).into()
+    let track = eds_parser::track_source(&eds_def);
+    let generated = sdo_client_codegen::generate(eds_def);
+    quote::quote! { #track #generated }.into()
 }
 
 /// Generate a typed remote-device PDO codec from an EDS file.
@@ -99,7 +106,9 @@ pub fn sdo_client_from_eds(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn pdo_client_from_eds(input: TokenStream) -> TokenStream {
     let eds_def = syn::parse_macro_input!(input as eds_parser::EdsDefinition);
-    pdo_client_codegen::generate(eds_def).into()
+    let track = eds_parser::track_source(&eds_def);
+    let generated = pdo_client_codegen::generate(eds_def);
+    quote::quote! { #track #generated }.into()
 }
 
 /// Generate the high-level remote device API from an EDS file.
@@ -121,11 +130,13 @@ pub fn pdo_client_from_eds(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn device_from_eds(input: TokenStream) -> TokenStream {
     let eds_def = syn::parse_macro_input!(input as eds_parser::EdsDefinition);
+    let track = eds_parser::track_source(&eds_def);
     let od = match eds_parser::parse_eds_to_od(eds_def) {
         Ok(od) => od,
         Err(error) => return error.to_compile_error().into(),
     };
-    generate_device(od)
+    let generated: proc_macro2::TokenStream = generate_device(od).into();
+    quote::quote! { #track #generated }.into()
 }
 
 /// Generate the high-level remote device API from EDS contents supplied by

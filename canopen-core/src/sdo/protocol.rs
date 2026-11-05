@@ -16,15 +16,26 @@ pub enum AbortCode {
     ObjectCannotBeMapped = 0x0604_0041,
     PdoLengthExceeded = 0x0604_0042,
     ParameterIncompatibility = 0x0604_0043,
+    GeneralInternalIncompatibility = 0x0604_0047,
+    HardwareError = 0x0606_0000,
+    /// Data type does not match, length of service parameter does not match.
+    DataTypeMismatch = 0x0607_0010,
+    /// Data type does not match, length of service parameter too high.
+    LengthTooHigh = 0x0607_0012,
+    /// Data type does not match, length of service parameter too low.
+    LengthTooLow = 0x0607_0013,
     SubindexNotFound = 0x0609_0011,
     ValueRangeExceeded = 0x0609_0030,
     ValueTooHigh = 0x0609_0031,
     ValueTooLow = 0x0609_0032,
-    DataTypeMismatch = 0x0609_0043,
+    MaxLessThanMin = 0x0609_0036,
+    ResourceNotAvailable = 0x060A_0023,
     GeneralError = 0x0800_0000,
     DataTransferError = 0x0800_0020,
     DataTransferLocalControl = 0x0800_0021,
     DataTransferDeviceState = 0x0800_0022,
+    OdGenerationFailed = 0x0800_0023,
+    NoDataAvailable = 0x0800_0024,
 }
 
 impl AbortCode {
@@ -53,15 +64,23 @@ impl AbortCode {
             0x0604_0041 => Self::ObjectCannotBeMapped,
             0x0604_0042 => Self::PdoLengthExceeded,
             0x0604_0043 => Self::ParameterIncompatibility,
+            0x0604_0047 => Self::GeneralInternalIncompatibility,
+            0x0606_0000 => Self::HardwareError,
+            0x0607_0010 => Self::DataTypeMismatch,
+            0x0607_0012 => Self::LengthTooHigh,
+            0x0607_0013 => Self::LengthTooLow,
             0x0609_0011 => Self::SubindexNotFound,
             0x0609_0030 => Self::ValueRangeExceeded,
             0x0609_0031 => Self::ValueTooHigh,
             0x0609_0032 => Self::ValueTooLow,
-            0x0609_0043 => Self::DataTypeMismatch,
+            0x0609_0036 => Self::MaxLessThanMin,
+            0x060A_0023 => Self::ResourceNotAvailable,
             0x0800_0000 => Self::GeneralError,
             0x0800_0020 => Self::DataTransferError,
             0x0800_0021 => Self::DataTransferLocalControl,
             0x0800_0022 => Self::DataTransferDeviceState,
+            0x0800_0023 => Self::OdGenerationFailed,
+            0x0800_0024 => Self::NoDataAvailable,
             _ => return None,
         })
     }

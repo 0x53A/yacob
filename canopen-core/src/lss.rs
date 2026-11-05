@@ -72,8 +72,9 @@ pub struct LssSlave {
     identity: LssIdentity,
     node_id: u8,
     mode: LssMode,
-    /// Partial selective switch state: tracking which identity fields matched.
-    selective_match: [bool; 4],
+    /// Selective switch progress: number of consecutive matching requests
+    /// (vendor, product, revision) received so far.
+    selective_step: u8,
     pending_event: Option<LssEvent>,
 }
 
@@ -83,7 +84,7 @@ impl LssSlave {
             identity,
             node_id,
             mode: LssMode::Waiting,
-            selective_match: [false; 4],
+            selective_step: 0,
             pending_event: None,
         }
     }
@@ -119,7 +120,7 @@ impl LssSlave {
                 match new_mode {
                     0 => {
                         self.mode = LssMode::Waiting;
-                        self.selective_match = [false; 4];
+                        self.selective_step = 0;
                     }
                     1 => {
                         self.mode = LssMode::Configuration;
@@ -129,35 +130,39 @@ impl LssSlave {
                 None // no response for global switch
             }
 
-            cs::SWITCH_VENDOR if self.mode == LssMode::Waiting => {
+            cs::SWITCH_VENDOR
+            | cs::SWITCH_PRODUCT
+            | cs::SWITCH_REVISION
+            | cs::SWITCH_SERIAL
+                if self.mode == LssMode::Waiting =>
+            {
                 let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-                self.selective_match[0] = val == self.identity.vendor_id;
-                None
-            }
-            cs::SWITCH_PRODUCT if self.mode == LssMode::Waiting => {
-                let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-                self.selective_match[1] = val == self.identity.product_code;
-                None
-            }
-            cs::SWITCH_REVISION if self.mode == LssMode::Waiting => {
-                let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-                self.selective_match[2] = val == self.identity.revision;
-                None
-            }
-            cs::SWITCH_SERIAL if self.mode == LssMode::Waiting => {
-                let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-                self.selective_match[3] = val == self.identity.serial;
-                // Check if all four match
-                if self.selective_match.iter().all(|&m| m) {
-                    self.mode = LssMode::Configuration;
-                    self.selective_match = [false; 4];
-                    // Respond with switch state response (0x44)
-                    let mut resp = [0u8; 8];
-                    resp[0] = 0x44;
-                    return self.make_response(&resp);
+                // CiA 305: vendor, product, revision, serial as one ordered
+                // sequence. Each request only advances a sequence whose
+                // previous step matched; anything else restarts it.
+                let (step, expected) = match cmd {
+                    cs::SWITCH_VENDOR => (0, self.identity.vendor_id),
+                    cs::SWITCH_PRODUCT => (1, self.identity.product_code),
+                    cs::SWITCH_REVISION => (2, self.identity.revision),
+                    _ => (3, self.identity.serial),
+                };
+                if step == 0 {
+                    self.selective_step = 0; // vendor always starts afresh
                 }
-                self.selective_match = [false; 4];
-                None
+                if self.selective_step != step || val != expected {
+                    self.selective_step = 0;
+                    return None;
+                }
+                if step < 3 {
+                    self.selective_step = step + 1;
+                    return None;
+                }
+                self.selective_step = 0;
+                self.mode = LssMode::Configuration;
+                // Respond with switch state response (0x44)
+                let mut resp = [0u8; 8];
+                resp[0] = 0x44;
+                self.make_response(&resp)
             }
 
             cs::CONFIGURE_NODE_ID if self.mode == LssMode::Configuration => {
@@ -248,6 +253,33 @@ mod tests {
             assert!(lss.process(&selective_request(command, value)).is_none());
         }
         lss.process(&selective_request(cs::SWITCH_SERIAL, identity.serial))
+    }
+
+    #[test]
+    fn selection_must_be_one_ordered_sequence() {
+        let identity = test_identity();
+        let mut lss = LssSlave::new(identity, 1);
+        // An interrupted sequence (vendor, product, then a foreign revision)
+        // must not be completed by a later revision+serial.
+        lss.process(&selective_request(cs::SWITCH_VENDOR, identity.vendor_id));
+        lss.process(&selective_request(cs::SWITCH_PRODUCT, identity.product_code));
+        lss.process(&selective_request(cs::SWITCH_REVISION, identity.revision ^ 1));
+        lss.process(&selective_request(cs::SWITCH_REVISION, identity.revision));
+        assert!(lss
+            .process(&selective_request(cs::SWITCH_SERIAL, identity.serial))
+            .is_none());
+        assert_eq!(lss.mode(), LssMode::Waiting);
+        // Out of order: product before vendor.
+        lss.process(&selective_request(cs::SWITCH_PRODUCT, identity.product_code));
+        lss.process(&selective_request(cs::SWITCH_VENDOR, identity.vendor_id));
+        lss.process(&selective_request(cs::SWITCH_REVISION, identity.revision));
+        assert!(lss
+            .process(&selective_request(cs::SWITCH_SERIAL, identity.serial))
+            .is_none());
+        // A fresh vendor restarts a half-finished sequence.
+        lss.process(&selective_request(cs::SWITCH_VENDOR, identity.vendor_id));
+        lss.process(&selective_request(cs::SWITCH_PRODUCT, identity.product_code));
+        assert!(select(&mut lss).is_some());
     }
 
     #[test]

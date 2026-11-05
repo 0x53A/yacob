@@ -112,11 +112,13 @@ pub mod error_register {
 ///
 /// Up to 4 EMCY frames can be pending at once (burst errors between two
 /// `Node::process()` calls). On overflow the oldest frame is dropped — later
-/// frames carry the accumulated error register.
+/// frames carry the accumulated error register. Drops are counted in
+/// [`dropped`](Self::dropped).
 pub struct EmcyProducer {
     node_id: NodeId,
     error_register: u8,
     pending: heapless::Deque<CanFrame, 4>,
+    dropped: u32,
 }
 
 impl EmcyProducer {
@@ -125,12 +127,19 @@ impl EmcyProducer {
             node_id,
             error_register: 0,
             pending: heapless::Deque::new(),
+            dropped: 0,
         }
+    }
+
+    /// Number of pending EMCY frames discarded because the queue was full.
+    pub const fn dropped(&self) -> u32 {
+        self.dropped
     }
 
     fn queue(&mut self, frame: CanFrame) {
         if self.pending.is_full() {
             self.pending.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
         }
         let _ = self.pending.push_back(frame);
     }
@@ -246,6 +255,17 @@ mod tests {
     }
 
     #[test]
+    fn overflow_evicts_oldest_and_counts() {
+        let mut emcy = EmcyProducer::new(NodeId::new(1).unwrap());
+        for code in 0..6u16 {
+            emcy.set_error(0x1000 + code, error_register::GENERIC, &[]);
+        }
+        assert_eq!(emcy.dropped(), 2);
+        let first = emcy.take_pending().unwrap();
+        assert_eq!(first.data()[0..2], [0x02, 0x10], "oldest two were evicted");
+    }
+
+    #[test]
     fn emcy_producer_set_clear() {
         let node = NodeId::new(1).unwrap();
         let mut emcy = EmcyProducer::new(node);
@@ -355,6 +375,7 @@ mod tests {
         }
 
         // Queue holds 4; the oldest (0x1000) was dropped.
+        assert_eq!(emcy.dropped(), 1);
         let f = emcy.take_pending().unwrap();
         assert_eq!(f.data()[0..2], [0x00, 0x20]);
         assert!(emcy.take_pending().is_some());

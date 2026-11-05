@@ -233,35 +233,32 @@ fn gen_array_methods(
     }
 }
 
+/// Rust type and `SdoDriver` method suffix for each fixed-width CANopen type.
+fn typed_info(ty: &str) -> Option<(&'static str, TokenStream)> {
+    Some(match ty {
+        "bool" => ("bool", quote! { bool }),
+        "u8" => ("u8", quote! { u8 }),
+        "i8" => ("i8", quote! { i8 }),
+        "u16" => ("u16", quote! { u16 }),
+        "i16" => ("i16", quote! { i16 }),
+        "u24" => ("u24", quote! { u32 }),
+        "i24" => ("i24", quote! { i32 }),
+        "u32" => ("u32", quote! { u32 }),
+        "i32" => ("i32", quote! { i32 }),
+        "f32" => ("f32", quote! { f32 }),
+        "u64" => ("u64", quote! { u64 }),
+        "i64" => ("i64", quote! { i64 }),
+        "f64" => ("f64", quote! { f64 }),
+        _ => return None,
+    })
+}
+
 /// Returns (driver_method_name, return_type_tokens) for a typed read.
-fn typed_read_info(ty: &str) -> Option<(&'static str, TokenStream)> {
-    match ty {
-        "bool" | "u8" => Some(("read_u8", quote! { u8 })),
-        "u16" => Some(("read_u16", quote! { u16 })),
-        "u32" => Some(("read_u32", quote! { u32 })),
-        "i32" => Some(("read_i32", quote! { i32 })),
-        "i24" => Some(("read_i24", quote! { i32 })),
-        "u24" => Some(("read_u24", quote! { u32 })),
-        "f32" => Some(("read_f32", quote! { f32 })),
-        // i8/i16 use unsigned reads — caller casts if needed
-        "i8" => Some(("read_u8", quote! { u8 })),
-        "i16" => Some(("read_u16", quote! { u16 })),
-        _ => None,
-    }
+fn typed_read_info(ty: &str) -> Option<(String, TokenStream)> {
+    typed_info(ty).map(|(suffix, ty)| (format!("read_{suffix}"), ty))
 }
 
 /// Returns (driver_method_name, parameter_type_tokens) for a typed write.
-fn typed_write_info(ty: &str) -> Option<(&'static str, TokenStream)> {
-    match ty {
-        "bool" | "u8" => Some(("write_u8", quote! { u8 })),
-        "u16" => Some(("write_u16", quote! { u16 })),
-        "u32" => Some(("write_u32", quote! { u32 })),
-        "f32" => Some(("write_f32", quote! { f32 })),
-        "i8" => Some(("write_u8", quote! { u8 })),
-        "i16" => Some(("write_u16", quote! { u16 })),
-        "i32" => Some(("write_u32", quote! { u32 })),
-        "i24" => Some(("write_i24", quote! { i32 })),
-        "u24" => Some(("write_u24", quote! { u32 })),
-        _ => None,
-    }
+fn typed_write_info(ty: &str) -> Option<(String, TokenStream)> {
+    typed_info(ty).map(|(suffix, ty)| (format!("write_{suffix}"), ty))
 }

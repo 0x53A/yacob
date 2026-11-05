@@ -48,14 +48,16 @@ pub struct NodeConfig<const TPDO: usize = 4, const RPDO: usize = 4, const SDO: u
     /// Additional SDO servers (0x1201+), resolved COB-IDs. Empty for the common
     /// single-server node.
     pub sdo_servers: [SdoServerConfig; SDO],
-    /// LSS identity (0x1018). Set to default if LSS is not needed.
+    /// LSS identity. [`from_od`](Self::from_od) copies it from 0x1018; set it
+    /// explicitly when the serial number is only known at runtime.
     pub identity: LssIdentity,
 }
 
 impl<const TPDO: usize, const RPDO: usize, const SDO: usize> NodeConfig<TPDO, RPDO, SDO> {
     /// Build a config with PDO and additional-SDO-server settings pulled from
     /// the OD (declared in the `object_dictionary!` macro) and defaults for the
-    /// rest: heartbeat every 1000 ms, no auto-start, default LSS identity.
+    /// rest: heartbeat every 1000 ms, no auto-start. The LSS identity is read
+    /// from 0x1018 sub 1..=4 when the OD declares them (missing subs are 0).
     ///
     /// Override the defaults with struct update syntax:
     /// ```ignore
@@ -66,9 +68,18 @@ impl<const TPDO: usize, const RPDO: usize, const SDO: usize> NodeConfig<TPDO, RP
     /// };
     /// ```
     pub fn from_od(
-        od: &(impl crate::pdo::PdoConfigSource<TPDO, RPDO> + crate::sdo::SdoServerConfigSource<SDO>),
+        od: &(impl crate::pdo::PdoConfigSource<TPDO, RPDO>
+              + crate::sdo::SdoServerConfigSource<SDO>
+              + ObjectDictionary),
         node_id: NodeId,
     ) -> Self {
+        let identity_sub = |sub: u8| {
+            let mut buf = [0u8; 8];
+            match od.read(0x1018, sub, &mut buf) {
+                Ok(4) => u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+                _ => 0,
+            }
+        };
         Self {
             node_id,
             heartbeat_interval_ms: 1000,
@@ -76,7 +87,12 @@ impl<const TPDO: usize, const RPDO: usize, const SDO: usize> NodeConfig<TPDO, RP
             tpdo: od.tpdo_configs(node_id),
             rpdo: od.rpdo_configs(node_id),
             sdo_servers: od.sdo_server_configs(node_id),
-            identity: LssIdentity::default(),
+            identity: LssIdentity {
+                vendor_id: identity_sub(1),
+                product_code: identity_sub(2),
+                revision: identity_sub(3),
+                serial: identity_sub(4),
+            },
         }
     }
 }
@@ -285,6 +301,7 @@ impl<
         // Mirror resolved additional-SDO-server COB-IDs into the OD (0x1201+)
         // so SDO reads return real values (node-relative resolved).
         node.od.store_sdo_server_cob_ids(config.node_id);
+        node.od.store_error_register(node.emcy.error_register());
         node.sync_heartbeat_from_od(false);
         // Before the assert below: the SYNC COB-ID it checks against is the
         // configured one, not necessarily 0x080.
@@ -727,6 +744,19 @@ impl<
     /// `register_bits` should be a combination of `emcy::error_register::*` constants.
     pub fn set_error(&mut self, error_code: u16, register_bits: u8, vendor_data: &[u8]) {
         self.emcy.set_error(error_code, register_bits, vendor_data);
+        self.mirror_error_register();
+    }
+
+    /// Keep OD 0x1001 equal to the EMCY producer's register, and trigger
+    /// event-driven TPDOs that map it.
+    fn mirror_error_register(&mut self) {
+        let value = self.emcy.error_register();
+        let mut old = [0u8; 8];
+        let changed = !matches!(self.od.read(0x1001, 0, &mut old), Ok(1) if old[0] == value);
+        self.od.store_error_register(value);
+        if changed {
+            self.notify_changed(0x1001, 0);
+        }
     }
 
     /// Clear error register bits. If all errors are cleared, sends an
@@ -734,11 +764,13 @@ impl<
     /// conditions as [`set_error`](Self::set_error).
     pub fn clear_error(&mut self, register_bits: u8) {
         self.emcy.clear_error(register_bits);
+        self.mirror_error_register();
     }
 
     /// Clear all errors and send an error-reset EMCY.
     pub fn clear_all_errors(&mut self) {
         self.emcy.clear_all();
+        self.mirror_error_register();
     }
 
     /// Current error register value (OD 0x1001).
@@ -852,6 +884,12 @@ impl<
         self.event_overflow_count
     }
 
+    /// Number of EMCY frames discarded before transmission because more than
+    /// four were pending (oldest dropped first).
+    pub fn emcy_dropped(&self) -> u32 {
+        self.emcy.dropped()
+    }
+
     /// Request a CANopen-layer reset from the application.
     ///
     /// This triggers the same reset sequence as an NMT Reset command from an
@@ -945,9 +983,17 @@ impl<
 
         // Boot sequence
         if !self.booted {
-            self.booted = true;
             let boot_frame = self.heartbeat.send_boot(now);
-            let _ = transport.transmit(&boot_frame);
+            // The boot-up message announces the transition to
+            // Pre-Operational, so a full transmit queue postpones the whole
+            // boot to the next call instead of losing the frame. Received
+            // frames stay queued in the transport meanwhile, exactly as they
+            // do behind a reset. Any other transport error is not
+            // retryable; the boot then proceeds without the frame.
+            if let Err(nb::Error::WouldBlock) = transport.transmit(&boot_frame) {
+                return;
+            }
+            self.booted = true;
             self.nmt.boot_complete();
             if self.auto_start {
                 self.nmt
@@ -1816,6 +1862,37 @@ mod tests {
         assert_eq!(frame.raw_id(), 0x701); // heartbeat for node 1
         assert_eq!(frame.data()[0], 0x00); // Initializing state in boot message
 
+        assert_eq!(node.state(), NmtState::PreOperational);
+    }
+
+    #[test]
+    fn boot_waits_for_transmit_acceptance() {
+        use embedded_can::nb::Can;
+        let config = NodeConfig::<1, 1> {
+            node_id: NodeId::new(1).unwrap(),
+            heartbeat_interval_ms: 100,
+            auto_start: false,
+            tpdo: [TpdoConfig::default()],
+            rpdo: [RpdoConfig::default()],
+            sdo_servers: [],
+            identity: LssIdentity::default(),
+        };
+        let od = MinimalOd {
+            device_type: 0x191,
+            error_reg: 0,
+        };
+        let mut node: Node<MinimalOd, 1, 1> = Node::new(config, od);
+        let mut transport = MailboxTransport::<1, 16>::new();
+        let filler = CanFrame::new(0x123, &[]).unwrap();
+        transport.transmit(&filler).unwrap();
+
+        node.process(&mut transport, &TestClock(0));
+        assert_eq!(node.state(), NmtState::Initializing, "boot-up frame was refused");
+
+        assert_eq!(transport.next_to_transmit().unwrap().raw_id(), 0x123);
+        node.process(&mut transport, &TestClock(1_000));
+        let boot = transport.next_to_transmit().expect("boot-up frame retried");
+        assert_eq!((boot.raw_id(), boot.data()), (0x701, &[0x00][..]));
         assert_eq!(node.state(), NmtState::PreOperational);
     }
 

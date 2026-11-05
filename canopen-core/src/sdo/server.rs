@@ -386,7 +386,7 @@ impl SdoServer {
         let len = match od.read(index, subindex, &mut buf) {
             Ok(n) => n,
             Err(e) => {
-                *response = encode_sdo_abort(index, subindex, od_error_to_abort(e));
+                *response = encode_sdo_abort(index, subindex, od_read_abort(od, index, e));
                 return Ok(());
             }
         };
@@ -508,7 +508,11 @@ impl SdoServer {
                     );
                 }
                 Err(e) => {
-                    *response = encode_sdo_abort(index, subindex, od_error_to_abort(e));
+                    *response = encode_sdo_abort(
+                        index,
+                        subindex,
+                        od_write_abort(od, index, subindex, data.len(), e),
+                    );
                 }
             }
             self.transfer = None;
@@ -575,8 +579,13 @@ impl SdoServer {
             && (received > transfer.total_len || (last && received != transfer.total_len))
         {
             let (idx, sub) = (transfer.index, transfer.subindex);
+            let code = if received > transfer.total_len {
+                AbortCode::LengthTooHigh
+            } else {
+                AbortCode::LengthTooLow
+            };
             self.transfer = None;
-            *response = encode_abort(idx, sub, AbortCode::DataTransferError);
+            *response = encode_abort(idx, sub, code);
             return Ok(());
         }
 
@@ -624,7 +633,11 @@ impl SdoServer {
                     );
                 }
                 Err(e) => {
-                    *response = encode_sdo_abort(index, subindex, od_error_to_abort(e));
+                    *response = encode_sdo_abort(
+                        index,
+                        subindex,
+                        od_write_abort(od, index, subindex, data_len, e),
+                    );
                 }
             }
         }
@@ -660,7 +673,7 @@ impl SdoServer {
                 let len = match od.read(index, subindex, &mut buf) {
                     Ok(n) => n,
                     Err(e) => {
-                        *response = encode_sdo_abort(index, subindex, od_error_to_abort(e));
+                        *response = encode_sdo_abort(index, subindex, od_read_abort(od, index, e));
                         return Ok(());
                     }
                 };
@@ -770,8 +783,13 @@ impl SdoServer {
                 }
             }
             1 => {
-                // End block upload confirmation from client
-                self.transfer = None;
+                // End block upload confirmation from client. The server
+                // already finished its side when it sent the end response, so
+                // this only closes a block upload; a stray frame must not end
+                // an unrelated transfer on this channel.
+                if matches!(self.transfer, Some(TransferState::BlockUpload(_))) {
+                    self.transfer = None;
+                }
                 Err(()) // no response needed
             }
             _ => {
@@ -876,7 +894,12 @@ impl SdoServer {
                         // If the initiate request declared a size, the received
                         // data must match it (CiA 301).
                         if size_indicated && data_len != total_len {
-                            *response = encode_abort(index, subindex, AbortCode::DataTransferError);
+                            let code = if data_len > total_len {
+                                AbortCode::LengthTooHigh
+                            } else {
+                                AbortCode::LengthTooLow
+                            };
+                            *response = encode_abort(index, subindex, code);
                             return Ok(());
                         }
 
@@ -918,7 +941,11 @@ impl SdoServer {
                                 );
                             }
                             Err(e) => {
-                                *response = encode_sdo_abort(index, subindex, od_error_to_abort(e));
+                                *response = encode_sdo_abort(
+                                    index,
+                                    subindex,
+                                    od_write_abort(od, index, subindex, data_len, e),
+                                );
                             }
                         }
 
@@ -1046,7 +1073,7 @@ fn validate_download<OD: ObjectDictionary>(
     validate_sync_cob_id_write(ctx.cob_ids, ctx.reserved_cob_ids, index, subindex, data)?;
     validate_sync_counter_overflow_write(index, subindex, data)?;
     od.validate_write(index, subindex, data)
-        .map_err(od_error_to_abort)
+        .map_err(|e| od_write_abort(od, index, subindex, data.len(), e))
 }
 
 /// CiA 301 rules for 0x1005 (COB-ID SYNC message).
@@ -1201,17 +1228,53 @@ fn is_pdo_config_index(index: u16) -> bool {
     index >= 0x1400 && index <= 0x1BFF
 }
 
-fn od_error_to_abort(e: OdError) -> SdoAbort {
+/// Abort for a failed object access, common to both directions.
+fn od_error_to_abort<OD: ObjectDictionary>(od: &OD, index: u16, e: OdError) -> SdoAbort {
     match e {
+        // An existing object with a missing sub-index is 0x0609_0011.
+        OdError::NotFound if od.lookup(index, 0).is_some() => {
+            AbortCode::SubindexNotFound.into()
+        }
         OdError::NotFound => AbortCode::ObjectNotFound.into(),
         OdError::ReadOnly => AbortCode::ReadOnlyObject.into(),
         OdError::WriteOnly => AbortCode::WriteOnlyObject.into(),
         OdError::DataTypeMismatch => AbortCode::DataTypeMismatch.into(),
-        OdError::ValueTooLong => AbortCode::OutOfMemory.into(),
+        OdError::ValueTooLong => AbortCode::LengthTooHigh.into(),
         OdError::ValueRange => AbortCode::ValueRangeExceeded.into(),
-        OdError::HardwareError => AbortCode::GeneralError.into(),
+        OdError::HardwareError => AbortCode::HardwareError.into(),
         OdError::Abort(code) => code,
     }
+}
+
+/// Upload: an object larger than the server's transfer buffer cannot be
+/// served at all, which CiA 301 reports as out of memory.
+fn od_read_abort<OD: ObjectDictionary>(od: &OD, index: u16, e: OdError) -> SdoAbort {
+    match e {
+        OdError::ValueTooLong => AbortCode::OutOfMemory.into(),
+        e => od_error_to_abort(od, index, e),
+    }
+}
+
+/// Download: a length mismatch against a fixed-size object is reported as
+/// too high / too low when the direction is known.
+fn od_write_abort<OD: ObjectDictionary>(
+    od: &OD,
+    index: u16,
+    subindex: u8,
+    data_len: usize,
+    e: OdError,
+) -> SdoAbort {
+    if e == OdError::DataTypeMismatch {
+        if let Some(size) = od.lookup(index, subindex).and_then(|m| m.data_type.size()) {
+            if data_len > size {
+                return AbortCode::LengthTooHigh.into();
+            }
+            if data_len < size {
+                return AbortCode::LengthTooLow.into();
+            }
+        }
+    }
+    od_error_to_abort(od, index, e)
 }
 
 #[cfg(test)]
@@ -1872,7 +1935,7 @@ mod tests {
 
         assert_eq!(command_specifier(resp[0]), Scs::AbortTransfer as u8);
         let code = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
-        assert_eq!(code, AbortCode::DataTransferError as u32);
+        assert_eq!(code, AbortCode::LengthTooLow as u32);
     }
 
     #[test]

@@ -1,5 +1,10 @@
 use crate::{datatypes::DataType, sdo::SdoAbort};
 
+/// OD 0x1022 (storage format) value for the raw-deflate EDS that generated
+/// ODs serve in 0x1021. CiA 301 reserves 1..=127; 128..=255 are
+/// manufacturer-specific, so this stack uses 0x80.
+pub const STORE_FORMAT_DEFLATE: u8 = 0x80;
+
 /// Access type for an OD entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessType {
@@ -151,4 +156,13 @@ pub trait ObjectDictionary {
     /// servers). The `object_dictionary!` macro overrides it when
     /// `sdo_server[N]` declarations are present.
     fn store_sdo_server_cob_ids(&mut self, _node_id: crate::cobid::NodeId) {}
+
+    /// Mirror the stack-owned error register into OD 0x1001, which is
+    /// read-only over SDO. Called by [`crate::node::Node`] whenever the EMCY
+    /// producer's register changes.
+    ///
+    /// The default implementation is a no-op (for ODs without 0x1001). The
+    /// `object_dictionary!` macro overrides it when 0x1001 is declared as a
+    /// `u8` variable.
+    fn store_error_register(&mut self, _value: u8) {}
 }

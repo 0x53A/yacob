@@ -24,6 +24,7 @@ pub struct SdoPort<'a, T: AsyncCan> {
     response_cob: u16,
     /// Frames that didn't match our filter — caller can drain these.
     pub overflow: heapless::Vec<CanFrame, 16>,
+    overflow_dropped: u32,
 }
 
 impl<'a, T: AsyncCan> SdoPort<'a, T> {
@@ -32,13 +33,21 @@ impl<'a, T: AsyncCan> SdoPort<'a, T> {
             transport,
             response_cob: CobId::sdo_tx(target).raw(),
             overflow: heapless::Vec::new(),
+            overflow_dropped: 0,
         }
     }
 
-    /// Drain overflow frames (non-SDO frames received during SDO transfers).
-    /// Call this after each SDO operation to process heartbeats, PDOs, etc.
-    pub fn drain_overflow(&mut self) -> &[CanFrame] {
-        &self.overflow
+    /// Take the overflow frames (non-SDO frames received during SDO
+    /// transfers), leaving the buffer empty. Call this after each SDO
+    /// operation to process heartbeats, PDOs, etc.
+    pub fn drain_overflow(&mut self) -> heapless::Vec<CanFrame, 16> {
+        core::mem::take(&mut self.overflow)
+    }
+
+    /// Frames lost because the 16-frame overflow buffer was full. The buffer
+    /// keeps the oldest frames; newer ones are counted here.
+    pub fn overflow_dropped(&self) -> u32 {
+        self.overflow_dropped
     }
 
     pub fn clear_overflow(&mut self) {
@@ -60,7 +69,9 @@ impl<T: AsyncCan> AsyncCan for SdoPort<'_, T> {
                 return Ok(frame);
             }
             // Buffer non-matching frames for other consumers
-            let _ = self.overflow.push(frame); // drop if overflow is full
+            if self.overflow.push(frame).is_err() {
+                self.overflow_dropped = self.overflow_dropped.saturating_add(1);
+            }
         }
     }
 }
@@ -548,7 +559,35 @@ mod tests {
             assert_eq!(port.overflow.len(), 2);
             assert_eq!(port.overflow[0].raw_id(), 0x701); // heartbeat
             assert_eq!(port.overflow[1].raw_id(), 0x181); // PDO
+
+            let drained = port.drain_overflow();
+            assert_eq!(drained.len(), 2);
+            assert!(port.overflow.is_empty(), "drain must empty the buffer");
+            assert_eq!(port.overflow_dropped(), 0);
         });
+    }
+
+    #[test]
+    fn sdo_port_counts_frames_beyond_overflow_capacity() {
+        struct Flood(u16);
+        impl AsyncCan for Flood {
+            type Error = MockErr;
+            async fn transmit(&mut self, _: &CanFrame) -> Result<(), MockErr> {
+                Ok(())
+            }
+            async fn receive(&mut self) -> Result<CanFrame, MockErr> {
+                if self.0 == 0 {
+                    return Err(MockErr);
+                }
+                self.0 -= 1;
+                Ok(CanFrame::new(0x181, &[0]).unwrap())
+            }
+        }
+        let mut can = Flood(20);
+        let mut port = SdoPort::new(&mut can, NodeId::new(1).unwrap());
+        assert!(block_on(port.receive()).is_err());
+        assert_eq!(port.overflow.len(), 16);
+        assert_eq!(port.overflow_dropped(), 4);
     }
 
     #[test]

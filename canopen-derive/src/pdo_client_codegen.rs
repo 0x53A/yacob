@@ -494,15 +494,16 @@ fn decode_field(field: &MappedField<'_>) -> TokenStream {
     let value = match ty.as_str() {
         "bool" => quote! { object_data[0] != 0 },
         "u8" => quote! { object_data[0] },
-        "i8" => quote! { object_data[0] as i8 },
+        "i8" => quote! {{ canopen_core::pdo::sign_extend_pdo_bits(&mut object_data, #bits); object_data[0] as i8 }},
         "u16" => quote! { u16::from_le_bytes(object_data) },
-        "i16" => quote! { i16::from_le_bytes(object_data) },
+        "i16" => quote! {{ canopen_core::pdo::sign_extend_pdo_bits(&mut object_data, #bits); i16::from_le_bytes(object_data) }},
         "u24" | "u32" => quote! { u32::from_le_bytes(object_data) },
         "i24" => quote! {{
+            canopen_core::pdo::sign_extend_pdo_bits(&mut object_data, #bits.min(24));
             if object_data[2] & 0x80 != 0 { object_data[3] = 0xff; }
             i32::from_le_bytes(object_data)
         }},
-        "i32" => quote! { i32::from_le_bytes(object_data) },
+        "i32" => quote! {{ canopen_core::pdo::sign_extend_pdo_bits(&mut object_data, #bits); i32::from_le_bytes(object_data) }},
         "f32" => quote! { f32::from_le_bytes(object_data) },
         "f64" => quote! { f64::from_le_bytes(object_data) },
         _ => unreachable!(),

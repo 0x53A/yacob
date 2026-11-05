@@ -101,3 +101,17 @@ async fn device_sdo_methods_are_always_addressed(
     let _ = device.read_i2032_s00_max_motor_speed(can).await;
     let _ = device.read_i6080_s00_max_motor_speed(can).await;
 }
+
+pdo_client_from_eds! {
+    pub struct PartialSignedPdo = "tests/test_partial_signed.eds";
+}
+
+#[test]
+fn generated_codec_sign_extends_partial_signed_mappings() {
+    let client = PartialSignedPdo::new(NodeId::new(5).unwrap());
+    // 12 bits 0xFFE (-2) | 4 bits 0x9 (-7)
+    let frame = CanFrame::new(0x185, &[0xFE, 0x9F]).unwrap();
+    let tpdo = client.decode_tpdo1(&frame).unwrap();
+    assert_eq!(tpdo.position, -2);
+    assert_eq!(tpdo.trim, -7);
+}

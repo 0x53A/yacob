@@ -5,31 +5,52 @@ CreatedBy=canopen-rs (object_dictionary! macro)
 
 [DeviceInfo]
 VendorName=
+VendorNumber=0x0000CAFE
 ProductName=DemoOd
+ProductNumber=0x0001
+RevisionNumber=0x00010000
+BaudRate_10=1
+BaudRate_20=1
+BaudRate_50=1
+BaudRate_125=1
+BaudRate_250=1
+BaudRate_500=1
+BaudRate_800=1
+BaudRate_1000=1
+SimpleBootUpMaster=0
+SimpleBootUpSlave=1
+Granularity=1
+DynamicChannelsSupported=0
+GroupMessaging=0
+NrOfRXPDO=2
+NrOfTXPDO=2
+LSS_Supported=1
 
 [MandatoryObjects]
-SupportedObjects=9
+SupportedObjects=3
 1=0x1000
 2=0x1001
-3=0x1005
-4=0x1006
-5=0x1007
-6=0x1016
-7=0x1017
-8=0x1018
-9=0x1019
+3=0x1018
 
 [OptionalObjects]
-SupportedObjects=9
-1=0x1400
-2=0x1404
-3=0x1600
-4=0x1604
-5=0x1800
-6=0x1804
-7=0x1A00
-8=0x1A04
+SupportedObjects=17
+1=0x1005
+2=0x1006
+3=0x1007
+4=0x1016
+5=0x1017
+6=0x1019
+7=0x1021
+8=0x1022
 9=0x1201
+10=0x1400
+11=0x1404
+12=0x1600
+13=0x1604
+14=0x1800
+15=0x1804
+16=0x1A00
+17=0x1A04
 
 [ManufacturerObjects]
 SupportedObjects=1
@@ -113,7 +134,7 @@ DefaultValue=4
 PDOMapping=0
 
 [1016sub1]
-ParameterName=consumer_heartbeat
+ParameterName=consumer_heartbeat_1
 ObjectType=0x7
 DataType=0x0007
 AccessType=rw
@@ -121,7 +142,7 @@ DefaultValue=0
 PDOMapping=0
 
 [1016sub2]
-ParameterName=consumer_heartbeat
+ParameterName=consumer_heartbeat_2
 ObjectType=0x7
 DataType=0x0007
 AccessType=rw
@@ -129,7 +150,7 @@ DefaultValue=0
 PDOMapping=0
 
 [1016sub3]
-ParameterName=consumer_heartbeat
+ParameterName=consumer_heartbeat_3
 ObjectType=0x7
 DataType=0x0007
 AccessType=rw
@@ -137,7 +158,7 @@ DefaultValue=0
 PDOMapping=0
 
 [1016sub4]
-ParameterName=consumer_heartbeat
+ParameterName=consumer_heartbeat_4
 ObjectType=0x7
 DataType=0x0007
 AccessType=rw
@@ -315,7 +336,7 @@ ParameterName=bit_output1
 ObjectType=0x7
 DataType=0x0001
 AccessType=rw
-DefaultValue=false
+DefaultValue=0
 PDOMapping=1
 
 [6300sub2]
@@ -323,7 +344,7 @@ ParameterName=bit_output2
 ObjectType=0x7
 DataType=0x0001
 AccessType=rw
-DefaultValue=false
+DefaultValue=0
 PDOMapping=1
 
 [6300sub3]
@@ -331,7 +352,7 @@ ParameterName=bit_output3
 ObjectType=0x7
 DataType=0x0001
 AccessType=rw
-DefaultValue=false
+DefaultValue=0
 PDOMapping=1
 
 [6300sub4]
@@ -339,7 +360,7 @@ ParameterName=bit_output4
 ObjectType=0x7
 DataType=0x0001
 AccessType=rw
-DefaultValue=false
+DefaultValue=0
 PDOMapping=1
 
 [6300sub5]
@@ -347,7 +368,7 @@ ParameterName=bit_output5
 ObjectType=0x7
 DataType=0x0001
 AccessType=rw
-DefaultValue=false
+DefaultValue=0
 PDOMapping=1
 
 [6300sub6]
@@ -355,7 +376,7 @@ ParameterName=bit_output6
 ObjectType=0x7
 DataType=0x0001
 AccessType=rw
-DefaultValue=false
+DefaultValue=0
 PDOMapping=1
 
 [6300sub7]
@@ -363,7 +384,7 @@ ParameterName=bit_output7
 ObjectType=0x7
 DataType=0x0001
 AccessType=rw
-DefaultValue=false
+DefaultValue=0
 PDOMapping=1
 
 [6300sub8]
@@ -371,7 +392,7 @@ ParameterName=bit_output8
 ObjectType=0x7
 DataType=0x0001
 AccessType=rw
-DefaultValue=false
+DefaultValue=0
 PDOMapping=1
 
 [6300sub9]
@@ -379,7 +400,7 @@ ParameterName=bit_output9
 ObjectType=0x7
 DataType=0x0001
 AccessType=rw
-DefaultValue=false
+DefaultValue=0
 PDOMapping=1
 
 [1800]
@@ -1685,5 +1706,20 @@ ObjectType=0x7
 DataType=0x0007
 AccessType=ro
 DefaultValue=$NODEID+0x5C0
+PDOMapping=0
+
+[1021]
+ParameterName=Store EDS
+ObjectType=0x7
+DataType=0x000F
+AccessType=ro
+PDOMapping=0
+
+[1022]
+ParameterName=Store Format
+ObjectType=0x7
+DataType=0x0005
+AccessType=ro
+DefaultValue=0x80
 PDOMapping=0
 

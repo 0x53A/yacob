@@ -50,7 +50,6 @@ pub enum EntryKind {
 pub struct ArrayDef {
     pub element_type: Ident,
     /// Capacity for variable-length element types.
-    #[allow(dead_code)]
     pub element_capacity: Option<usize>,
     pub count: usize,
     pub access: AccessKind,
@@ -246,7 +245,7 @@ impl Parse for OdDefinition {
             }
         }
 
-        Ok(OdDefinition {
+        let def = OdDefinition {
             vis,
             name,
             entries,
@@ -255,7 +254,9 @@ impl Parse for OdDefinition {
             export_eds_path,
             use_alloc,
             validate_write_fn,
-        })
+        };
+        def.validate()?;
+        Ok(def)
     }
 }
 
@@ -934,4 +935,194 @@ pub fn rust_repr_type(ty: &proc_macro2::Ident) -> proc_macro2::TokenStream {
 /// Returns true if the type is variable-length (needs capacity parameter).
 pub fn is_variable_length_type(ty: &str) -> bool {
     matches!(ty, "visible_string" | "octet_string" | "domain")
+}
+
+impl OdDefinition {
+    /// Structural checks shared by the inline DSL and EDS import: every OD
+    /// address must have exactly one owner, and statically mapped PDO
+    /// entries must be accessible in the PDO's direction.
+    pub fn validate(&self) -> Result<()> {
+        use std::collections::HashMap;
+
+        let mut owners: HashMap<u16, &Ident> = HashMap::new();
+        for entry in &self.entries {
+            if let Some(previous) = owners.insert(entry.index, &entry.name) {
+                return Err(syn::Error::new(
+                    entry.name.span(),
+                    format!(
+                        "index 0x{:04X} is already declared by `{previous}`",
+                        entry.index
+                    ),
+                ));
+            }
+            if let EntryKind::Record(subs) = &entry.kind {
+                let mut seen = std::collections::HashSet::new();
+                for sub in subs {
+                    if sub.subindex == 0 {
+                        return Err(syn::Error::new(
+                            sub.name.span(),
+                            "record sub-index 0 is generated (highest sub-index supported); \
+                             declare sub-indices from 1",
+                        ));
+                    }
+                    if !seen.insert(sub.subindex) {
+                        return Err(syn::Error::new(
+                            sub.name.span(),
+                            format!(
+                                "sub-index {} of 0x{:04X} is declared twice",
+                                sub.subindex, entry.index
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut generated: Vec<(u16, String)> = vec![
+            (0x1021, "the generated Store EDS object".into()),
+            (0x1022, "the generated Store Format object".into()),
+        ];
+        for pdo in &self.pdos {
+            let (comm, map, label) = match pdo.direction {
+                PdoDirection::Tpdo => (0x1800, 0x1A00, "tpdo"),
+                PdoDirection::Rpdo => (0x1400, 0x1600, "rpdo"),
+            };
+            let offset = pdo.number - 1;
+            generated.push((comm + offset, format!("{label}[{}] communication", pdo.number)));
+            generated.push((map + offset, format!("{label}[{}] mapping", pdo.number)));
+        }
+        for server in &self.sdo_servers {
+            generated.push((
+                0x1200 + server.number - 1,
+                format!("sdo_server[{}]", server.number),
+            ));
+        }
+        for (index, what) in generated {
+            if let Some(name) = owners.get(&index) {
+                return Err(syn::Error::new(
+                    name.span(),
+                    format!("index 0x{index:04X} is generated for {what}; remove `{name}`"),
+                ));
+            }
+        }
+
+        for pdo in &self.pdos {
+            if matches!(pdo.transmission_type, 252 | 253) {
+                let label = match pdo.direction {
+                    PdoDirection::Tpdo => "tpdo",
+                    PdoDirection::Rpdo => "rpdo",
+                };
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "{label}[{}]: RTR transmission types (252/253) are not supported \
+                         (the CAN frame type and transports carry no remote frames); \
+                         use sync_acyclic, sync_cyclic(N) or event_driven",
+                        pdo.number
+                    ),
+                ));
+            }
+        }
+
+        for pdo in &self.pdos {
+            for mapping in &pdo.mappings {
+                if mapping.raw_mapping.is_some() {
+                    continue;
+                }
+                let Some(access) = self.find_var_access(&mapping.field_name) else {
+                    continue; // unknown fields are reported by codegen
+                };
+                let bad = match pdo.direction {
+                    PdoDirection::Rpdo => matches!(access, AccessKind::Ro | AccessKind::Const),
+                    PdoDirection::Tpdo => access == AccessKind::Wo,
+                };
+                if bad {
+                    let (label, need) = match pdo.direction {
+                        PdoDirection::Rpdo => ("rpdo", "writable (`rw` or `wo`)"),
+                        PdoDirection::Tpdo => ("tpdo", "readable (`ro`, `rw` or `const`)"),
+                    };
+                    return Err(syn::Error::new(
+                        mapping.field_name.span(),
+                        format!(
+                            "{label}[{}] maps `{}`, which must be {need}",
+                            pdo.number, mapping.field_name
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn find_var_access(&self, field: &Ident) -> Option<AccessKind> {
+        self.entries.iter().find_map(|entry| match &entry.kind {
+            EntryKind::Var(var) if entry.name == *field => Some(var.access),
+            EntryKind::Record(subs) => subs
+                .iter()
+                .find(|sub| sub.name == *field)
+                .map(|sub| sub.var.access),
+            _ => None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::OdDefinition;
+
+    fn error(src: &str) -> String {
+        match syn::parse_str::<OdDefinition>(src) {
+            Ok(_) => panic!("accepted:\n{src}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn duplicate_index_is_rejected() {
+        let e = error("pub struct S { [0x2000] a: u8 = 1, rw; [0x2000] b: u16 = 2, rw; }");
+        assert!(e.contains("already declared by `a`"), "{e}");
+    }
+
+    #[test]
+    fn generated_indices_cannot_be_declared() {
+        for (decl, needle) in [
+            ("[0x1800] c: u8 = 7, rw; [0x6000] x: u8 = 0, ro, pdo; tpdo[1] { x, };", "tpdo[1] communication"),
+            ("[0x1A00] c: u8 = 7, rw; [0x6000] x: u8 = 0, ro, pdo; tpdo[1] { x, };", "tpdo[1] mapping"),
+            ("[0x1021] c: u8 = 7, ro;", "Store EDS"),
+            ("[0x1201] c: u8 = 7, ro; sdo_server[2](cob_rx = 0x640, cob_tx = 0x5C0);", "sdo_server[2]"),
+        ] {
+            let e = error(&format!("pub struct S {{ {decl} }}"));
+            assert!(e.contains(needle), "{decl}: {e}");
+        }
+    }
+
+    #[test]
+    fn record_sub0_and_duplicate_subs_are_rejected() {
+        let e = error("pub struct S { [0x2000] r: record { [0] n: u8 = 1, ro; [1] a: u8 = 1, rw; }; }");
+        assert!(e.contains("sub-index 0 is generated"), "{e}");
+        let e = error("pub struct S { [0x2000] r: record { [1] a: u8 = 1, rw; [1] b: u8 = 1, rw; }; }");
+        assert!(e.contains("declared twice"), "{e}");
+    }
+
+    #[test]
+    fn pdo_mapping_direction_must_match_access() {
+        let e = error("pub struct S { [0x6000] x: u8 = 0, ro, pdo; rpdo[1] { x, }; }");
+        assert!(e.contains("must be writable"), "{e}");
+        let e = error("pub struct S { [0x6000] x: u8 = 0, wo, pdo; tpdo[1] { x, }; }");
+        assert!(e.contains("must be readable"), "{e}");
+        assert!(syn::parse_str::<OdDefinition>(
+            "pub struct S { [0x6000] x: u8 = 0, rw, pdo; rpdo[1] { x, }; tpdo[1] { x, }; }"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rtr_transmission_types_are_rejected() {
+        for tt in ["rtr_sync", "rtr_event", "252", "253"] {
+            let e = error(&format!(
+                "pub struct S {{ [0x6000] x: u8 = 0, ro, pdo; tpdo[1](transmission_type = {tt}) {{ x, }}; }}"
+            ));
+            assert!(e.contains("RTR transmission types"), "{tt}: {e}");
+        }
+    }
 }

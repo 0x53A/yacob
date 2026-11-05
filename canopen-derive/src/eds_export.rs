@@ -48,11 +48,7 @@ fn flatten_for_eds(entries: &[OdEntry]) -> Vec<FlatEdsEntry> {
     for entry in entries {
         match &entry.kind {
             EntryKind::Var(var) => {
-                let default_value = var
-                    .default_value
-                    .as_ref()
-                    .map(|expr| quote::ToTokens::to_token_stream(expr).to_string())
-                    .unwrap_or_default();
+                let default_value = eds_default(var);
                 flat.push(FlatEdsEntry {
                     index: entry.index,
                     subindex: 0,
@@ -65,12 +61,7 @@ fn flatten_for_eds(entries: &[OdEntry]) -> Vec<FlatEdsEntry> {
             }
             EntryKind::Record(subs) => {
                 for sub in subs {
-                    let default_value = sub
-                        .var
-                        .default_value
-                        .as_ref()
-                        .map(|expr| quote::ToTokens::to_token_stream(expr).to_string())
-                        .unwrap_or_default();
+                    let default_value = eds_default(&sub.var);
                     flat.push(FlatEdsEntry {
                         index: entry.index,
                         subindex: sub.subindex,
@@ -87,9 +78,15 @@ fn flatten_for_eds(entries: &[OdEntry]) -> Vec<FlatEdsEntry> {
                     flat.push(FlatEdsEntry {
                         index: entry.index,
                         subindex: sub as u8,
-                        name: entry.name.to_string(),
+                        name: format!("{}_{sub}", entry.name),
                         type_name: arr.element_type.to_string(),
-                        default_value: "0".to_string(),
+                        // Array elements are zero-initialised; variable-length
+                        // elements start empty.
+                        default_value: if arr.element_capacity.is_some() {
+                            String::new()
+                        } else {
+                            "0".to_string()
+                        },
                         access: arr.access,
                         pdo_mappable: arr.pdo_mappable,
                     });
@@ -112,10 +109,35 @@ pub fn generate_eds(od: &OdDefinition) -> String {
     writeln!(out, "CreatedBy=canopen-rs (object_dictionary! macro)").unwrap();
     writeln!(out).unwrap();
 
-    // DeviceInfo
+    // DeviceInfo (CiA 306 §4.6.2). Identity numbers come from the 0x1018
+    // defaults when they are plain literals; the bit rates and boot-up flag
+    // describe what this stack implements (every rate is the driver's
+    // business, so all are claimed; only the minimal boot-up is supported).
+    let identity = |sub: u8| {
+        flat.iter()
+            .find(|f| f.index == 0x1018 && f.subindex == sub)
+            .map(|f| f.default_value.clone())
+            .unwrap_or_default()
+    };
+    let rx_count = od.pdos.iter().filter(|p| p.direction == PdoDirection::Rpdo).count();
+    let tx_count = od.pdos.iter().filter(|p| p.direction == PdoDirection::Tpdo).count();
     writeln!(out, "[DeviceInfo]").unwrap();
     writeln!(out, "VendorName=").unwrap();
+    writeln!(out, "VendorNumber={}", identity(1)).unwrap();
     writeln!(out, "ProductName={}", od.name).unwrap();
+    writeln!(out, "ProductNumber={}", identity(2)).unwrap();
+    writeln!(out, "RevisionNumber={}", identity(3)).unwrap();
+    for rate in ["10", "20", "50", "125", "250", "500", "800", "1000"] {
+        writeln!(out, "BaudRate_{rate}=1").unwrap();
+    }
+    writeln!(out, "SimpleBootUpMaster=0").unwrap();
+    writeln!(out, "SimpleBootUpSlave=1").unwrap();
+    writeln!(out, "Granularity=1").unwrap();
+    writeln!(out, "DynamicChannelsSupported=0").unwrap();
+    writeln!(out, "GroupMessaging=0").unwrap();
+    writeln!(out, "NrOfRXPDO={rx_count}").unwrap();
+    writeln!(out, "NrOfTXPDO={tx_count}").unwrap();
+    writeln!(out, "LSS_Supported=1").unwrap();
     writeln!(out).unwrap();
 
     // Categorise indices
@@ -147,16 +169,25 @@ pub fn generate_eds(od: &OdDefinition) -> String {
     sdo_indices.sort();
     sdo_indices.dedup();
 
+    // CiA 306: only 0x1000, 0x1001 and 0x1018 are mandatory; every other
+    // communication-profile object (including the generated PDO, SDO server
+    // and 0x1021/0x1022 records) is optional.
+    const MANDATORY: [u16; 3] = [0x1000, 0x1001, 0x1018];
     let mandatory: Vec<u16> = user_indices
         .iter()
         .copied()
-        .filter(|i| *i < 0x2000)
+        .filter(|i| MANDATORY.contains(i))
         .collect();
-    let optional: Vec<u16> = pdo_indices
+    let mut optional: Vec<u16> = user_indices
         .iter()
         .copied()
-        .chain(sdo_indices.clone())
+        .filter(|i| *i < 0x2000 && !MANDATORY.contains(i))
+        .chain(pdo_indices.iter().copied())
+        .chain(sdo_indices.iter().copied())
+        .chain([0x1021, 0x1022])
         .collect();
+    optional.sort();
+    optional.dedup();
     let manufacturer: Vec<u16> = user_indices
         .iter()
         .copied()
@@ -261,6 +292,24 @@ pub fn generate_eds(od: &OdDefinition) -> String {
         write_sdo_server_eds(&mut out, s);
     }
 
+    // The generated self-description objects. 0x1021's content is this file
+    // (compressed), so it has no DefaultValue.
+    writeln!(out, "[1021]").unwrap();
+    writeln!(out, "ParameterName=Store EDS").unwrap();
+    writeln!(out, "ObjectType=0x7").unwrap();
+    writeln!(out, "DataType=0x000F").unwrap();
+    writeln!(out, "AccessType=ro").unwrap();
+    writeln!(out, "PDOMapping=0").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "[1022]").unwrap();
+    writeln!(out, "ParameterName=Store Format").unwrap();
+    writeln!(out, "ObjectType=0x7").unwrap();
+    writeln!(out, "DataType=0x0005").unwrap();
+    writeln!(out, "AccessType=ro").unwrap();
+    writeln!(out, "DefaultValue=0x80").unwrap();
+    writeln!(out, "PDOMapping=0").unwrap();
+    writeln!(out).unwrap();
+
     out
 }
 
@@ -315,9 +364,97 @@ fn write_index_list(out: &mut String, section: &str, indices: &[u16]) {
     writeln!(out).unwrap();
 }
 
-fn normalize_eds_value(val: &str) -> String {
-    // Remove Rust-style underscores from numeric literals (e.g. 0x0000_0191 -> 0x00000191)
-    val.replace('_', "")
+/// CiA 306 `DefaultValue` text for a DSL default, or empty (no default).
+///
+/// Literals and constant integer expressions (`-5`, `1 << 4`, `0x10 | 1`) are
+/// evaluated; booleans become 0/1 and strings their raw text. Anything the
+/// macro cannot evaluate (e.g. a path to a `const`) yields an empty value
+/// rather than Rust source text, which no EDS consumer can read.
+fn eds_default(var: &VarDef) -> String {
+    let Some(expr) = var.default_value.as_ref() else {
+        return String::new();
+    };
+    let ty = var.type_name.to_string();
+    if let syn::Expr::Lit(syn::ExprLit { lit, .. }) = expr {
+        match lit {
+            syn::Lit::Str(s) => return s.value(),
+            syn::Lit::Bool(b) => return if b.value { "1" } else { "0" }.into(),
+            syn::Lit::Float(f) => return f.base10_digits().to_string(),
+            _ => {}
+        }
+    }
+    if ty == "f32" || ty == "f64" {
+        if let Some(v) = eval_float(expr) {
+            return format!("{v}");
+        }
+        return String::new();
+    }
+    // A plain decimal or hex literal keeps its spelling (minus `_` separators
+    // and any type suffix); binary/octal literals and computed values are
+    // written in decimal (negative) or hex.
+    if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(i), .. }) = expr {
+        let text = i.to_string();
+        let text = text.trim_end_matches(i.suffix()).replace('_', "");
+        if !text.starts_with("0b") && !text.starts_with("0o") {
+            return text;
+        }
+    }
+    match eval_int(expr) {
+        Some(v) if v < 0 => v.to_string(),
+        Some(v) => format!("0x{v:X}"),
+        None => String::new(),
+    }
+}
+
+fn eval_int(expr: &syn::Expr) -> Option<i128> {
+    use syn::{BinOp, Expr, Lit, UnOp};
+    Some(match expr {
+        Expr::Lit(lit) => match &lit.lit {
+            Lit::Int(i) => i.base10_parse::<i128>().ok()?,
+            Lit::Bool(b) => b.value as i128,
+            Lit::Byte(b) => b.value() as i128,
+            _ => return None,
+        },
+        Expr::Paren(p) => eval_int(&p.expr)?,
+        Expr::Group(g) => eval_int(&g.expr)?,
+        Expr::Cast(c) => eval_int(&c.expr)?,
+        Expr::Unary(u) => match u.op {
+            UnOp::Neg(_) => -eval_int(&u.expr)?,
+            UnOp::Not(_) => !eval_int(&u.expr)?,
+            _ => return None,
+        },
+        Expr::Binary(b) => {
+            let (l, r) = (eval_int(&b.left)?, eval_int(&b.right)?);
+            match b.op {
+                BinOp::Add(_) => l.checked_add(r)?,
+                BinOp::Sub(_) => l.checked_sub(r)?,
+                BinOp::Mul(_) => l.checked_mul(r)?,
+                BinOp::Div(_) => l.checked_div(r)?,
+                BinOp::Rem(_) => l.checked_rem(r)?,
+                BinOp::BitOr(_) => l | r,
+                BinOp::BitAnd(_) => l & r,
+                BinOp::BitXor(_) => l ^ r,
+                BinOp::Shl(_) => l.checked_shl(u32::try_from(r).ok()?)?,
+                BinOp::Shr(_) => l.checked_shr(u32::try_from(r).ok()?)?,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn eval_float(expr: &syn::Expr) -> Option<f64> {
+    use syn::{Expr, Lit, UnOp};
+    match expr {
+        Expr::Lit(lit) => match &lit.lit {
+            Lit::Float(f) => f.base10_parse().ok(),
+            Lit::Int(i) => i.base10_parse().ok(),
+            _ => None,
+        },
+        Expr::Paren(p) => eval_float(&p.expr),
+        Expr::Unary(u) if matches!(u.op, UnOp::Neg(_)) => eval_float(&u.expr).map(|v| -v),
+        _ => None,
+    }
 }
 
 fn write_var_props(out: &mut String, fe: &FlatEdsEntry, obj_type: u8) {
@@ -328,7 +465,7 @@ fn write_var_props(out: &mut String, fe: &FlatEdsEntry, obj_type: u8) {
     writeln!(
         out,
         "DefaultValue={}",
-        normalize_eds_value(&fe.default_value)
+        fe.default_value
     )
     .unwrap();
     writeln!(out, "PDOMapping={}", if fe.pdo_mappable { 1 } else { 0 }).unwrap();
@@ -510,19 +647,28 @@ fn write_pdo_mapping_eds(
     }
 }
 
-/// Write the EDS file to the given path (relative to CARGO_MANIFEST_DIR, or absolute).
-pub fn export_eds_file(od: &OdDefinition, path: &str) {
+/// Write the EDS file to the given path (relative to CARGO_MANIFEST_DIR, or
+/// absolute). The file is only rewritten when its content changes, so
+/// repeated expansions (rust-analyzer, incremental builds) do not touch it.
+/// Failure is a compile error: the attribute explicitly asks for the file.
+pub fn export_eds_file(od: &OdDefinition, path: &str) -> Result<(), String> {
     let path = std::path::Path::new(path);
     let full_path = if path.is_absolute() {
         path.to_path_buf()
-    } else if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        std::path::Path::new(&manifest_dir).join(path)
     } else {
-        return;
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
+            "#[export_eds]: CARGO_MANIFEST_DIR is not set; use an absolute path".to_string()
+        })?;
+        std::path::Path::new(&manifest_dir).join(path)
     };
-    if let Some(parent) = full_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let eds = generate_eds(od);
-    let _ = std::fs::write(&full_path, eds);
+    if std::fs::read_to_string(&full_path).is_ok_and(|current| current == eds) {
+        return Ok(());
+    }
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("#[export_eds]: cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&full_path, eds)
+        .map_err(|e| format!("#[export_eds]: cannot write {}: {e}", full_path.display()))
 }

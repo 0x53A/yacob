@@ -709,7 +709,8 @@ fn store_format_is_compressed() {
     let mut buf = [0u8; 1];
     let len = od.read(0x1022, 0, &mut buf).unwrap();
     assert_eq!(len, 1);
-    assert_eq!(buf[0], 1); // 1 = deflate compressed
+    assert_eq!(buf[0], canopen_core::od::STORE_FORMAT_DEFLATE);
+    assert_eq!(buf[0], 0x80, "manufacturer-specific range (CiA 301)");
 }
 
 #[test]
@@ -2014,4 +2015,82 @@ fn rpdo_resync_keeps_more_than_eight_mutable_mappings() {
     assert!(config.mappings.iter().all(|mapping| {
         mapping.index == 0x2002 && mapping.subindex == 0 && mapping.bit_length == 1
     }));
+}
+
+#[test]
+fn record_sub0_reports_highest_subindex() {
+    let od = TestOd::new();
+    let mut buf = [0u8; 8];
+    assert_eq!(od.read(0x1018, 0, &mut buf), Ok(1));
+    assert_eq!(buf[0], 4);
+    let meta = od.lookup(0x1018, 0).expect("record sub0 metadata");
+    assert_eq!(meta.access, canopen_core::od::AccessType::Ro);
+    assert_eq!(meta.data_type, canopen_core::datatypes::DataType::U8);
+    let mut od = od;
+    assert_eq!(
+        od.write(0x1018, 0, &[9]),
+        Err(canopen_core::od::OdError::ReadOnly)
+    );
+}
+
+#[test]
+fn rejected_variable_length_write_keeps_previous_value() {
+    let mut od = TestOd::new();
+    od.write(0x2021, 0, b"abc").unwrap();
+    assert_eq!(
+        od.write(0x2021, 0, &[0u8; 65]),
+        Err(canopen_core::od::OdError::ValueTooLong)
+    );
+    let mut buf = [0u8; 64];
+    let n = od.read(0x2021, 0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"abc");
+}
+
+#[test]
+fn node_config_takes_lss_identity_from_1018() {
+    use canopen_core::cobid::NodeId;
+    use canopen_core::node::NodeConfig;
+    let od = TestOd::new();
+    let config: NodeConfig<0, 0, 0> = NodeConfig::from_od(&od, NodeId::new(3).unwrap());
+    assert_eq!(config.identity.vendor_id, 0x1234);
+    assert_eq!(config.identity.product_code, 1);
+    assert_eq!(config.identity.revision, 0x0001_0000);
+    assert_eq!(config.identity.serial, 1);
+}
+
+#[test]
+fn od_error_register_follows_emcy_state() {
+    use canopen_core::cobid::NodeId;
+    use canopen_core::emcy::error_register;
+    use canopen_core::node::{Node, NodeConfig};
+    let od = TestOd::new();
+    let config: NodeConfig<0, 0, 0> = NodeConfig::from_od(&od, NodeId::new(3).unwrap());
+    let mut node: Node<TestOd, 0, 0, 0> = Node::new(config, od);
+    let read = |node: &Node<TestOd, 0, 0, 0>| {
+        let mut buf = [0u8; 1];
+        node.od().read(0x1001, 0, &mut buf).unwrap();
+        buf[0]
+    };
+    assert_eq!(read(&node), 0);
+    node.set_error(0x4210, error_register::TEMPERATURE, &[]);
+    assert_eq!(
+        read(&node),
+        error_register::TEMPERATURE | error_register::GENERIC
+    );
+    node.clear_error(error_register::TEMPERATURE);
+    assert_eq!(read(&node), 0);
+}
+
+#[test]
+fn pdo_transmission_type_rejects_reserved_and_rtr_values() {
+    use canopen_core::od::OdError;
+    let mut od = PdoTestOd::new();
+    for bad in [241u8, 251, 252, 253] {
+        assert_eq!(od.write(0x1800, 2, &[bad]), Err(OdError::ValueRange), "tpdo {bad}");
+        assert_eq!(od.write(0x1400, 2, &[bad]), Err(OdError::ValueRange), "rpdo {bad}");
+    }
+    for good in [0u8, 1, 240, 254, 255] {
+        assert_eq!(od.write(0x1800, 2, &[good]), Ok(()), "tpdo {good}");
+        assert_eq!(od.write(0x1400, 2, &[good]), Ok(()), "rpdo {good}");
+    }
 }

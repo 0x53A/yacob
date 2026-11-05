@@ -9,6 +9,7 @@
 
 use crate::cobid::{CobId, NodeId};
 use crate::sdo::client::{SdoClient, SdoClientResult};
+use crate::sdo::protocol::{encode_abort, AbortCode};
 use crate::sdo::SdoAbort;
 use crate::time::Clock;
 use crate::transport::CanFrame;
@@ -82,7 +83,50 @@ impl TransferDeadline {
     }
 }
 
+/// Deadline state of one transfer: `None` waits indefinitely.
+type Deadline<'c, C> = Option<(TransferDeadline, &'c C)>;
+
+/// Clock stand-in for untimed transfers; never consulted.
+struct NoClock;
+
+impl Clock for NoClock {
+    fn now_us(&self) -> u64 {
+        0
+    }
+}
+
+/// Generate a typed read/write helper pair for a fixed-width type.
+macro_rules! typed_access {
+    ($read:ident, $write:ident, $ty:ty, $width:literal, $doc:literal) => {
+        #[doc = concat!("Read ", $doc, " (exact ", stringify!($width), "-byte wire width).")]
+        pub async fn $read<E: core::fmt::Debug>(
+            &self,
+            index: u16,
+            subindex: u8,
+            can: &mut impl AsyncCan<Error = E>,
+        ) -> Result<$ty, SdoError<E>> {
+            let buf = self.read_fixed::<$width, E>(index, subindex, can).await?;
+            Ok(<$ty>::from_le_bytes(buf))
+        }
+
+        #[doc = concat!("Write ", $doc, ".")]
+        pub async fn $write<E: core::fmt::Debug>(
+            &self,
+            index: u16,
+            subindex: u8,
+            val: $ty,
+            can: &mut impl AsyncCan<Error = E>,
+        ) -> Result<(), SdoError<E>> {
+            self.download(index, subindex, &val.to_le_bytes(), can).await
+        }
+    };
+}
+
 impl SdoDriver {
+    /// Largest object this driver can upload or download in one transfer
+    /// (the size of its internal [`SdoClient`] buffer).
+    pub const MAX_TRANSFER: usize = 256;
+
     pub fn new(target: NodeId) -> Self {
         Self {
             response_cob: CobId::sdo_tx(target).raw(),
@@ -99,6 +143,10 @@ impl SdoDriver {
     /// Returns the number of bytes written into `buf`.
     /// For expedited transfers (≤4 bytes), this completes in one round-trip.
     /// For segmented transfers, multiple frames are exchanged automatically.
+    ///
+    /// When the transfer fails while the server may still be inside it
+    /// (protocol error, timeout, client buffer exceeded), the driver sends a
+    /// best-effort SDO abort so the server channel is free for a retry.
     pub async fn upload<E: core::fmt::Debug>(
         &self,
         index: u16,
@@ -106,50 +154,14 @@ impl SdoDriver {
         buf: &mut [u8],
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<usize, SdoError<E>> {
-        self.upload_sized(index, subindex, buf, can)
+        self.upload_impl(index, subindex, buf, can, None::<(TransferDeadline, &NoClock)>)
             .await
             .map(|(len, _)| len)
     }
 
-    /// [`upload`](Self::upload), also reporting whether the server indicated
-    /// the size (see [`SdoClient::upload_size_indicated`]).
-    async fn upload_sized<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        buf: &mut [u8],
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<(usize, bool), SdoError<E>> {
-        let mut client = SdoClient::<256>::new(self.target);
-        let req = client.start_upload(index, subindex);
-        can.transmit(&req).await.map_err(SdoError::Transport)?;
-
-        loop {
-            let frame = self.receive_response(can).await?;
-            let data: [u8; 8] = frame.data().try_into().unwrap();
-
-            match client.process_response(&data) {
-                SdoClientResult::UploadComplete { data_len } => {
-                    if data_len > buf.len() {
-                        return Err(SdoError::TooLarge);
-                    }
-                    let src = &client.data()[..data_len];
-                    buf[..data_len].copy_from_slice(src);
-                    return Ok((data_len, client.upload_size_indicated()));
-                }
-                SdoClientResult::SendNext(next) => {
-                    can.transmit(&next).await.map_err(SdoError::Transport)?;
-                }
-                SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
-                SdoClientResult::IgnoredAbort => {}
-                SdoClientResult::DownloadComplete | SdoClientResult::Error => {
-                    return Err(SdoError::ProtocolError)
-                }
-            }
-        }
-    }
-
     /// Write a value to the remote node's object dictionary.
+    ///
+    /// Sends a best-effort abort on failure, like [`upload`](Self::upload).
     pub async fn download<E: core::fmt::Debug>(
         &self,
         index: u16,
@@ -157,192 +169,7 @@ impl SdoDriver {
         data: &[u8],
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<(), SdoError<E>> {
-        let mut client = SdoClient::<256>::new(self.target);
-        let req = client
-            .start_download(index, subindex, data)
-            .map_err(|()| SdoError::TooLarge)?;
-        can.transmit(&req).await.map_err(SdoError::Transport)?;
-
-        loop {
-            let frame = self.receive_response(can).await?;
-            let resp: [u8; 8] = frame.data().try_into().unwrap();
-
-            match client.process_response(&resp) {
-                SdoClientResult::DownloadComplete => return Ok(()),
-                SdoClientResult::SendNext(next) => {
-                    can.transmit(&next).await.map_err(SdoError::Transport)?;
-                }
-                SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
-                SdoClientResult::IgnoredAbort => {}
-                SdoClientResult::UploadComplete { .. } | SdoClientResult::Error => {
-                    return Err(SdoError::ProtocolError)
-                }
-            }
-        }
-    }
-
-    /// Read exactly the wire width of a fixed-size type.
-    async fn read_fixed<const N: usize, E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<[u8; N], SdoError<E>> {
-        // Room for a size-less expedited reply (always four bytes).
-        let mut buf = [0u8; 8];
-        let (len, size_indicated) = self.upload_sized(index, subindex, &mut buf, can).await?;
-        // A size-less expedited reply carries four bytes of which the object
-        // occupies the leading N (CiA 301); otherwise the width must match.
-        let width_ok = len == N || (!size_indicated && len == 4 && N < 4);
-        if !width_ok {
-            return Err(SdoError::ProtocolError);
-        }
-        let mut out = [0; N];
-        out.copy_from_slice(&buf[..N]);
-        Ok(out)
-    }
-
-    /// Typed read helpers reject values with a different wire width.
-    pub async fn read_u8<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<u8, SdoError<E>> {
-        let buf = self.read_fixed::<1, E>(index, subindex, can).await?;
-        Ok(buf[0])
-    }
-
-    pub async fn read_u16<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<u16, SdoError<E>> {
-        let buf = self.read_fixed::<2, E>(index, subindex, can).await?;
-        Ok(u16::from_le_bytes(buf))
-    }
-
-    pub async fn read_u32<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<u32, SdoError<E>> {
-        let buf = self.read_fixed::<4, E>(index, subindex, can).await?;
-        Ok(u32::from_le_bytes(buf))
-    }
-
-    pub async fn read_i32<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<i32, SdoError<E>> {
-        let buf = self.read_fixed::<4, E>(index, subindex, can).await?;
-        Ok(i32::from_le_bytes(buf))
-    }
-
-    pub async fn read_f32<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<f32, SdoError<E>> {
-        let buf = self.read_fixed::<4, E>(index, subindex, can).await?;
-        Ok(f32::from_le_bytes(buf))
-    }
-
-    /// Read an INTEGER24 (3 bytes on the wire), sign-extended to `i32`.
-    pub async fn read_i24<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<i32, SdoError<E>> {
-        let buf = self.read_fixed::<3, E>(index, subindex, can).await?;
-        let ext = if (buf[2] & 0x80) != 0 { 0xFF } else { 0x00 };
-        Ok(i32::from_le_bytes([buf[0], buf[1], buf[2], ext]))
-    }
-
-    /// Read an UNSIGNED24 (3 bytes on the wire), zero-extended to `u32`.
-    pub async fn read_u24<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<u32, SdoError<E>> {
-        let buf = self.read_fixed::<3, E>(index, subindex, can).await?;
-        Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], 0]))
-    }
-
-    /// Typed write helpers.
-    pub async fn write_u8<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        val: u8,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<(), SdoError<E>> {
-        self.download(index, subindex, &[val], can).await
-    }
-
-    pub async fn write_u16<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        val: u16,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<(), SdoError<E>> {
-        self.download(index, subindex, &val.to_le_bytes(), can)
-            .await
-    }
-
-    pub async fn write_u32<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        val: u32,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<(), SdoError<E>> {
-        self.download(index, subindex, &val.to_le_bytes(), can)
-            .await
-    }
-
-    pub async fn write_f32<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        val: f32,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<(), SdoError<E>> {
-        self.download(index, subindex, &val.to_le_bytes(), can)
-            .await
-    }
-
-    /// Write an INTEGER24 (3 bytes on the wire). The upper 8 bits of `val`
-    /// are truncated.
-    pub async fn write_i24<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        val: i32,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<(), SdoError<E>> {
-        self.download(index, subindex, &val.to_le_bytes()[..3], can)
-            .await
-    }
-
-    /// Write an UNSIGNED24 (3 bytes on the wire). The upper 8 bits of `val`
-    /// are truncated.
-    pub async fn write_u24<E: core::fmt::Debug>(
-        &self,
-        index: u16,
-        subindex: u8,
-        val: u32,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<(), SdoError<E>> {
-        self.download(index, subindex, &val.to_le_bytes()[..3], can)
+        self.download_impl(index, subindex, data, can, None::<(TransferDeadline, &NoClock)>)
             .await
     }
 
@@ -372,33 +199,9 @@ impl SdoDriver {
             started: clock.now_us(),
             timeout_us,
         };
-        let mut client = SdoClient::<256>::new(self.target);
-        let req = client.start_upload(index, subindex);
-        self.transmit_timed(can, &req, deadline, clock).await?;
-
-        loop {
-            let frame = self.receive_response_timed(can, deadline, clock).await?;
-            let data: [u8; 8] = frame.data().try_into().unwrap();
-
-            match client.process_response(&data) {
-                SdoClientResult::UploadComplete { data_len } => {
-                    if data_len > buf.len() {
-                        return Err(SdoError::TooLarge);
-                    }
-                    let src = &client.data()[..data_len];
-                    buf[..data_len].copy_from_slice(src);
-                    return Ok(data_len);
-                }
-                SdoClientResult::SendNext(next) => {
-                    self.transmit_timed(can, &next, deadline, clock).await?;
-                }
-                SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
-                SdoClientResult::IgnoredAbort => {}
-                SdoClientResult::DownloadComplete | SdoClientResult::Error => {
-                    return Err(SdoError::ProtocolError)
-                }
-            }
-        }
+        self.upload_impl(index, subindex, buf, can, Some((deadline, clock)))
+            .await
+            .map(|(len, _)| len)
     }
 
     /// Write a value with a timeout.
@@ -420,133 +223,321 @@ impl SdoDriver {
             started: clock.now_us(),
             timeout_us,
         };
-        let mut client = SdoClient::<256>::new(self.target);
+        self.download_impl(index, subindex, data, can, Some((deadline, clock)))
+            .await
+    }
+
+    /// Upload, also reporting whether the server indicated the size (see
+    /// [`SdoClient::upload_size_indicated`]).
+    async fn upload_impl<E: core::fmt::Debug, C: Clock>(
+        &self,
+        index: u16,
+        subindex: u8,
+        buf: &mut [u8],
+        can: &mut impl AsyncCan<Error = E>,
+        deadline: Deadline<'_, C>,
+    ) -> Result<(usize, bool), SdoError<E>> {
+        let mut client = SdoClient::<{ Self::MAX_TRANSFER }>::new(self.target);
+        let req = client.start_upload(index, subindex);
+        self.send(can, &req, deadline).await?;
+
+        let result = async {
+            loop {
+                let frame = self.receive_response(can, deadline).await?;
+                let data: [u8; 8] = frame.data().try_into().unwrap();
+                match client.process_response(&data) {
+                    SdoClientResult::UploadComplete { data_len } => {
+                        // The server has finished; nothing to abort.
+                        if data_len > buf.len() {
+                            return Ok(Err(SdoError::TooLarge));
+                        }
+                        buf[..data_len].copy_from_slice(&client.data()[..data_len]);
+                        return Ok(Ok((data_len, client.upload_size_indicated())));
+                    }
+                    SdoClientResult::SendNext(next) => self.send(can, &next, deadline).await?,
+                    SdoClientResult::Aborted(code) => return Ok(Err(SdoError::Aborted(code))),
+                    SdoClientResult::IgnoredAbort => {}
+                    SdoClientResult::DownloadComplete | SdoClientResult::Error => {
+                        return Err(SdoError::ProtocolError)
+                    }
+                }
+            }
+        }
+        .await;
+        self.finish(can, index, subindex, result).await
+    }
+
+    async fn download_impl<E: core::fmt::Debug, C: Clock>(
+        &self,
+        index: u16,
+        subindex: u8,
+        data: &[u8],
+        can: &mut impl AsyncCan<Error = E>,
+        deadline: Deadline<'_, C>,
+    ) -> Result<(), SdoError<E>> {
+        let mut client = SdoClient::<{ Self::MAX_TRANSFER }>::new(self.target);
         let req = client
             .start_download(index, subindex, data)
             .map_err(|()| SdoError::TooLarge)?;
-        self.transmit_timed(can, &req, deadline, clock).await?;
+        self.send(can, &req, deadline).await?;
 
-        loop {
-            let frame = self.receive_response_timed(can, deadline, clock).await?;
-            let resp: [u8; 8] = frame.data().try_into().unwrap();
+        let result = async {
+            loop {
+                let frame = self.receive_response(can, deadline).await?;
+                let resp: [u8; 8] = frame.data().try_into().unwrap();
+                match client.process_response(&resp) {
+                    SdoClientResult::DownloadComplete => return Ok(Ok(())),
+                    SdoClientResult::SendNext(next) => self.send(can, &next, deadline).await?,
+                    SdoClientResult::Aborted(code) => return Ok(Err(SdoError::Aborted(code))),
+                    SdoClientResult::IgnoredAbort => {}
+                    SdoClientResult::UploadComplete { .. } | SdoClientResult::Error => {
+                        return Err(SdoError::ProtocolError)
+                    }
+                }
+            }
+        }
+        .await;
+        self.finish(can, index, subindex, result).await
+    }
 
-            match client.process_response(&resp) {
-                SdoClientResult::DownloadComplete => return Ok(()),
-                SdoClientResult::SendNext(next) => {
-                    self.transmit_timed(can, &next, deadline, clock).await?;
+    /// Resolve a transfer outcome. `Err` means the transfer broke off while
+    /// the server may still hold it open (`Ok(Err(_))` are terminal outcomes
+    /// the server already knows about): send a best-effort abort first.
+    async fn finish<T, E: core::fmt::Debug>(
+        &self,
+        can: &mut impl AsyncCan<Error = E>,
+        index: u16,
+        subindex: u8,
+        result: Result<Result<T, SdoError<E>>, SdoError<E>>,
+    ) -> Result<T, SdoError<E>> {
+        match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let code = match error {
+                    SdoError::Timeout => Some(AbortCode::SdoProtocolTimeout),
+                    SdoError::ProtocolError => Some(AbortCode::InvalidCommandSpecifier),
+                    // A transport failure leaves nothing to send the abort on.
+                    _ => None,
+                };
+                if let Some(code) = code {
+                    self.send_abort(can, index, subindex, code).await;
                 }
-                SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
-                SdoClientResult::IgnoredAbort => {}
-                SdoClientResult::UploadComplete { .. } | SdoClientResult::Error => {
-                    return Err(SdoError::ProtocolError)
-                }
+                Err(error)
             }
         }
     }
 
-    /// Apply the operation deadline to TX backpressure as well as RX waits.
-    async fn transmit_timed<E: core::fmt::Debug>(
+    /// Offer an abort to the transport without waiting for TX space: the
+    /// transfer has already failed, and a stuck transport must not turn that
+    /// failure into a hang.
+    async fn send_abort<E: core::fmt::Debug>(
+        &self,
+        can: &mut impl AsyncCan<Error = E>,
+        index: u16,
+        subindex: u8,
+        code: AbortCode,
+    ) {
+        use core::future::Future;
+        use core::task::Poll;
+        let Some(frame) = CanFrame::new(
+            CobId::sdo_rx(self.target).raw(),
+            &encode_abort(index, subindex, code),
+        ) else {
+            return;
+        };
+        let mut transmit = core::pin::pin!(can.transmit(&frame));
+        core::future::poll_fn(|cx| {
+            let _ = transmit.as_mut().poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// Read exactly the wire width of a fixed-size type.
+    async fn read_fixed<const N: usize, E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<[u8; N], SdoError<E>> {
+        // Room for a size-less expedited reply (always four bytes).
+        let mut buf = [0u8; 8];
+        let (len, size_indicated) = self
+            .upload_impl(index, subindex, &mut buf, can, None::<(TransferDeadline, &NoClock)>)
+            .await?;
+        // A size-less expedited reply carries four bytes of which the object
+        // occupies the leading N (CiA 301); otherwise the width must match.
+        let width_ok = len == N || (!size_indicated && len == 4 && N < 4);
+        if !width_ok {
+            return Err(SdoError::ProtocolError);
+        }
+        let mut out = [0; N];
+        out.copy_from_slice(&buf[..N]);
+        Ok(out)
+    }
+
+    typed_access!(read_u8, write_u8, u8, 1, "an UNSIGNED8");
+    typed_access!(read_i8, write_i8, i8, 1, "an INTEGER8");
+    typed_access!(read_u16, write_u16, u16, 2, "an UNSIGNED16");
+    typed_access!(read_i16, write_i16, i16, 2, "an INTEGER16");
+    typed_access!(read_u32, write_u32, u32, 4, "an UNSIGNED32");
+    typed_access!(read_i32, write_i32, i32, 4, "an INTEGER32");
+    typed_access!(read_f32, write_f32, f32, 4, "a REAL32");
+    typed_access!(read_u64, write_u64, u64, 8, "an UNSIGNED64");
+    typed_access!(read_i64, write_i64, i64, 8, "an INTEGER64");
+    typed_access!(read_f64, write_f64, f64, 8, "a REAL64");
+
+    /// Read a BOOLEAN (one byte; any nonzero value is `true`).
+    pub async fn read_bool<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<bool, SdoError<E>> {
+        Ok(self.read_fixed::<1, E>(index, subindex, can).await?[0] != 0)
+    }
+
+    /// Write a BOOLEAN as one byte (0 or 1).
+    pub async fn write_bool<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        val: bool,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<(), SdoError<E>> {
+        self.download(index, subindex, &[val as u8], can).await
+    }
+
+    /// Read an INTEGER24 (3 bytes on the wire), sign-extended into `i32`.
+    pub async fn read_i24<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<i32, SdoError<E>> {
+        let buf = self.read_fixed::<3, E>(index, subindex, can).await?;
+        let ext = if (buf[2] & 0x80) != 0 { 0xFF } else { 0x00 };
+        Ok(i32::from_le_bytes([buf[0], buf[1], buf[2], ext]))
+    }
+
+    /// Read an UNSIGNED24 (3 bytes on the wire) into `u32`.
+    pub async fn read_u24<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<u32, SdoError<E>> {
+        let buf = self.read_fixed::<3, E>(index, subindex, can).await?;
+        Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], 0]))
+    }
+
+    /// Write an INTEGER24 (3 bytes on the wire). Values outside the 24-bit
+    /// range are truncated.
+    pub async fn write_i24<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        val: i32,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<(), SdoError<E>> {
+        self.download(index, subindex, &val.to_le_bytes()[..3], can)
+            .await
+    }
+
+    /// Write an UNSIGNED24 (3 bytes on the wire). Values outside the 24-bit
+    /// range are truncated.
+    pub async fn write_u24<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        val: u32,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<(), SdoError<E>> {
+        self.download(index, subindex, &val.to_le_bytes()[..3], can)
+            .await
+    }
+
+    /// Transmit, bounded by the transfer deadline when there is one.
+    async fn send<E: core::fmt::Debug, C: Clock>(
         &self,
         can: &mut impl AsyncCan<Error = E>,
         frame: &CanFrame,
-        deadline: TransferDeadline,
-        clock: &impl Clock,
+        deadline: Deadline<'_, C>,
     ) -> Result<(), SdoError<E>> {
-        use core::future::Future;
-        use core::task::Poll;
+        let Some((deadline, clock)) = deadline else {
+            return can.transmit(frame).await.map_err(SdoError::Transport);
+        };
+        let transmit = can.transmit(frame);
+        with_deadline(transmit, deadline, clock)
+            .await?
+            .map_err(SdoError::Transport)
+    }
 
-        let remaining = deadline.remaining(clock.now_us());
-        if remaining == 0 {
-            return Err(SdoError::Timeout);
+    /// Receive the next frame on this node's SDO response COB-ID. A frame on
+    /// that COB-ID must be a full 8-byte SDO frame.
+    async fn receive_response<E: core::fmt::Debug, C: Clock>(
+        &self,
+        can: &mut impl AsyncCan<Error = E>,
+        deadline: Deadline<'_, C>,
+    ) -> Result<CanFrame, SdoError<E>> {
+        loop {
+            let frame = match deadline {
+                None => can.receive().await,
+                Some((deadline, clock)) => with_deadline(can.receive(), deadline, clock).await?,
+            }
+            .map_err(SdoError::Transport)?;
+            if frame.raw_id() != self.response_cob {
+                continue;
+            }
+            if frame.raw_dlc() != 8 {
+                return Err(SdoError::ProtocolError);
+            }
+            return Ok(frame);
+        }
+    }
+}
+
+/// Run `fut` until it completes or the transfer deadline passes.
+///
+/// The `clock` deadline is checked on every poll, which is sufficient for
+/// executors that re-poll periodically (like the canopen-linux blocking
+/// helpers). With the `embassy` feature an `embassy_time::Timer` is armed as
+/// well, so the timeout also fires on wake-driven executors when the bus is
+/// completely silent.
+async fn with_deadline<F: core::future::Future, E: core::fmt::Debug>(
+    fut: F,
+    deadline: TransferDeadline,
+    clock: &impl Clock,
+) -> Result<F::Output, SdoError<E>> {
+    #[cfg(feature = "embassy")]
+    use core::future::Future as _;
+    use core::task::Poll;
+
+    let remaining = deadline.remaining(clock.now_us());
+    if remaining == 0 {
+        return Err(SdoError::Timeout);
+    }
+    #[cfg(feature = "embassy")]
+    let mut timer = core::pin::pin!(embassy_time::Timer::after(
+        embassy_time::Duration::from_micros(remaining)
+    ));
+    #[cfg(not(feature = "embassy"))]
+    let _ = remaining;
+    let mut fut = core::pin::pin!(fut);
+    core::future::poll_fn(|cx| {
+        if deadline.remaining(clock.now_us()) == 0 {
+            return Poll::Ready(Err(SdoError::Timeout));
+        }
+        if let Poll::Ready(output) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Ok(output));
         }
         #[cfg(feature = "embassy")]
-        let mut timer = core::pin::pin!(embassy_time::Timer::after(
-            embassy_time::Duration::from_micros(remaining)
-        ));
-        let mut transmit = core::pin::pin!(can.transmit(frame));
-        core::future::poll_fn(|cx| {
-            if deadline.remaining(clock.now_us()) == 0 {
-                return Poll::Ready(Err(SdoError::Timeout));
-            }
-            if let Poll::Ready(result) = transmit.as_mut().poll(cx) {
-                return Poll::Ready(result.map_err(SdoError::Transport));
-            }
-            #[cfg(feature = "embassy")]
-            if timer.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(SdoError::Timeout));
-            }
-            Poll::Pending
-        })
-        .await
-    }
-
-    /// Receive a frame, filtering for this node's SDO response COB-ID.
-    async fn receive_response<E: core::fmt::Debug>(
-        &self,
-        can: &mut impl AsyncCan<Error = E>,
-    ) -> Result<CanFrame, SdoError<E>> {
-        loop {
-            let frame = can.receive().await.map_err(SdoError::Transport)?;
-            if frame.raw_id() != self.response_cob {
-                continue;
-            }
-            if frame.raw_dlc() != 8 {
-                return Err(SdoError::ProtocolError);
-            }
-            return Ok(frame);
+        if timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(SdoError::Timeout));
         }
-    }
-
-    /// Receive with deadline enforcement.
-    ///
-    /// The `clock` deadline is checked on every poll, which is sufficient for
-    /// executors that re-poll periodically (like the canopen-linux blocking
-    /// helpers). With the `embassy` feature an `embassy_time::Timer` is armed
-    /// as well, so the timeout also fires on wake-driven executors when the
-    /// bus is completely silent.
-    async fn receive_response_timed<E: core::fmt::Debug>(
-        &self,
-        can: &mut impl AsyncCan<Error = E>,
-        deadline: TransferDeadline,
-        clock: &impl Clock,
-    ) -> Result<CanFrame, SdoError<E>> {
-        use core::future::Future;
-        use core::task::Poll;
-
-        loop {
-            let remaining = deadline.remaining(clock.now_us());
-            if remaining == 0 {
-                return Err(SdoError::Timeout);
-            }
-            #[cfg(feature = "embassy")]
-            let mut timer = core::pin::pin!(embassy_time::Timer::after(
-                embassy_time::Duration::from_micros(remaining)
-            ));
-            let mut receive = core::pin::pin!(can.receive());
-            let frame = core::future::poll_fn(|cx| {
-                if deadline.remaining(clock.now_us()) == 0 {
-                    return Poll::Ready(Err(SdoError::Timeout));
-                }
-                if let Poll::Ready(result) = receive.as_mut().poll(cx) {
-                    return Poll::Ready(result.map_err(SdoError::Transport));
-                }
-                #[cfg(feature = "embassy")]
-                if timer.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Err(SdoError::Timeout));
-                }
-                Poll::Pending
-            })
-            .await?;
-
-            if frame.raw_id() != self.response_cob {
-                continue;
-            }
-            if frame.raw_dlc() != 8 {
-                return Err(SdoError::ProtocolError);
-            }
-            return Ok(frame);
-        }
-    }
+        Poll::Pending
+    })
+    .await
 }
 
 /// Wraps an `embedded_can::nb::Can` transport into `AsyncCan` by polling with yield.
