@@ -96,9 +96,11 @@ pub struct Node<
     od: OD,
     nmt: NmtHandler,
     sdo_server: SdoServer,
+    sdo_tx: PendingSdoTx,
     /// Additional SDO servers (0x1201+), each an independent transfer state
     /// machine. `SDO` is 0 for the common single-server node.
     extra_sdo: [SdoServer; SDO],
+    extra_sdo_pending_tx: [PendingSdoTx; SDO],
     /// Resolved rx COB-ID (client→server) for each additional SDO server,
     /// parallel to `extra_sdo`. Dispatch matches incoming frames against these.
     extra_sdo_rx: [u16; SDO],
@@ -163,6 +165,67 @@ enum SdoServerSel {
     Extra(usize),
 }
 
+/// One protocol-owned response, not a general outgoing FIFO. The residence
+/// limit also covers expedited responses, which have no active transfer timer.
+#[derive(Clone, Copy, Default)]
+struct PendingSdoTx {
+    frame: Option<(CanFrame, u64)>,
+    refused_this_poll: bool,
+}
+
+impl PendingSdoTx {
+    fn begin_poll(&mut self, server: &mut SdoServer, cob: u16, now: u64) {
+        self.refused_this_poll = false;
+        if self
+            .frame
+            .is_some_and(|(_, since)| now.wrapping_sub(since) >= crate::sdo::server::SDO_TIMEOUT_US)
+        {
+            // Do not replay a stale response, even if the transport recovers now.
+            self.frame = None;
+            server.abort_transfer();
+        } else if let Some(abort) = server.check_timeout(now) {
+            self.queue(cob, abort, now);
+        }
+    }
+
+    fn queue(&mut self, cob: u16, data: [u8; 8], now: u64) {
+        self.frame = CanFrame::new(cob, &data).map(|frame| (frame, now));
+    }
+
+    fn try_send(&mut self, transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>) {
+        if self.refused_this_poll {
+            return;
+        }
+        if let Some((frame, _)) = self.frame {
+            match transport.transmit(&frame) {
+                Ok(_) => self.frame = None,
+                Err(_) => self.refused_this_poll = true,
+            }
+        }
+    }
+
+    fn service(
+        &mut self,
+        server: &mut SdoServer,
+        cob: u16,
+        transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
+        now: u64,
+    ) {
+        self.try_send(transport);
+        // At most one sub-block per poll; never advance beyond a refused frame.
+        for _ in 0..127 {
+            if self.frame.is_some() {
+                break;
+            }
+            let Some(data) = server.poll_block_upload(now) else {
+                break;
+            };
+            self.queue(cob, data, now);
+            self.try_send(transport);
+        }
+    }
+}
+
 /// 0-based offset of a PDO's comm/mapping records from the range base
 /// (0x1400/0x1600/0x1800/0x1A00): explicit CANopen number if set, else the
 /// engine slot.
@@ -192,7 +255,9 @@ impl<
             od,
             nmt: NmtHandler::new(),
             sdo_server: SdoServer::new(),
+            sdo_tx: PendingSdoTx::default(),
             extra_sdo: [const { SdoServer::new() }; SDO],
+            extra_sdo_pending_tx: [PendingSdoTx::default(); SDO],
             extra_sdo_rx,
             extra_sdo_tx,
             tpdo: TpdoEngine::new(config.tpdo),
@@ -541,7 +606,22 @@ impl<
         self.pending_sync_tpdo.clear();
         self.sync_tpdo_last_attempt_us = None;
         self.rpdo.discard_pending();
+        self.rpdo.reset_deadline_monitoring();
+        self.dirty_set.clear();
         self.tpdo.reset_communication_state();
+    }
+
+    /// Discard PDO work at the transition, before another queued NMT/SYNC
+    /// frame can restart the node in the same processing call.
+    fn leave_operational(&mut self) {
+        self.rpdo.reset_deadline_monitoring();
+        self.rpdo.discard_pending();
+        self.tpdo.discard_sync_events();
+        self.tpdo.discard_async_events();
+        self.dirty_set.clear();
+        self.sync_window.reset();
+        self.pending_sync_tpdo.clear();
+        self.sync_tpdo_last_attempt_us = None;
     }
 
     /// COB-ID this node consumes SYNC on (OD 0x1005). A missing object uses
@@ -640,8 +720,9 @@ impl<
         &mut self.rpdo
     }
 
-    /// Report an emergency error. Sends an EMCY frame on the next `process()`
-    /// call and sets the corresponding bits in the error register.
+    /// Report an emergency error and set the corresponding register bits.
+    /// Queues an EMCY for `process()` to send in Pre-Operational or Operational
+    /// once the transport accepts it; Stopped defers transmission.
     ///
     /// `register_bits` should be a combination of `emcy::error_register::*` constants.
     pub fn set_error(&mut self, error_code: u16, register_bits: u8, vendor_data: &[u8]) {
@@ -649,7 +730,8 @@ impl<
     }
 
     /// Clear error register bits. If all errors are cleared, sends an
-    /// "error reset" EMCY frame (code 0x0000) on the next `process()` call.
+    /// "error reset" EMCY frame (code 0x0000) under the same transmission
+    /// conditions as [`set_error`](Self::set_error).
     pub fn clear_error(&mut self, register_bits: u8) {
         self.emcy.clear_error(register_bits);
     }
@@ -880,6 +962,18 @@ impl<
         // when the change and the pulse landed in the same call.
         self.tpdo.latch_sync_events(&self.dirty_set);
 
+        // Expire stale SDO work before accepting requests. Retry only after RX,
+        // so a queued NMT reset/client abort can cancel it before handoff.
+        self.sdo_tx
+            .begin_poll(&mut self.sdo_server, CobId::sdo_tx(self.node_id).raw(), now);
+        for i in 0..SDO {
+            self.extra_sdo_pending_tx[i].begin_poll(
+                &mut self.extra_sdo[i],
+                self.extra_sdo_tx[i],
+                now,
+            );
+        }
+
         // Drain incoming frames
         loop {
             match transport.receive() {
@@ -889,34 +983,21 @@ impl<
             }
         }
 
-        // SDO timeout check — abort stale transfers (default + extra servers)
-        if let Some(abort_frame) = self.sdo_server.check_timeout(now) {
-            let resp_cob = CobId::sdo_tx(self.node_id);
-            if let Some(frame) = CanFrame::new(resp_cob.raw(), &abort_frame) {
-                let _ = transport.transmit(&frame);
-            }
-        }
+        // SDO responses, timeout aborts and block segments share the same
+        // bounded pending slot on each independently serviced channel.
+        self.sdo_tx.service(
+            &mut self.sdo_server,
+            CobId::sdo_tx(self.node_id).raw(),
+            transport,
+            now,
+        );
         for i in 0..SDO {
-            if let Some(abort_frame) = self.extra_sdo[i].check_timeout(now) {
-                if let Some(frame) = CanFrame::new(self.extra_sdo_tx[i], &abort_frame) {
-                    let _ = transport.transmit(&frame);
-                }
-            }
-        }
-
-        // SDO block upload — send pending sub-block segments (default + extra)
-        while let Some(seg_data) = self.sdo_server.poll_block_upload(now) {
-            let resp_cob = CobId::sdo_tx(self.node_id);
-            if let Some(frame) = CanFrame::new(resp_cob.raw(), &seg_data) {
-                let _ = transport.transmit(&frame);
-            }
-        }
-        for i in 0..SDO {
-            while let Some(seg_data) = self.extra_sdo[i].poll_block_upload(now) {
-                if let Some(frame) = CanFrame::new(self.extra_sdo_tx[i], &seg_data) {
-                    let _ = transport.transmit(&frame);
-                }
-            }
+            self.extra_sdo_pending_tx[i].service(
+                &mut self.extra_sdo[i],
+                self.extra_sdo_tx[i],
+                transport,
+                now,
+            );
         }
 
         // SYNC production (OD 0x1005 bit 30 + 0x1006). A producing node also
@@ -925,8 +1006,8 @@ impl<
         // one. Stopped takes no part in bus traffic beyond NMT and error
         // control, so no SYNC is generated there.
         // The local pulse is applied only once the transport has accepted the
-        // frame. Dropping it silently — as the heartbeat and PDO paths do —
-        // would be worse here than a missing frame: the bus would never see
+        // frame. Dropping it silently would be worse than a missing frame:
+        // the bus would never see
         // the pulse while this node committed its synchronous RPDOs and
         // advanced its TPDO cycle, leaving the two disagreeing about which
         // pulse is which. On refusal the producer keeps the pulse and offers
@@ -965,22 +1046,21 @@ impl<
                 });
             }
         } else {
-            self.rpdo.reset_deadline_monitoring();
             // PDO data that never reached a SYNC must not act after the node
             // has stopped processing PDOs: buffered RPDO frames would land in
             // the OD, and a latched type-0 trigger would fire a TPDO, on the
             // first pulse after returning to Operational.
-            self.rpdo.discard_pending();
-            self.tpdo.discard_sync_events();
-            self.tpdo.discard_async_events();
-            self.sync_window.reset();
-            self.pending_sync_tpdo.clear();
-            self.sync_tpdo_last_attempt_us = None;
+            self.leave_operational();
         }
 
-        // Heartbeat production
-        if let Some(hb) = self.heartbeat.poll(now, self.nmt.state()) {
-            let _ = transport.transmit(&hb);
+        // A reset received above leaves boot pending until the next call.
+        // Do not emit a periodic zero-state frame masquerading as boot-up.
+        if self.booted {
+            if let Some(hb) = self.heartbeat.pending(now, self.nmt.state()) {
+                if transport.transmit(&hb).is_ok() {
+                    self.heartbeat.confirm_sent(now);
+                }
+            }
         }
 
         // Heartbeat consumer timeouts (0x1016). Unlike RPDO deadlines this is
@@ -996,18 +1076,28 @@ impl<
             }
         }
 
-        // EMCY (drain all pending frames — burst errors queue several)
-        while let Some(emcy_frame) = self.emcy.take_pending() {
-            let _ = transport.transmit(&emcy_frame);
+        // EMCY is available only in Pre-Operational and Operational. Keep
+        // the bounded error history while stopped, but do not transmit it.
+        if self.booted
+            && matches!(
+                self.nmt.state(),
+                NmtState::PreOperational | NmtState::Operational
+            )
+        {
+            while let Some(emcy_frame) = self.emcy.peek_pending() {
+                if transport.transmit(emcy_frame).is_err() {
+                    break;
+                }
+                self.emcy.take_pending();
+            }
         }
 
         // TPDO event timers + dirty-triggered sends (only in Operational)
         if self.nmt.state() == NmtState::Operational {
-            let mut out = Vec::<CanFrame, TPDO>::new();
-            self.tpdo.poll(&self.od, now, &self.dirty_set, &mut out);
-            for frame in &out {
-                let _ = transport.transmit(frame);
-            }
+            self.tpdo
+                .poll_with(&self.od, now, &self.dirty_set, |frame| {
+                    transport.transmit(frame).is_ok()
+                });
         }
         self.dirty_set.clear();
 
@@ -1103,8 +1193,10 @@ impl<
     /// cannot outlive a reset.
     fn abort_all_sdo_transfers(&mut self) {
         self.sdo_server.abort_transfer();
+        self.sdo_tx = PendingSdoTx::default();
         for i in 0..SDO {
             self.extra_sdo[i].abort_transfer();
+            self.extra_sdo_pending_tx[i] = PendingSdoTx::default();
         }
     }
 
@@ -1119,10 +1211,27 @@ impl<
         transport: &mut impl embedded_can::nb::Can<Frame = CanFrame>,
         now: u64,
     ) {
-        if frame.raw_dlc() < 8 {
+        // SDO is available only in Pre-Operational and Operational. In
+        // particular, requests queued behind a reset must wait for boot.
+        if !matches!(
+            self.nmt.state(),
+            NmtState::PreOperational | NmtState::Operational
+        )
+            || frame.raw_dlc() != 8
+        {
             return;
         }
         let req: [u8; 8] = frame.data().try_into().unwrap();
+        let pending = match sel {
+            SdoServerSel::Default => &mut self.sdo_tx,
+            SdoServerSel::Extra(i) => &mut self.extra_sdo_pending_tx[i],
+        };
+        if req[0] == 0x80 {
+            // Client aborts must still be serviced while TX is blocked.
+            pending.frame = None;
+        } else if pending.frame.is_some() {
+            return;
+        }
         let mut resp = [0u8; 8];
         let state = self.nmt.state();
         let was_full = self.event_queue.is_full();
@@ -1172,9 +1281,12 @@ impl<
                 SdoServerSel::Default => CobId::sdo_tx(self.node_id).raw(),
                 SdoServerSel::Extra(i) => self.extra_sdo_tx[i],
             };
-            if let Some(resp_frame) = CanFrame::new(resp_cob, &resp) {
-                let _ = transport.transmit(&resp_frame);
-            }
+            let pending = match sel {
+                SdoServerSel::Default => &mut self.sdo_tx,
+                SdoServerSel::Extra(i) => &mut self.extra_sdo_pending_tx[i],
+            };
+            pending.queue(resp_cob, resp, now);
+            pending.try_send(transport);
         }
         // Resync runtime services whose config lives in the OD. Signalled
         // directly by the SDO server rather than via the event queue: an
@@ -1321,7 +1433,7 @@ impl<
         // only a pre-defined-connection-set heuristic and custom PDOs may live
         // anywhere in the 11-bit ID space.
         if frame.raw_id() == CobId::nmt().raw() {
-            if frame.raw_dlc() >= 2 {
+            if frame.raw_dlc() == 2 {
                 let data = frame.data();
                 if let Some(cmd) = NmtCommand::from_byte(data[0]) {
                     let transition = self.nmt.process_command(cmd, data[1], self.node_id);
@@ -1342,6 +1454,16 @@ impl<
                             self.sync_heartbeat_from_od(false);
                             self.reset_sync_state();
                         }
+                        NmtTransition::StateChanged
+                            if self.nmt.state() != NmtState::Operational =>
+                        {
+                            self.leave_operational();
+                            if self.nmt.state() == NmtState::Stopped {
+                                // Cancel before draining the next frame: Stop
+                                // and Start can arrive in this same RX batch.
+                                self.abort_all_sdo_transfers();
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1361,7 +1483,7 @@ impl<
             return;
         }
 
-        let heartbeat_monitor = if frame.raw_dlc() >= 1 {
+        let heartbeat_monitor = if frame.raw_dlc() == 1 {
             self.hb_monitors
                 .iter_mut()
                 .flatten()

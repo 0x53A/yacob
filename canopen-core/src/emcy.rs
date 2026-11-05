@@ -106,7 +106,8 @@ pub mod error_register {
 /// EMCY producer. Queues emergency frames and tracks the error register.
 ///
 /// Call `set_error()` to report a new error. The frame will be sent on the
-/// next `Node::process()` call. Call `clear_error()` to clear error bits
+/// next `Node::process()` call in Pre-Operational or Operational, once the
+/// transport accepts it. Call `clear_error()` to clear error bits
 /// and send an "error reset" EMCY (code 0x0000).
 ///
 /// Up to 4 EMCY frames can be pending at once (burst errors between two
@@ -205,6 +206,11 @@ impl EmcyProducer {
     /// Take the oldest pending EMCY frame to transmit, if any.
     pub fn take_pending(&mut self) -> Option<CanFrame> {
         self.pending.pop_front()
+    }
+
+    /// Inspect the oldest announcement without consuming it before acceptance.
+    pub(crate) fn peek_pending(&self) -> Option<&CanFrame> {
+        self.pending.front()
     }
 }
 

@@ -17,7 +17,7 @@ pub enum SdoError {
     Timeout,
     ProtocolError,
     TransportError,
-    /// Download data exceeds the SDO client's transfer buffer.
+    /// Transfer data exceeds the client or caller's buffer capacity.
     TooLarge,
 }
 
@@ -28,7 +28,7 @@ impl std::fmt::Display for SdoError {
             Self::Timeout => write!(f, "SDO timeout"),
             Self::ProtocolError => write!(f, "SDO protocol error"),
             Self::TransportError => write!(f, "CAN transport error"),
-            Self::TooLarge => write!(f, "SDO download data exceeds client buffer"),
+            Self::TooLarge => write!(f, "SDO transfer data exceeds buffer capacity"),
         }
     }
 }

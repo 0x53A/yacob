@@ -26,6 +26,7 @@ pub struct SlcanTransport<P: SerialPort> {
     port: P,
     rx_buf: [u8; 256],
     rx_pos: usize,
+    discarding_line: bool,
 }
 
 impl<P: SerialPort> SlcanTransport<P> {
@@ -38,6 +39,7 @@ impl<P: SerialPort> SlcanTransport<P> {
             port,
             rx_buf: [0; 256],
             rx_pos: 0,
+            discarding_line: false,
         }
     }
 
@@ -71,34 +73,47 @@ impl<P: SerialPort> SlcanTransport<P> {
     /// currently has pending).
     pub fn drain_rx(&mut self) {
         self.rx_pos = 0;
+        self.discarding_line = false;
         let mut drain = [0u8; 64];
         while matches!(self.port.read(&mut drain), Ok(n) if n > 0) {}
     }
 
-    fn try_recv(&mut self) -> Option<CanFrame> {
+    fn try_recv(&mut self) -> Result<Option<CanFrame>, P::Error> {
+        if let Some(frame) = self.take_buffered_frame() {
+            return Ok(Some(frame));
+        }
         let space = self.rx_buf.len() - self.rx_pos;
         if space > 0 {
-            if let Ok(n) = self.port.read(&mut self.rx_buf[self.rx_pos..]) {
-                self.rx_pos += n;
-            }
+            let n = self.port.read(&mut self.rx_buf[self.rx_pos..])?;
+            self.rx_pos += n;
         }
+        Ok(self.take_buffered_frame())
+    }
 
-        let buf = &self.rx_buf[..self.rx_pos];
-        if let Some(cr_pos) = buf.iter().position(|&b| b == b'\r') {
-            let line = &buf[..cr_pos];
-            let frame = parse_slcan_frame(line);
-
+    /// Drain only already-buffered lines: ACKs and malformed lines must not
+    /// report idle while a complete frame is sitting behind them.
+    fn take_buffered_frame(&mut self) -> Option<CanFrame> {
+        while let Some(cr_pos) = self.rx_buf[..self.rx_pos].iter().position(|&b| b == b'\r') {
+            let frame = if self.discarding_line {
+                self.discarding_line = false;
+                None
+            } else {
+                parse_slcan_frame(&self.rx_buf[..cr_pos])
+            };
             let remaining = self.rx_pos - cr_pos - 1;
             self.rx_buf.copy_within(cr_pos + 1..self.rx_pos, 0);
             self.rx_pos = remaining;
-
-            frame
-        } else {
-            if self.rx_pos > 200 {
-                self.rx_pos = 0;
+            if frame.is_some() {
+                return frame;
             }
-            None
         }
+        if self.rx_pos == self.rx_buf.len() {
+            // Discard through the next delimiter, not merely this chunk:
+            // otherwise a command-shaped tail would become a new CAN frame.
+            self.rx_pos = 0;
+            self.discarding_line = true;
+        }
+        None
     }
 }
 
@@ -118,7 +133,9 @@ impl<P: SerialPort> embedded_can::nb::Can for SlcanTransport<P> {
     }
 
     fn receive(&mut self) -> nb::Result<Self::Frame, Self::Error> {
-        self.try_recv().ok_or(nb::Error::WouldBlock)
+        self.try_recv()
+            .map_err(|_| nb::Error::Other(CanError::BusError))?
+            .ok_or(nb::Error::WouldBlock)
     }
 }
 
@@ -131,6 +148,71 @@ impl<P: SerialPort> embedded_can::nb::Can for SlcanTransport<P> {
 /// short read timeout.
 #[cfg(feature = "std")]
 pub struct IoPort<T>(pub T);
+
+#[cfg(test)]
+mod framing_regressions {
+    use super::*;
+    use embedded_can::nb::Can;
+
+    struct Bytes {
+        data: &'static [u8],
+        reads: usize,
+        fail_after: usize,
+    }
+    impl SerialPort for Bytes {
+        type Error = ();
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
+            if self.reads >= self.fail_after {
+                return Err(());
+            }
+            self.reads += 1;
+            let len = buf.len().min(self.data.len());
+            buf[..len].copy_from_slice(&self.data[..len]);
+            self.data = &self.data[len..];
+            Ok(len)
+        }
+        fn write_all(&mut self, _: &[u8]) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ack_and_invalid_lines_do_not_hide_a_buffered_frame() {
+        let mut can = SlcanTransport::new(Bytes {
+            data: b"\rF00\rt20112A\r",
+            reads: 0,
+            fail_after: 1,
+        });
+        assert_eq!(can.receive().unwrap().data(), &[42]);
+    }
+
+    #[test]
+    fn buffered_frames_are_delivered_before_another_serial_read() {
+        let mut can = SlcanTransport::new(Bytes {
+            data: b"t20112A\rt20112B\r",
+            reads: 0,
+            fail_after: 1,
+        });
+        assert_eq!(can.receive().unwrap().data(), &[42]);
+        assert_eq!(can.receive().unwrap().data(), &[43]);
+        assert!(matches!(can.receive(), Err(nb::Error::Other(_))));
+    }
+
+    #[test]
+    fn overlong_line_tail_cannot_become_a_command() {
+        let mut can = SlcanTransport::new(Bytes {
+            data: b"t20112A\rt20112B\r",
+            reads: 0,
+            fail_after: 2,
+        });
+        // Already filled with an unterminated malformed line. The next serial
+        // chunk begins with a valid-looking tail of that same line.
+        can.rx_buf.fill(b'x');
+        can.rx_pos = can.rx_buf.len();
+        let frame = can.receive().or_else(|_| can.receive()).unwrap();
+        assert_eq!(frame.data(), &[43]);
+    }
+}
 
 #[cfg(feature = "std")]
 impl<T: std::io::Read + std::io::Write> SerialPort for IoPort<T> {

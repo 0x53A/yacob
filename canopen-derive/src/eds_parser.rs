@@ -163,6 +163,21 @@ fn parse_eds_content_with_overrides(
 
     validate_unique_object_sections(&sections)?;
 
+    for (section, props) in &sections {
+        if parse_section_index(section).is_some() {
+            if let Some(raw) = get_prop(props, "DataType").filter(|v| !v.trim().is_empty()) {
+                if parse_int(&raw)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .is_none()
+                {
+                    return Err(format!(
+                        "invalid UNSIGNED16 DataType `{raw}` in [{section}]"
+                    ));
+                }
+            }
+        }
+    }
+
     // Parse object sections (hex indices like "1000", "1018sub1", etc.)
     // First pass: collect top-level objects and track their ObjectType
     let mut record_subs: std::collections::HashMap<u16, Vec<(u8, Vec<(String, String)>)>> =
@@ -368,9 +383,10 @@ fn extract_pdos(
         }
 
         // Read COB-ID from sub1
-        let cob_id = get_section_props(&format!("{:04X}sub1", comm_idx))
-            .and_then(|props| get_prop(props, "DefaultValue"))
-            .and_then(|v| parse_pdo_cob_id(&v));
+        let cob_id = parse_pdo_cob_id_default(
+            get_section_props(&format!("{:04X}sub1", comm_idx)),
+            comm_idx,
+        )?;
 
         // Read transmission type from sub2
         let transmission_type = parse_pdo_default(
@@ -412,15 +428,16 @@ fn extract_pdos(
         // Read mappings
         let mut mappings = Vec::new();
         for sub in 1..=map_count {
-            if let Some(props) = get_section_props(&format!("{:04X}sub{:X}", map_idx, sub)) {
-                if let Some(val_str) = get_prop(props, "DefaultValue") {
-                    if let Some(val) = parse_int(&val_str) {
-                        if val != 0 {
-                            if let Some(mapping) = resolve_mapping(val as u32, entries) {
-                                mappings.push(mapping);
-                            }
-                        }
-                    }
+            let val = parse_pdo_default(
+                get_section_props(&format!("{:04X}sub{:X}", map_idx, sub)),
+                0u32,
+                map_idx,
+                sub,
+                "PDO mapping descriptor",
+            )?;
+            if val != 0 {
+                if let Some(mapping) = resolve_mapping(val, entries) {
+                    mappings.push(mapping);
                 }
             }
         }
@@ -449,9 +466,10 @@ fn extract_pdos(
             continue;
         }
 
-        let cob_id = get_section_props(&format!("{:04X}sub1", comm_idx))
-            .and_then(|props| get_prop(props, "DefaultValue"))
-            .and_then(|v| parse_pdo_cob_id(&v));
+        let cob_id = parse_pdo_cob_id_default(
+            get_section_props(&format!("{:04X}sub1", comm_idx)),
+            comm_idx,
+        )?;
 
         let transmission_type = parse_pdo_default(
             get_section_props(&format!("{:04X}sub2", comm_idx)),
@@ -481,15 +499,16 @@ fn extract_pdos(
 
         let mut mappings = Vec::new();
         for sub in 1..=map_count {
-            if let Some(props) = get_section_props(&format!("{:04X}sub{:X}", map_idx, sub)) {
-                if let Some(val_str) = get_prop(props, "DefaultValue") {
-                    if let Some(val) = parse_int(&val_str) {
-                        if val != 0 {
-                            if let Some(mapping) = resolve_mapping(val as u32, entries) {
-                                mappings.push(mapping);
-                            }
-                        }
-                    }
+            let val = parse_pdo_default(
+                get_section_props(&format!("{:04X}sub{:X}", map_idx, sub)),
+                0u32,
+                map_idx,
+                sub,
+                "PDO mapping descriptor",
+            )?;
+            if val != 0 {
+                if let Some(mapping) = resolve_mapping(val, entries) {
+                    mappings.push(mapping);
                 }
             }
         }
@@ -520,6 +539,25 @@ impl PdoWireType for u8 {
 
 impl PdoWireType for u16 {
     const EDS_NAME: &'static str = "UNSIGNED16";
+}
+
+impl PdoWireType for u32 {
+    const EDS_NAME: &'static str = "UNSIGNED32";
+}
+
+fn parse_pdo_cob_id_default(
+    props: Option<&Vec<(String, String)>>,
+    index: u16,
+) -> std::result::Result<Option<CobIdSpec>, String> {
+    let Some(raw) = props.and_then(|props| get_prop(props, "DefaultValue")) else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_pdo_cob_id(&raw)
+        .map(Some)
+        .ok_or_else(|| format!("invalid PDO COB-ID `{raw}` at 0x{index:04X}:01"))
 }
 
 /// Read a PDO parameter's `DefaultValue` and narrow it to its wire type.
@@ -643,15 +681,22 @@ fn resolve_mapping(mapping_val: u32, entries: &mut [OdEntry]) -> Option<PdoMappi
 /// become [`CobIdSpec::Absolute`]. Returns None if the value is unparseable.
 fn parse_pdo_cob_id(value: &str) -> Option<CobIdSpec> {
     let v = value.trim();
-    if v.to_ascii_uppercase().contains("$NODEID") {
-        // e.g. "$NODEID+0x200" or "0x200+$NODEID"
-        let base_str = v
-            .split('+')
-            .map(str::trim)
-            .find(|part| !part.eq_ignore_ascii_case("$NODEID"))?;
-        parse_int(base_str).map(|n| CobIdSpec::NodeRelative(n as u32))
+    if v.eq_ignore_ascii_case("$NODEID") {
+        Some(CobIdSpec::NodeRelative(0))
+    } else if let Some((left, right)) = v.split_once('+') {
+        let (left, right) = (left.trim(), right.trim());
+        let base = if left.eq_ignore_ascii_case("$NODEID") {
+            right
+        } else if right.eq_ignore_ascii_case("$NODEID") {
+            left
+        } else {
+            return None;
+        };
+        u32::try_from(parse_int(base)?)
+            .ok()
+            .map(CobIdSpec::NodeRelative)
     } else {
-        parse_int(v).map(|n| CobIdSpec::Absolute(n as u32))
+        u32::try_from(parse_int(v)?).ok().map(CobIdSpec::Absolute)
     }
 }
 
@@ -681,7 +726,8 @@ fn parse_var_entry(
     capacity_overrides: &std::collections::HashMap<u16, usize>,
 ) -> Option<SubEntry> {
     let name_str = get_prop(props, "ParameterName")?;
-    let data_type_code = get_prop(props, "DataType").and_then(|v| parse_int(&v))? as u16;
+    let data_type_code =
+        u16::try_from(get_prop(props, "DataType").and_then(|v| parse_int(&v))?).ok()?;
     let access_str = get_prop(props, "AccessType").unwrap_or_else(|| "ro".to_string());
     let default_str = get_prop(props, "DefaultValue").unwrap_or_else(|| "0".to_string());
     let pdo_mapping = get_prop(props, "PDOMapping")
@@ -858,6 +904,49 @@ fn normalize_default(value: &str, data_type: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cob_id_defaults_do_not_truncate_or_ignore_expression_terms() {
+        for value in [
+            "0x100000181",
+            "$NODEID+0x100000180",
+            "$NODEID+0x180+1",
+            "bad$NODEID+0x180",
+            "oops",
+        ] {
+            let eds = format!("[1800]\nObjectType=9\n[1800sub1]\nDefaultValue={value}\n");
+            assert!(parse_eds_content(&eds).is_err(), "accepted {value}");
+        }
+        for value in [
+            "",
+            "$NODEID",
+            "$nodeid+0x180",
+            "0x180+$NODEID",
+            "0x80000181",
+        ] {
+            let eds = format!("[1800]\nObjectType=9\n[1800sub1]\nDefaultValue={value}\n");
+            assert!(parse_eds_content(&eds).is_ok(), "rejected {value}");
+        }
+    }
+
+    #[test]
+    fn mapping_descriptor_overflow_is_rejected_in_both_directions() {
+        for (comm, map) in [("1800", "1A00"), ("1400", "1600")] {
+            for value in ["0x120000008", "18446744073709551616", "invalid"] {
+                let eds = format!(
+                    "[2000]\nParameterName=Value\nDataType=5\nAccessType=rw\n\
+                    [{comm}]\nObjectType=9\n[{map}sub0]\nDefaultValue=1\n[{map}sub1]\nDefaultValue={value}\n"
+                );
+                assert!(parse_eds_content(&eds).is_err(), "accepted {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn datatype_code_does_not_wrap_into_a_supported_type() {
+        let eds = "[2000]\nParameterName=Value\nDataType=0x10005\n";
+        assert!(parse_eds_content(eds).is_err());
+    }
 
     #[test]
     fn duplicate_top_level_object_section_is_error() {

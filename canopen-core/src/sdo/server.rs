@@ -3,8 +3,8 @@ use crate::od::{ObjectDictionary, OdError, OdEvent, OdEventSource};
 use crate::sdo::protocol::*;
 use heapless::Deque;
 
-/// SDO server timeout for segmented transfers: 5 seconds in microseconds.
-const SDO_TIMEOUT_US: u64 = 5_000_000;
+/// SDO server inactivity timeout for segmented/block transfers, in microseconds.
+pub(crate) const SDO_TIMEOUT_US: u64 = 5_000_000;
 
 /// Maximum block size (number of segments per sub-block). CiA 301 max is 127.
 const MAX_BLKSIZE: u8 = 127;
@@ -18,6 +18,7 @@ struct SegmentedTransfer {
     buf: [u8; 889], // 127 * 7 = 889, enough for max block
     offset: usize,
     total_len: usize,
+    size_indicated: bool,
     last_activity_us: u64,
 }
 
@@ -52,7 +53,8 @@ struct BlockDownloadState {
     subindex: u8,
     buf: [u8; 889],
     offset: usize,
-    total_len: usize, // expected size (0 if unknown)
+    total_len: usize,
+    size_indicated: bool,
     blksize: u8,
     seqno: u8, // last received sequence number within the current sub-block
     /// Set after the final segment (bit 7) is acknowledged; the next frame
@@ -276,7 +278,8 @@ impl SdoServer {
     /// when the node is in Operational state (per CiA 301).
     ///
     /// Returns `Ok(())` if a response was written to `response`.
-    /// Returns `Err(())` if the frame was malformed and no response should be sent.
+    /// Returns `Err(())` when no response should be sent, including client
+    /// aborts and intermediate block-download segments (not just malformed frames).
     ///
     /// Downloads are validated against the OD only. Use
     /// [`process_with_context`](Self::process_with_context) to also reject
@@ -330,7 +333,7 @@ impl SdoServer {
 
         let cs = command_specifier(request[0]);
 
-        match cs {
+        let result = match cs {
             cs if cs == Ccs::InitiateUpload as u8 => {
                 self.handle_initiate_upload(request, od, response, now_us)
             }
@@ -358,7 +361,14 @@ impl SdoServer {
                 *response = encode_abort(index, subindex, AbortCode::InvalidCommandSpecifier);
                 Ok(())
             }
+        };
+        // Every server abort ends the channel's transfer, including errors
+        // while initiating a replacement request. Never leave the previous
+        // segmented state available after reporting an abort to the client.
+        if result.is_ok() && response[0] == 0x80 {
+            self.transfer = None;
         }
+        result
     }
 
     // ---- Segmented transfer handlers ----
@@ -381,7 +391,7 @@ impl SdoServer {
             }
         };
 
-        if len <= 4 {
+        if len > 0 && len <= 4 {
             *response = encode_upload_response_expedited(index, subindex, &buf[..len]).unwrap();
             self.transfer = None;
         } else {
@@ -394,6 +404,7 @@ impl SdoServer {
                 buf,
                 offset: 0,
                 total_len: len,
+                size_indicated: true,
                 last_activity_us: now_us,
             }));
         }
@@ -430,7 +441,8 @@ impl SdoServer {
             transfer.toggle,
             &transfer.buf[transfer.offset..transfer.offset + seg_len],
             last,
-        );
+        )
+        .expect("segment length is bounded to seven bytes");
 
         transfer.offset += seg_len;
         transfer.toggle = !transfer.toggle;
@@ -520,6 +532,7 @@ impl SdoServer {
                 buf: [0u8; 889],
                 offset: 0,
                 total_len,
+                size_indicated,
                 last_activity_us: now_us,
             }));
             *response = encode_download_response(index, subindex);
@@ -556,6 +569,16 @@ impl SdoServer {
         let last = (request[0] & 0x01) != 0;
         let n = ((request[0] >> 1) & 0x07) as usize;
         let seg_len = 7 - n;
+
+        let received = transfer.offset + seg_len;
+        if transfer.size_indicated
+            && (received > transfer.total_len || (last && received != transfer.total_len))
+        {
+            let (idx, sub) = (transfer.index, transfer.subindex);
+            self.transfer = None;
+            *response = encode_abort(idx, sub, AbortCode::DataTransferError);
+            return Ok(());
+        }
 
         if transfer.offset + seg_len > 889 {
             let (idx, sub) = (transfer.index, transfer.subindex);
@@ -809,6 +832,7 @@ impl SdoServer {
                     buf: [0u8; 889],
                     offset: 0,
                     total_len,
+                    size_indicated,
                     blksize: MAX_BLKSIZE,
                     seqno: 0,
                     awaiting_end: false,
@@ -843,6 +867,7 @@ impl SdoServer {
                         let subindex = state.subindex;
                         let data_len = state.offset;
                         let total_len = state.total_len;
+                        let size_indicated = state.size_indicated;
                         let crc_enabled = state.crc_enabled;
                         let mut write_buf = [0u8; 889];
                         write_buf[..data_len].copy_from_slice(&state.buf[..data_len]);
@@ -850,7 +875,7 @@ impl SdoServer {
 
                         // If the initiate request declared a size, the received
                         // data must match it (CiA 301).
-                        if total_len != 0 && data_len != total_len {
+                        if size_indicated && data_len != total_len {
                             *response = encode_abort(index, subindex, AbortCode::DataTransferError);
                             return Ok(());
                         }
@@ -939,16 +964,17 @@ impl SdoServer {
             return Ok(());
         }
 
-        // Copy 7 data bytes. A non-final segment that doesn't fit means the
-        // transfer exceeds the buffer (possible when no size was indicated).
+        // Capacity is a whole number of seven-byte segments. Even a final
+        // segment needs a full slot: dropping its bytes here and trimming
+        // padding later could silently commit an undersized payload.
         let space = 889 - state.offset;
-        if !is_last && space < 7 {
+        if space < 7 {
             let (index, subindex) = (state.index, state.subindex);
             self.transfer = None;
             *response = encode_abort(index, subindex, AbortCode::OutOfMemory);
             return Ok(());
         }
-        let copy_len = space.min(7);
+        let copy_len = 7;
         state.buf[state.offset..state.offset + copy_len].copy_from_slice(&request[1..1 + copy_len]);
         state.offset += copy_len;
         state.seqno = seqno;
@@ -1085,10 +1111,10 @@ fn validate_sync_counter_overflow_write(
 /// Rejected with 0x0604_0043, as for the duplicate heartbeat producer.
 ///
 /// The valid bit (31) is deliberately ignored: a disabled PDO can be enabled
-/// later by a write that carries no COB-ID, so the collision has to be caught
-/// when the COB-ID is written, not when it goes live. Only the 11-bit ID is
-/// compared, matching `Node::sync_pdo_from_od` — the stack has no extended-ID
-/// PDOs, so the frame-type bit does not make a colliding ID distinct.
+/// later by clearing that bit while retaining the ID, so collisions are checked
+/// when the COB-ID is written, not when it goes live. Unsupported identifier
+/// bits are rejected before comparing the 11-bit ID: silently masking them
+/// would configure a different frame from the one the client requested.
 fn validate_pdo_cob_id_write(
     sdo_cobs: SdoCobIds<'_>,
     sync_cob_id: u16,
@@ -1101,6 +1127,12 @@ fn validate_pdo_cob_id_write(
         return Ok(());
     }
     let raw = u32::from_le_bytes(data.try_into().unwrap());
+    // Only standard identifiers are supported. Preserve the existing handling
+    // of validity/RTR flags (31/30), but reject extended format (29) and the
+    // identifier bits which cannot fit into the stack's 11-bit frame model.
+    if raw & 0x3FFF_F800 != 0 {
+        return Err(AbortCode::ValueRangeExceeded);
+    }
     let cob = (raw & 0x7FF) as u16;
     if sdo_cobs.claims(cob) || (cob != 0 && cob == sync_cob_id) {
         return Err(AbortCode::ParameterIncompatibility);
@@ -2113,6 +2145,20 @@ mod tests {
             validate_pdo_cob_id_write(SdoCobIds::default(), 0x080, 0x1400, 1, &raw),
             Ok(())
         );
+        for index in [0x1400, 0x1800] {
+            for flags in [0, 0x4000_0000, 0x8000_0000, 0xC000_0000] {
+                assert_eq!(
+                    validate_pdo_cob_id_write(
+                        SdoCobIds::default(),
+                        0x080,
+                        index,
+                        1,
+                        &(flags | 0x321u32).to_le_bytes(),
+                    ),
+                    Ok(())
+                );
+            }
+        }
     }
 
     #[test]

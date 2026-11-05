@@ -9,10 +9,19 @@ pub struct SocketcanTransport {
     socket: CanSocket,
 }
 
+fn map_transmit_error(error: std::io::Error) -> nb::Error<CanError> {
+    if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::ENOBUFS)
+    {
+        nb::Error::WouldBlock
+    } else {
+        nb::Error::Other(CanError::BusError)
+    }
+}
+
 fn sc_frame_to_canframe(frame: &socketcan::CanFrame) -> Option<CanFrame> {
     match frame {
-        socketcan::CanFrame::Data(df) => {
-            let id = (df.raw_id() & 0x7FF) as u16;
+        socketcan::CanFrame::Data(df) if !df.is_extended() => {
+            let id = df.raw_id() as u16;
             CanFrame::new(id, df.data())
         }
         _ => None,
@@ -57,7 +66,7 @@ impl embedded_can::nb::Can for SocketcanTransport {
             CanDataFrame::new(id, frame.data()).ok_or(nb::Error::Other(CanError::BusError))?;
         self.socket
             .write_frame(&sc_frame)
-            .map_err(|_| nb::Error::Other(CanError::BusError))?;
+            .map_err(map_transmit_error)?;
         Ok(None)
     }
 

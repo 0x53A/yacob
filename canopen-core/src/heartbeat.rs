@@ -28,17 +28,30 @@ impl HeartbeatProducer {
     }
 
     /// Check if a heartbeat is due. Returns the frame to send, if any.
+    ///
+    /// Returning a frame advances the interval immediately; callers must retain
+    /// it if transmission is refused. `Node` uses acceptance-aware bookkeeping
+    /// internally instead of this convenience method.
     pub fn poll(&mut self, now_us: u64, state: NmtState) -> Option<CanFrame> {
+        let frame = self.pending(now_us, state)?;
+        self.confirm_sent(now_us);
+        Some(frame)
+    }
+
+    pub(crate) fn pending(&self, now_us: u64, state: NmtState) -> Option<CanFrame> {
         if self.interval_us == 0 {
             return None;
         }
         if now_us.wrapping_sub(self.last_sent_us) >= self.interval_us {
-            self.last_sent_us = now_us;
             let cob = CobId::heartbeat(self.node_id);
             Some(CanFrame::new(cob.raw(), &[state.heartbeat_byte()]).unwrap())
         } else {
             None
         }
+    }
+
+    pub(crate) fn confirm_sent(&mut self, now_us: u64) {
+        self.last_sent_us = now_us;
     }
 
     /// Force sending a heartbeat immediately (e.g., on boot).

@@ -39,9 +39,9 @@ pub enum SdoError<E: core::fmt::Debug> {
     ProtocolError,
     /// CAN transport error.
     Transport(E),
-    /// Transfer timed out waiting for a response.
+    /// Transfer deadline expired during transmission or reception.
     Timeout,
-    /// Download data does not fit the client's transfer buffer.
+    /// Transfer data does not fit the client or caller's buffer.
     TooLarge,
 }
 
@@ -52,7 +52,7 @@ impl<E: core::fmt::Debug> core::fmt::Display for SdoError<E> {
             Self::ProtocolError => write!(f, "SDO protocol error"),
             Self::Transport(e) => write!(f, "CAN transport error: {:?}", e),
             Self::Timeout => write!(f, "SDO timeout"),
-            Self::TooLarge => write!(f, "SDO download data exceeds client buffer"),
+            Self::TooLarge => write!(f, "SDO transfer data exceeds buffer capacity"),
         }
     }
 }
@@ -64,6 +64,22 @@ impl<E: core::fmt::Debug> core::fmt::Display for SdoError<E> {
 pub struct SdoDriver {
     target: NodeId,
     response_cob: u16,
+}
+
+/// One transfer budget, shared across every TX and RX wait. Compare elapsed
+/// time rather than an absolute end instant so an arbitrary clock epoch can
+/// cross u64::MAX without making a new transfer immediately time out.
+#[derive(Clone, Copy)]
+struct TransferDeadline {
+    started: u64,
+    timeout_us: u64,
+}
+
+impl TransferDeadline {
+    fn remaining(self, now: u64) -> u64 {
+        self.timeout_us
+            .saturating_sub(now.wrapping_sub(self.started))
+    }
 }
 
 impl SdoDriver {
@@ -90,6 +106,20 @@ impl SdoDriver {
         buf: &mut [u8],
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<usize, SdoError<E>> {
+        self.upload_sized(index, subindex, buf, can)
+            .await
+            .map(|(len, _)| len)
+    }
+
+    /// [`upload`](Self::upload), also reporting whether the server indicated
+    /// the size (see [`SdoClient::upload_size_indicated`]).
+    async fn upload_sized<E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        buf: &mut [u8],
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<(usize, bool), SdoError<E>> {
         let mut client = SdoClient::<256>::new(self.target);
         let req = client.start_upload(index, subindex);
         can.transmit(&req).await.map_err(SdoError::Transport)?;
@@ -100,10 +130,12 @@ impl SdoDriver {
 
             match client.process_response(&data) {
                 SdoClientResult::UploadComplete { data_len } => {
+                    if data_len > buf.len() {
+                        return Err(SdoError::TooLarge);
+                    }
                     let src = &client.data()[..data_len];
-                    let copy_len = data_len.min(buf.len());
-                    buf[..copy_len].copy_from_slice(&src[..copy_len]);
-                    return Ok(data_len);
+                    buf[..data_len].copy_from_slice(src);
+                    return Ok((data_len, client.upload_size_indicated()));
                 }
                 SdoClientResult::SendNext(next) => {
                     can.transmit(&next).await.map_err(SdoError::Transport)?;
@@ -149,15 +181,35 @@ impl SdoDriver {
         }
     }
 
-    /// Typed read helpers.
+    /// Read exactly the wire width of a fixed-size type.
+    async fn read_fixed<const N: usize, E: core::fmt::Debug>(
+        &self,
+        index: u16,
+        subindex: u8,
+        can: &mut impl AsyncCan<Error = E>,
+    ) -> Result<[u8; N], SdoError<E>> {
+        // Room for a size-less expedited reply (always four bytes).
+        let mut buf = [0u8; 8];
+        let (len, size_indicated) = self.upload_sized(index, subindex, &mut buf, can).await?;
+        // A size-less expedited reply carries four bytes of which the object
+        // occupies the leading N (CiA 301); otherwise the width must match.
+        let width_ok = len == N || (!size_indicated && len == 4 && N < 4);
+        if !width_ok {
+            return Err(SdoError::ProtocolError);
+        }
+        let mut out = [0; N];
+        out.copy_from_slice(&buf[..N]);
+        Ok(out)
+    }
+
+    /// Typed read helpers reject values with a different wire width.
     pub async fn read_u8<E: core::fmt::Debug>(
         &self,
         index: u16,
         subindex: u8,
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<u8, SdoError<E>> {
-        let mut buf = [0u8; 1];
-        self.upload(index, subindex, &mut buf, can).await?;
+        let buf = self.read_fixed::<1, E>(index, subindex, can).await?;
         Ok(buf[0])
     }
 
@@ -167,8 +219,7 @@ impl SdoDriver {
         subindex: u8,
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<u16, SdoError<E>> {
-        let mut buf = [0u8; 2];
-        self.upload(index, subindex, &mut buf, can).await?;
+        let buf = self.read_fixed::<2, E>(index, subindex, can).await?;
         Ok(u16::from_le_bytes(buf))
     }
 
@@ -178,8 +229,7 @@ impl SdoDriver {
         subindex: u8,
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<u32, SdoError<E>> {
-        let mut buf = [0u8; 4];
-        self.upload(index, subindex, &mut buf, can).await?;
+        let buf = self.read_fixed::<4, E>(index, subindex, can).await?;
         Ok(u32::from_le_bytes(buf))
     }
 
@@ -189,8 +239,7 @@ impl SdoDriver {
         subindex: u8,
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<i32, SdoError<E>> {
-        let mut buf = [0u8; 4];
-        self.upload(index, subindex, &mut buf, can).await?;
+        let buf = self.read_fixed::<4, E>(index, subindex, can).await?;
         Ok(i32::from_le_bytes(buf))
     }
 
@@ -200,8 +249,7 @@ impl SdoDriver {
         subindex: u8,
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<f32, SdoError<E>> {
-        let mut buf = [0u8; 4];
-        self.upload(index, subindex, &mut buf, can).await?;
+        let buf = self.read_fixed::<4, E>(index, subindex, can).await?;
         Ok(f32::from_le_bytes(buf))
     }
 
@@ -212,8 +260,7 @@ impl SdoDriver {
         subindex: u8,
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<i32, SdoError<E>> {
-        let mut buf = [0u8; 3];
-        self.upload(index, subindex, &mut buf, can).await?;
+        let buf = self.read_fixed::<3, E>(index, subindex, can).await?;
         let ext = if (buf[2] & 0x80) != 0 { 0xFF } else { 0x00 };
         Ok(i32::from_le_bytes([buf[0], buf[1], buf[2], ext]))
     }
@@ -225,8 +272,7 @@ impl SdoDriver {
         subindex: u8,
         can: &mut impl AsyncCan<Error = E>,
     ) -> Result<u32, SdoError<E>> {
-        let mut buf = [0u8; 3];
-        self.upload(index, subindex, &mut buf, can).await?;
+        let buf = self.read_fixed::<3, E>(index, subindex, can).await?;
         Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], 0]))
     }
 
@@ -322,10 +368,13 @@ impl SdoDriver {
         timeout_us: u64,
         clock: &impl Clock,
     ) -> Result<usize, SdoError<E>> {
-        let deadline = clock.now_us().wrapping_add(timeout_us);
+        let deadline = TransferDeadline {
+            started: clock.now_us(),
+            timeout_us,
+        };
         let mut client = SdoClient::<256>::new(self.target);
         let req = client.start_upload(index, subindex);
-        can.transmit(&req).await.map_err(SdoError::Transport)?;
+        self.transmit_timed(can, &req, deadline, clock).await?;
 
         loop {
             let frame = self.receive_response_timed(can, deadline, clock).await?;
@@ -333,13 +382,15 @@ impl SdoDriver {
 
             match client.process_response(&data) {
                 SdoClientResult::UploadComplete { data_len } => {
+                    if data_len > buf.len() {
+                        return Err(SdoError::TooLarge);
+                    }
                     let src = &client.data()[..data_len];
-                    let copy_len = data_len.min(buf.len());
-                    buf[..copy_len].copy_from_slice(&src[..copy_len]);
+                    buf[..data_len].copy_from_slice(src);
                     return Ok(data_len);
                 }
                 SdoClientResult::SendNext(next) => {
-                    can.transmit(&next).await.map_err(SdoError::Transport)?;
+                    self.transmit_timed(can, &next, deadline, clock).await?;
                 }
                 SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
                 SdoClientResult::IgnoredAbort => {}
@@ -365,12 +416,15 @@ impl SdoDriver {
         timeout_us: u64,
         clock: &impl Clock,
     ) -> Result<(), SdoError<E>> {
-        let deadline = clock.now_us().wrapping_add(timeout_us);
+        let deadline = TransferDeadline {
+            started: clock.now_us(),
+            timeout_us,
+        };
         let mut client = SdoClient::<256>::new(self.target);
         let req = client
             .start_download(index, subindex, data)
             .map_err(|()| SdoError::TooLarge)?;
-        can.transmit(&req).await.map_err(SdoError::Transport)?;
+        self.transmit_timed(can, &req, deadline, clock).await?;
 
         loop {
             let frame = self.receive_response_timed(can, deadline, clock).await?;
@@ -379,7 +433,7 @@ impl SdoDriver {
             match client.process_response(&resp) {
                 SdoClientResult::DownloadComplete => return Ok(()),
                 SdoClientResult::SendNext(next) => {
-                    can.transmit(&next).await.map_err(SdoError::Transport)?;
+                    self.transmit_timed(can, &next, deadline, clock).await?;
                 }
                 SdoClientResult::Aborted(code) => return Err(SdoError::Aborted(code)),
                 SdoClientResult::IgnoredAbort => {}
@@ -388,6 +442,42 @@ impl SdoDriver {
                 }
             }
         }
+    }
+
+    /// Apply the operation deadline to TX backpressure as well as RX waits.
+    async fn transmit_timed<E: core::fmt::Debug>(
+        &self,
+        can: &mut impl AsyncCan<Error = E>,
+        frame: &CanFrame,
+        deadline: TransferDeadline,
+        clock: &impl Clock,
+    ) -> Result<(), SdoError<E>> {
+        use core::future::Future;
+        use core::task::Poll;
+
+        let remaining = deadline.remaining(clock.now_us());
+        if remaining == 0 {
+            return Err(SdoError::Timeout);
+        }
+        #[cfg(feature = "embassy")]
+        let mut timer = core::pin::pin!(embassy_time::Timer::after(
+            embassy_time::Duration::from_micros(remaining)
+        ));
+        let mut transmit = core::pin::pin!(can.transmit(frame));
+        core::future::poll_fn(|cx| {
+            if deadline.remaining(clock.now_us()) == 0 {
+                return Poll::Ready(Err(SdoError::Timeout));
+            }
+            if let Poll::Ready(result) = transmit.as_mut().poll(cx) {
+                return Poll::Ready(result.map_err(SdoError::Transport));
+            }
+            #[cfg(feature = "embassy")]
+            if timer.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(SdoError::Timeout));
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     /// Receive a frame, filtering for this node's SDO response COB-ID.
@@ -417,14 +507,14 @@ impl SdoDriver {
     async fn receive_response_timed<E: core::fmt::Debug>(
         &self,
         can: &mut impl AsyncCan<Error = E>,
-        deadline: u64,
+        deadline: TransferDeadline,
         clock: &impl Clock,
     ) -> Result<CanFrame, SdoError<E>> {
         use core::future::Future;
         use core::task::Poll;
 
         loop {
-            let remaining = deadline.saturating_sub(clock.now_us());
+            let remaining = deadline.remaining(clock.now_us());
             if remaining == 0 {
                 return Err(SdoError::Timeout);
             }
@@ -434,7 +524,7 @@ impl SdoDriver {
             ));
             let mut receive = core::pin::pin!(can.receive());
             let frame = core::future::poll_fn(|cx| {
-                if clock.now_us() >= deadline {
+                if deadline.remaining(clock.now_us()) == 0 {
                     return Poll::Ready(Err(SdoError::Timeout));
                 }
                 if let Poll::Ready(result) = receive.as_mut().poll(cx) {

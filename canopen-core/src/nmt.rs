@@ -122,6 +122,7 @@ impl NmtHandler {
     /// Process an incoming NMT command (from COB-ID 0x000).
     /// `target` is the node ID byte from the NMT frame (0 = all nodes).
     /// Returns the type of transition that occurred.
+    /// During Initializing, commands are ignored until `boot_complete()`.
     pub fn process_command(
         &mut self,
         cmd: NmtCommand,
@@ -130,6 +131,17 @@ impl NmtHandler {
     ) -> NmtTransition {
         if target != 0 && target != our_node.raw() {
             return NmtTransition::None;
+        }
+        // Initialization ends through boot_complete(), not an external state
+        // command. In particular, Start queued behind Reset cannot admit PDO
+        // or SDO traffic before communication initialization has completed.
+        // A Reset Node arriving behind a Reset Communication still escalates,
+        // so the application reset is not lost; a repeated reset is redundant.
+        if self.state == NmtState::Initializing {
+            return match cmd {
+                NmtCommand::ResetNode => NmtTransition::ResetApplication,
+                _ => NmtTransition::None,
+            };
         }
         let new_state = match cmd {
             NmtCommand::StartRemoteNode => NmtState::Operational,
@@ -200,6 +212,42 @@ mod tests {
         assert_eq!(
             nmt.process_command(NmtCommand::ResetCommunication, 0, node),
             NmtTransition::ResetCommunication
+        );
+        assert_eq!(nmt.state(), NmtState::Initializing);
+    }
+
+    #[test]
+    fn initialization_requires_boot_complete_before_state_commands() {
+        let node = NodeId::new(1).unwrap();
+        for command in [
+            NmtCommand::StartRemoteNode,
+            NmtCommand::StopRemoteNode,
+            NmtCommand::EnterPreOperational,
+        ] {
+            let mut nmt = NmtHandler::new();
+            assert_eq!(nmt.process_command(command, 0, node), NmtTransition::None);
+            assert_eq!(nmt.state(), NmtState::Initializing);
+            nmt.boot_complete();
+            assert_eq!(nmt.state(), NmtState::PreOperational);
+        }
+    }
+
+    #[test]
+    fn reset_node_escalates_a_pending_communication_reset() {
+        let node = NodeId::new(1).unwrap();
+        let mut nmt = NmtHandler::new();
+        nmt.boot_complete();
+        assert_eq!(
+            nmt.process_command(NmtCommand::ResetCommunication, 0, node),
+            NmtTransition::ResetCommunication
+        );
+        assert_eq!(
+            nmt.process_command(NmtCommand::ResetCommunication, 0, node),
+            NmtTransition::None
+        );
+        assert_eq!(
+            nmt.process_command(NmtCommand::ResetNode, 0, node),
+            NmtTransition::ResetApplication
         );
         assert_eq!(nmt.state(), NmtState::Initializing);
     }

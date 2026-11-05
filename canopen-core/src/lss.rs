@@ -1,15 +1,20 @@
 //! Layer Setting Services (LSS) slave implementation.
 //!
 //! LSS allows an LSS master to discover and configure unconfigured nodes
-//! on the bus. The slave responds on COB-ID 0x7E4 (LSS request) and
-//! sends responses on 0x7E5 (LSS response).
+//! on the bus. The slave receives requests on COB-ID 0x7E5 and
+//! sends responses on COB-ID 0x7E4.
 //!
 //! Supported services:
 //! - Switch Mode Global (waiting ↔ configuration)
 //! - Switch Mode Selective (by identity: vendor/product/revision/serial)
 //! - Configure Node ID
-//! - Store Configuration (signals the application via callback)
+//! - Store Configuration (signals the application via a pending event)
 //! - Identity inquiry (vendor, product, revision, serial, node ID)
+//!
+//! This is a protocol state machine, not a complete commissioning workflow.
+//! Store Configuration acknowledges a request and exposes an event; it does
+//! not verify persistence. The integrated `Node` currently does not expose
+//! these events or apply a configured ID to its other protocol objects.
 
 use crate::transport::CanFrame;
 
@@ -98,6 +103,8 @@ impl LssSlave {
 
     /// Process an incoming LSS request frame (COB-ID 0x7E5).
     /// Returns a response frame to send on 0x7E4, if any.
+    /// Selective switching is serviced only in Waiting mode; once selected,
+    /// the slave ignores further selection requests until switched back.
     pub fn process(&mut self, frame: &CanFrame) -> Option<CanFrame> {
         if frame.raw_id() != LSS_REQUEST_COB || frame.raw_dlc() < 8 {
             return None;
@@ -122,27 +129,28 @@ impl LssSlave {
                 None // no response for global switch
             }
 
-            cs::SWITCH_VENDOR => {
+            cs::SWITCH_VENDOR if self.mode == LssMode::Waiting => {
                 let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
                 self.selective_match[0] = val == self.identity.vendor_id;
                 None
             }
-            cs::SWITCH_PRODUCT => {
+            cs::SWITCH_PRODUCT if self.mode == LssMode::Waiting => {
                 let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
                 self.selective_match[1] = val == self.identity.product_code;
                 None
             }
-            cs::SWITCH_REVISION => {
+            cs::SWITCH_REVISION if self.mode == LssMode::Waiting => {
                 let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
                 self.selective_match[2] = val == self.identity.revision;
                 None
             }
-            cs::SWITCH_SERIAL => {
+            cs::SWITCH_SERIAL if self.mode == LssMode::Waiting => {
                 let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
                 self.selective_match[3] = val == self.identity.serial;
                 // Check if all four match
                 if self.selective_match.iter().all(|&m| m) {
                     self.mode = LssMode::Configuration;
+                    self.selective_match = [false; 4];
                     // Respond with switch state response (0x44)
                     let mut resp = [0u8; 8];
                     resp[0] = 0x44;
@@ -222,6 +230,61 @@ impl LssSlave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selective_request(command: u8, value: u32) -> CanFrame {
+        let mut data = [0; 8];
+        data[0] = command;
+        data[1..5].copy_from_slice(&value.to_le_bytes());
+        CanFrame::new(LSS_REQUEST_COB, &data).unwrap()
+    }
+
+    fn select(lss: &mut LssSlave) -> Option<CanFrame> {
+        let identity = test_identity();
+        for (command, value) in [
+            (cs::SWITCH_VENDOR, identity.vendor_id),
+            (cs::SWITCH_PRODUCT, identity.product_code),
+            (cs::SWITCH_REVISION, identity.revision),
+        ] {
+            assert!(lss.process(&selective_request(command, value)).is_none());
+        }
+        lss.process(&selective_request(cs::SWITCH_SERIAL, identity.serial))
+    }
+
+    #[test]
+    fn selected_slave_does_not_reply_to_repeated_selection_tail() {
+        let mut lss = LssSlave::new(test_identity(), 1);
+        let reply = select(&mut lss).unwrap();
+        assert_eq!(reply.raw_id(), LSS_RESPONSE_COB);
+        assert_eq!(reply.data(), &[0x44, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(lss
+            .process(&selective_request(
+                cs::SWITCH_SERIAL,
+                test_identity().serial
+            ))
+            .is_none());
+        assert_eq!(lss.mode(), LssMode::Configuration);
+        assert!(lss.take_event().is_none());
+    }
+
+    #[test]
+    fn global_configuration_ignores_selective_switch_until_return_to_waiting() {
+        let mut lss = LssSlave::new(test_identity(), 1);
+        let global = |mode| CanFrame::new(LSS_REQUEST_COB, &[4, mode, 0, 0, 0, 0, 0, 0]).unwrap();
+        lss.process(&global(1));
+        assert!(select(&mut lss).is_none());
+        assert_eq!(lss.mode(), LssMode::Configuration);
+
+        lss.process(&global(0));
+        // Selection attempts from Configuration cannot seed the next exchange.
+        assert!(lss
+            .process(&selective_request(
+                cs::SWITCH_SERIAL,
+                test_identity().serial
+            ))
+            .is_none());
+        assert_eq!(lss.mode(), LssMode::Waiting);
+        assert!(select(&mut lss).is_some());
+    }
 
     fn test_identity() -> LssIdentity {
         LssIdentity {

@@ -45,23 +45,36 @@ impl UnixSerialPort {
                 std::io::Error::last_os_error()
             ));
         }
+        // Own the descriptor before any fallible setup, so errors close it.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let setup_error = |step| {
+            format!(
+                "Failed to {step} for {path}: {}",
+                std::io::Error::last_os_error()
+            )
+        };
 
         // Configure terminal: raw, 115200, no hupcl
         unsafe {
             let mut tio: libc::termios = std::mem::zeroed();
-            libc::tcgetattr(fd, &mut tio);
+            if libc::tcgetattr(fd, &mut tio) != 0 {
+                return Err(setup_error("read terminal settings"));
+            }
             libc::cfmakeraw(&mut tio);
             tio.c_cflag &= !libc::HUPCL;
-            libc::cfsetispeed(&mut tio, libc::B115200);
-            libc::cfsetospeed(&mut tio, libc::B115200);
+            if libc::cfsetispeed(&mut tio, libc::B115200) != 0
+                || libc::cfsetospeed(&mut tio, libc::B115200) != 0
+            {
+                return Err(setup_error("set terminal speed"));
+            }
             tio.c_cc[libc::VMIN] = 0;
             tio.c_cc[libc::VTIME] = 0;
-            libc::tcsetattr(fd, libc::TCSANOW, &tio);
+            if libc::tcsetattr(fd, libc::TCSANOW, &tio) != 0 {
+                return Err(setup_error("apply terminal settings"));
+            }
         }
 
-        Ok(Self {
-            file: unsafe { std::fs::File::from_raw_fd(fd) },
-        })
+        Ok(Self { file })
     }
 
     /// Assert DTR and RTS. On USB CDC-ACM devices this activates the port
@@ -150,4 +163,48 @@ pub fn open(path: &str, bitrate: SlcanBitrate) -> Result<SlcanTransport, String>
 /// Open without sending any SLCAN commands.
 pub fn open_raw(path: &str) -> Result<SlcanTransport, String> {
     Ok(SlcanTransport::new(UnixSerialPort::open(path)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    #[test]
+    fn serial_open_configures_a_pseudoterminal() {
+        let (mut master, mut slave) = (-1, -1);
+        let mut name = [0 as libc::c_char; 128];
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    name.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let _master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_str()
+            .unwrap();
+        let port = UnixSerialPort::open(path).unwrap();
+        let mut settings = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut settings) },
+            0
+        );
+        assert_eq!(settings.c_lflag & (libc::ICANON | libc::ECHO), 0);
+        assert_eq!(settings.c_cflag & libc::HUPCL, 0);
+        assert_eq!(settings.c_cc[libc::VMIN], 0);
+        assert_eq!(settings.c_cc[libc::VTIME], 0);
+        assert_eq!(unsafe { libc::cfgetispeed(&settings) }, libc::B115200);
+        assert_eq!(unsafe { libc::cfgetospeed(&settings) }, libc::B115200);
+        assert!(
+            unsafe { libc::fcntl(port.file.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK != 0
+        );
+    }
 }

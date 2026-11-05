@@ -164,9 +164,9 @@ pub fn encode_sdo_abort(index: u16, subindex: u8, code: SdoAbort) -> [u8; 8] {
     data
 }
 
-/// Encode an initiate upload response (expedited, ≤4 bytes).
+/// Encode an initiate upload response (expedited, 1–4 bytes).
 pub fn encode_upload_response_expedited(index: u16, subindex: u8, value: &[u8]) -> Option<[u8; 8]> {
-    if value.len() > 4 {
+    if value.is_empty() || value.len() > 4 {
         return None;
     }
     let n = 4 - value.len();
@@ -192,16 +192,20 @@ pub fn encode_upload_response_segmented(index: u16, subindex: u8, total_size: u3
     data
 }
 
-/// Encode an upload segment response.
-pub fn encode_upload_segment_response(toggle: bool, segment_data: &[u8], last: bool) -> [u8; 8] {
-    let n = 7 - segment_data.len();
+/// Encode an upload segment response, or return None for more than 7 bytes.
+pub fn encode_upload_segment_response(
+    toggle: bool,
+    segment_data: &[u8],
+    last: bool,
+) -> Option<[u8; 8]> {
+    let n = 7usize.checked_sub(segment_data.len())?;
     let mut data = [0u8; 8];
     data[0] = (Scs::UploadSegmentResponse as u8) << 5
         | if toggle { 0x10 } else { 0 }
         | (n as u8) << 1
         | if last { 0x01 } else { 0 };
     data[1..1 + segment_data.len()].copy_from_slice(segment_data);
-    data
+    Some(data)
 }
 
 /// Encode an initiate download response.

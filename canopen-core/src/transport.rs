@@ -147,7 +147,7 @@ impl<const TX: usize, const RX: usize> embedded_can::nb::Can for MailboxTranspor
                 .borrow(cs)
                 .borrow_mut()
                 .push_back(*frame)
-                .map_err(|_| nb::Error::Other(CanError::TxBufferFull))
+                .map_err(|_| nb::Error::WouldBlock)
         })?;
         Ok(None)
     }

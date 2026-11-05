@@ -322,6 +322,39 @@ impl<const N: usize> RpdoConfig<N> {
     }
 }
 
+/// Validate the object eligibility of a dynamic mapping at activation.
+/// Existing dummy/partial-width handling is deliberately not redefined here.
+#[doc(hidden)]
+pub fn validate_mapping_target(
+    od: &impl ObjectDictionary,
+    descriptor: u32,
+    receive: bool,
+) -> Result<(), crate::od::OdError> {
+    let index = (descriptor >> 16) as u16;
+    if is_dummy_mapping_index(index) {
+        return Ok(());
+    }
+    let meta = od.lookup(index, (descriptor >> 8) as u8);
+    let eligible = meta.is_some_and(|meta| {
+        meta.pdo_mappable
+            && if receive {
+                matches!(
+                    meta.access,
+                    crate::od::AccessType::Wo | crate::od::AccessType::Rw
+                )
+            } else {
+                !matches!(meta.access, crate::od::AccessType::Wo)
+            }
+    });
+    if eligible {
+        Ok(())
+    } else {
+        Err(crate::od::OdError::Abort(
+            crate::sdo::AbortCode::ObjectCannotBeMapped.into(),
+        ))
+    }
+}
+
 /// TPDO engine. Manages up to N transmit PDOs.
 pub struct TpdoEngine<const N: usize = 4> {
     pdos: [TpdoConfig; N],
@@ -536,6 +569,18 @@ impl<const N: usize> TpdoEngine<N> {
         dirty: &Vec<(u16, u8), DIRTY>,
         out: &mut Vec<CanFrame, N>,
     ) {
+        self.poll_with(od, now_us, dirty, |frame| out.push(*frame).is_ok());
+    }
+
+    /// Node's immediate transmit path: retain the trigger and timing state
+    /// until the transport accepts the latest process image.
+    pub(crate) fn poll_with<OD: ObjectDictionary, const DIRTY: usize>(
+        &mut self,
+        od: &OD,
+        now_us: u64,
+        dirty: &Vec<(u16, u8), DIRTY>,
+        mut accept: impl FnMut(&CanFrame) -> bool,
+    ) {
         for i in 0..N {
             if !self.pdos[i].enabled {
                 continue;
@@ -555,16 +600,16 @@ impl<const N: usize> TpdoEngine<N> {
                 self.async_event_pending[i] = true;
             }
 
-            // Send on dirty trigger (respecting inhibit time) or event timer
+            // Both application and event-timer triggers respect inhibit time.
             let timer_trigger = self.pdos[i].event_timer_ms > 0 && {
                 let interval_us = self.pdos[i].event_timer_ms as u64 * 1000;
                 elapsed >= interval_us
             };
 
-            let application_trigger = self.async_event_pending[i] && elapsed >= inhibit_us;
-            if application_trigger || timer_trigger {
+            let application_trigger = self.async_event_pending[i];
+            if (application_trigger || timer_trigger) && elapsed >= inhibit_us {
                 if let Some(frame) = self.build_pdo_frame(i, od) {
-                    if out.push(frame).is_ok() {
+                    if accept(&frame) {
                         self.last_send_us[i] = now_us;
                         // A timer transmission carries the same latest process
                         // image and therefore also satisfies a pending event.

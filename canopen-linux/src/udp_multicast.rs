@@ -33,6 +33,30 @@ struct WireMessage {
     channel: Option<String>,
 }
 
+/// Outcome of decoding one datagram.
+#[derive(Debug)]
+enum Decoded {
+    Frame(CanFrame),
+    /// Valid python-can message without CANopen meaning (extended, RTR,
+    /// error or FD frame).
+    Ignored,
+    /// Inconsistent metadata or undecodable payload.
+    Malformed,
+}
+
+fn decode_message(msg: WireMessage) -> Decoded {
+    if msg.is_extended_id || msg.is_error_frame || msg.is_remote_frame || msg.is_fd {
+        return Decoded::Ignored;
+    }
+    if msg.arbitration_id > 0x7ff || msg.dlc as usize != msg.data.len() {
+        return Decoded::Malformed;
+    }
+    match CanFrame::new(msg.arbitration_id as u16, &msg.data) {
+        Some(frame) => Decoded::Frame(frame),
+        None => Decoded::Malformed,
+    }
+}
+
 /// UDP multicast CAN transport.
 ///
 /// Compatible with python-can's `udp_multicast` interface. Create with:
@@ -43,9 +67,19 @@ pub struct UdpMulticastTransport {
     socket: UdpSocket,
     dest: SocketAddr,
     buf: [u8; 1024],
+    malformed: u64,
 }
 
 impl UdpMulticastTransport {
+    /// Number of received datagrams skipped because they could not be decoded
+    /// as a classic CAN frame (bad msgpack, ID > 0x7FF, DLC/data mismatch).
+    ///
+    /// Any process can send to the multicast group, so such datagrams are
+    /// counted and skipped rather than reported as a transport failure.
+    pub fn malformed_count(&self) -> u64 {
+        self.malformed
+    }
+
     /// Create a new transport, joining the multicast group.
     ///
     /// - `addr`: multicast IPv4 address (default: 239.74.163.2)
@@ -89,6 +123,7 @@ impl UdpMulticastTransport {
             socket,
             dest,
             buf: [0u8; 1024],
+            malformed: 0,
         })
     }
 }
@@ -117,26 +152,77 @@ impl embedded_can::nb::Can for UdpMulticastTransport {
 
         self.socket
             .send_to(&encoded, self.dest)
-            .map_err(|_| nb::Error::Other(CanError::BusError))?;
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::WouldBlock => nb::Error::WouldBlock,
+                _ => nb::Error::Other(CanError::BusError),
+            })?;
 
         Ok(None)
     }
 
     fn receive(&mut self) -> nb::Result<Self::Frame, Self::Error> {
-        match self.socket.recv_from(&mut self.buf) {
-            Ok((len, _src)) => {
-                let msg: WireMessage = rmp_serde::from_slice(&self.buf[..len])
-                    .map_err(|_| nb::Error::Other(CanError::BusError))?;
-
-                if msg.is_extended_id || msg.is_error_frame || msg.is_remote_frame {
-                    return Err(nb::Error::WouldBlock);
+        loop {
+            match self.socket.recv_from(&mut self.buf) {
+                Ok((len, _src)) => {
+                    let decoded = match rmp_serde::from_slice::<WireMessage>(&self.buf[..len]) {
+                        Ok(msg) => decode_message(msg),
+                        Err(_) => Decoded::Malformed,
+                    };
+                    match decoded {
+                        Decoded::Frame(frame) => return Ok(frame),
+                        Decoded::Ignored => {}
+                        Decoded::Malformed => self.malformed = self.malformed.saturating_add(1),
+                    }
                 }
-
-                let id = (msg.arbitration_id & 0x7FF) as u16;
-                CanFrame::new(id, &msg.data).ok_or(nb::Error::Other(CanError::BusError))
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(nb::Error::WouldBlock)
+                }
+                Err(_) => return Err(nb::Error::Other(CanError::BusError)),
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Err(nb::Error::WouldBlock),
-            Err(_) => Err(nb::Error::Other(CanError::BusError)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message() -> WireMessage {
+        WireMessage {
+            timestamp: 0.0,
+            arbitration_id: 0x201,
+            is_extended_id: false,
+            is_remote_frame: false,
+            is_error_frame: false,
+            data: vec![42],
+            dlc: 1,
+            is_fd: false,
+            bitrate_switch: false,
+            error_state_indicator: false,
+            channel: None,
+        }
+    }
+
+    #[test]
+    fn wire_metadata_cannot_alias_a_classic_command() {
+        assert!(matches!(decode_message(message()), Decoded::Frame(f) if f.data() == [42]));
+        for variant in 0..7 {
+            let mut msg = message();
+            match variant {
+                0 => msg.arbitration_id = 0x1201,
+                1 => msg.arbitration_id = u32::MAX,
+                2 => msg.dlc = 0,
+                3 => msg.is_fd = true,
+                4 => msg.is_extended_id = true,
+                5 => msg.is_remote_frame = true,
+                _ => msg.is_error_frame = true,
+            }
+            let expected_malformed = variant < 3;
+            match decode_message(msg) {
+                Decoded::Malformed => assert!(expected_malformed, "variant {variant}"),
+                Decoded::Ignored => assert!(!expected_malformed, "variant {variant}"),
+                Decoded::Frame(_) => panic!("variant {variant} decoded as a frame"),
+            }
         }
     }
 }

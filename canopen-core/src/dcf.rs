@@ -9,7 +9,7 @@
 //!
 //! ```ignore
 //! let dcf = Dcf::parse(include_str!("config.dcf"))?;
-//! dcf.apply(&mut od)?;
+//! let written = dcf.apply(&mut od); // count; failed writes are skipped
 //! ```
 
 use alloc::string::{String, ToString};
@@ -30,9 +30,9 @@ pub struct DcfEntry {
 /// Parsed DCF/EDS configuration.
 #[derive(Debug, Clone)]
 pub struct Dcf {
-    /// Node ID from [DeviceComissioning], if present.
+    /// Node ID from `[DeviceComissioning]`, if present.
     pub node_id: Option<u8>,
-    /// Baud rate index from [DeviceComissioning], if present.
+    /// Baud rate index from `[DeviceComissioning]`, if present.
     pub baud_rate: Option<u32>,
     /// Configured entries (index, subindex, serialized value).
     pub entries: Vec<DcfEntry>,
@@ -81,11 +81,21 @@ impl Dcf {
         // Read DeviceComissioning (DCF-specific)
         let node_id = find_section(&sections, "DeviceComissioning")
             .and_then(|props| get_prop(props, "NodeID"))
-            .and_then(|v| parse_int_val(&v).map(|n| n as u8));
+            .map(|v| {
+                parse_int_val(&v)
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or_else(|| DcfError::ParseError(alloc::format!("Invalid NodeID: {v}")))
+            })
+            .transpose()?;
 
         let baud_rate = find_section(&sections, "DeviceComissioning")
             .and_then(|props| get_prop(props, "BaudRate"))
-            .and_then(|v| parse_int_val(&v).map(|n| n as u32));
+            .map(|v| {
+                parse_int_val(&v)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| DcfError::ParseError(alloc::format!("Invalid BaudRate: {v}")))
+            })
+            .transpose()?;
 
         let mut entries = Vec::new();
 
@@ -127,15 +137,19 @@ impl Dcf {
             }
 
             // Serialize the value to bytes based on data type
-            if let Some(data) = serialize_value(trimmed, data_type as u16) {
-                let name = get_prop(props, "ParameterName").unwrap_or_default();
-                entries.push(DcfEntry {
-                    index,
-                    subindex: sub,
-                    data,
-                    name,
-                });
-            }
+            let data = u16::try_from(data_type)
+                .ok()
+                .and_then(|ty| serialize_value(trimmed, ty))
+                .ok_or_else(|| DcfError::ParseError(alloc::format!(
+                    "Invalid or unsupported value at 0x{index:04X}:{sub:02X}: {trimmed} (type 0x{data_type:X})"
+                )))?;
+            let name = get_prop(props, "ParameterName").unwrap_or_default();
+            entries.push(DcfEntry {
+                index,
+                subindex: sub,
+                data,
+                name,
+            });
         }
 
         Ok(Dcf {
@@ -160,6 +174,7 @@ impl Dcf {
     }
 
     /// Apply configured values to a local ObjectDictionary, failing on first error.
+    /// Earlier successful writes are not rolled back.
     pub fn apply_strict<OD: ObjectDictionary>(&self, od: &mut OD) -> Result<usize, DcfError> {
         let mut count = 0;
         for entry in &self.entries {
@@ -176,7 +191,8 @@ impl Dcf {
 
     /// Write configured values to a remote node via SDO.
     ///
-    /// Skips entries that fail. Returns the count of entries successfully written.
+    /// Stops on the first error. Earlier successful writes are not rolled back.
+    /// Returns the count of entries successfully written when all writes succeed.
     pub async fn apply_remote<E: core::fmt::Debug>(
         &self,
         driver: &SdoDriver,
@@ -269,6 +285,27 @@ fn is_pdo_index(index: u16) -> bool {
     matches!(index, 0x1400..=0x15FF | 0x1600..=0x17FF | 0x1800..=0x19FF | 0x1A00..=0x1BFF)
 }
 
+/// Signed decimal values use their numeric range; hexadecimal values may
+/// express the full two's-complement wire bit pattern of a signed type.
+fn serialize_integer(value: &str, bits: u32, signed: bool) -> Option<Vec<u8>> {
+    let raw = if signed && value.starts_with('-') {
+        let n = value.parse::<i64>().ok()?;
+        if (n as i128) < -(1i128 << (bits - 1)) {
+            return None;
+        }
+        n as u64
+    } else {
+        let n = parse_int_val(value)?;
+        let hex = value.starts_with("0x") || value.starts_with("0X");
+        let limit_bits = if signed && !hex { bits - 1 } else { bits };
+        if limit_bits < 64 && n >= (1u64 << limit_bits) {
+            return None;
+        }
+        n
+    };
+    Some(raw.to_le_bytes()[..(bits / 8) as usize].to_vec())
+}
+
 /// Serialize a text value to LE bytes based on CiA 301 data type code.
 fn serialize_value(value: &str, data_type: u16) -> Option<Vec<u8>> {
     let v = value.trim().trim_matches('"');
@@ -276,19 +313,24 @@ fn serialize_value(value: &str, data_type: u16) -> Option<Vec<u8>> {
         // Boolean
         0x0001 => {
             let b = match v {
-                "0" | "false" => 0u8,
-                _ => 1u8,
+                "false" => 0u8,
+                "true" => 1u8,
+                _ => match parse_int_val(v)? {
+                    0 => 0,
+                    1 => 1,
+                    _ => return None,
+                },
             };
             Some(alloc::vec![b])
         }
-        // Integer8 / Unsigned8
-        0x0002 | 0x0005 => parse_int_val(v).map(|n| alloc::vec![n as u8]),
-        // Integer16 / Unsigned16
-        0x0003 | 0x0006 => parse_int_val(v).map(|n| (n as u16).to_le_bytes().to_vec()),
-        // Integer24 / Unsigned24 (3 bytes on the wire)
-        0x0010 | 0x0016 => parse_int_val(v).map(|n| (n as u32).to_le_bytes()[..3].to_vec()),
-        // Integer32 / Unsigned32
-        0x0004 | 0x0007 => parse_int_val(v).map(|n| (n as u32).to_le_bytes().to_vec()),
+        0x0002 => serialize_integer(v, 8, true),
+        0x0005 => serialize_integer(v, 8, false),
+        0x0003 => serialize_integer(v, 16, true),
+        0x0006 => serialize_integer(v, 16, false),
+        0x0010 => serialize_integer(v, 24, true),
+        0x0016 => serialize_integer(v, 24, false),
+        0x0004 => serialize_integer(v, 32, true),
+        0x0007 => serialize_integer(v, 32, false),
         // Real32
         0x0008 => {
             if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
@@ -307,9 +349,12 @@ fn serialize_value(value: &str, data_type: u16) -> Option<Vec<u8>> {
         0x000A | 0x000F => {
             // Try hex, otherwise raw bytes
             if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                if !hex.is_ascii() || hex.len() % 2 != 0 {
+                    return None;
+                }
                 let bytes: Option<Vec<u8>> = (0..hex.len())
                     .step_by(2)
-                    .map(|i| u8::from_str_radix(&hex[i..i + 2.min(hex.len() - i)], 16).ok())
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
                     .collect();
                 bytes
             } else {
@@ -326,8 +371,8 @@ fn serialize_value(value: &str, data_type: u16) -> Option<Vec<u8>> {
                 v.parse::<f64>().ok().map(|f| f.to_le_bytes().to_vec())
             }
         }
-        // Integer64 / Unsigned64
-        0x0015 | 0x001B => parse_int_val(v).map(|n| n.to_le_bytes().to_vec()),
+        0x0015 => serialize_integer(v, 64, true),
+        0x001B => serialize_integer(v, 64, false),
         _ => None,
     }
 }
@@ -556,9 +601,9 @@ ParameterValue=0x000F
 
     #[test]
     fn serialize_float_decimal() {
-        let data = serialize_value("3.14", 0x0008).unwrap();
-        let f = f32::from_le_bytes(data[..4].try_into().unwrap());
-        assert!((f - 3.14).abs() < 0.01);
+        // An exactly representable decimal avoids a tolerance hiding parser errors.
+        let data = serialize_value("1.25", 0x0008).unwrap();
+        assert_eq!(data.as_slice(), &1.25f32.to_le_bytes());
     }
 
     #[test]

@@ -840,6 +840,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     let mut total_bits = 0usize;
                     let mut j = 0usize;
                     while j < data[0] as usize {
+                        canopen_core::pdo::engine::validate_mapping_target(self, self.tpdo_mappings[#n][j], false)?;
                         total_bits += (self.tpdo_mappings[#n][j] & 0xFF) as usize;
                         j += 1;
                     }
@@ -982,6 +983,7 @@ pub fn generate(od: OdDefinition) -> TokenStream {
                     let mut total_bits = 0usize;
                     let mut j = 0usize;
                     while j < data[0] as usize {
+                        canopen_core::pdo::engine::validate_mapping_target(self, self.rpdo_mappings[#n][j], true)?;
                         total_bits += (self.rpdo_mappings[#n][j] & 0xFF) as usize;
                         j += 1;
                     }
@@ -1674,6 +1676,18 @@ pub fn generate(od: OdDefinition) -> TokenStream {
             }
 
             fn read(&self, index: u16, subindex: u8, buf: &mut [u8]) -> Result<usize, canopen_core::od::OdError> {
+                // Fixed-width arms (including generated communication objects)
+                // must not index a caller's undersized output slice. The common
+                // SDO/PDO read buffers are >=8 bytes and skip this lookup.
+                if buf.len() < 8 {
+                    if let Some(meta) = self.lookup(index, subindex) {
+                        if meta.access != canopen_core::od::AccessType::Wo
+                            && meta.data_type.size().is_some_and(|size| size > buf.len())
+                        {
+                            return Err(canopen_core::od::OdError::ValueTooLong);
+                        }
+                    }
+                }
                 match (index, subindex) {
                     #(#read_arms)*
                     #(#array_read_arms)*

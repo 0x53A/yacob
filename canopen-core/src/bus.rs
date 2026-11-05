@@ -50,12 +50,14 @@ impl WakerSet {
         }
     }
 
+    fn take(&self) -> Vec<Waker> {
+        std::mem::take(&mut *self.wakers.lock().expect("waker set poisoned"))
+    }
+
     fn wake_all(&self) {
         // Take the wakers out first — waking while holding the lock could
         // re-enter register() from an executor that polls inline.
-        let wakers: Vec<Waker> =
-            std::mem::take(&mut *self.wakers.lock().expect("waker set poisoned"));
-        for w in wakers {
+        for w in self.take() {
             w.wake();
         }
     }
@@ -64,6 +66,9 @@ impl WakerSet {
 /// Publish-side frame filter. Runs under the publish path against a
 /// reference; the frame is copied into the subscription queue only when the
 /// filter returns `true`.
+/// Filters currently run under the subscriber-list lock: they must not call
+/// back into this bus. Subscriber wakeups, in contrast, run after unlocking.
+/// Filters must not panic: unwinding poisons the subscriber-list lock.
 pub type FrameFilter = Box<dyn Fn(&CanFrame) -> bool + Send + Sync>;
 
 /// What to do when a subscription queue is full.
@@ -88,7 +93,7 @@ struct SubscriptionShared {
 }
 
 impl SubscriptionShared {
-    fn push(&self, frame: CanFrame) {
+    fn push(&self, frame: CanFrame) -> Vec<Waker> {
         let mut queue = self.queue.lock().expect("subscription queue poisoned");
         if queue.len() >= self.capacity {
             self.overflow.fetch_add(1, Ordering::Relaxed);
@@ -96,13 +101,13 @@ impl SubscriptionShared {
                 OverflowPolicy::DropOldest => {
                     queue.pop_front();
                 }
-                OverflowPolicy::DropNewest => return,
+                OverflowPolicy::DropNewest => return Vec::new(),
             }
         }
         queue.push_back(frame);
         self.ready.notify_one();
         drop(queue);
-        self.rx_wakers.wake_all();
+        self.rx_wakers.take()
     }
 }
 
@@ -158,16 +163,24 @@ impl SharedCanBus {
     /// Publish a frame to every live subscriber whose filter accepts it.
     /// Dropped subscriptions are pruned as a side effect.
     pub fn publish(&self, frame: &CanFrame) {
+        let mut wake = Vec::new();
         let mut subs = self.subs.lock().expect("bus subscriber list poisoned");
         subs.retain(|weak| {
             let Some(sub) = weak.upgrade() else {
                 return false;
             };
             if sub.filter.as_ref().is_none_or(|f| f(frame)) {
-                sub.push(*frame);
+                wake.extend(sub.push(*frame));
             }
             true
         });
+        // Finish fanout before running arbitrary executor code. Inline
+        // wakeups may subscribe or publish again; neither may run under the
+        // subscriber-list lock or overtake this frame at later subscribers.
+        drop(subs);
+        for waker in wake {
+            waker.wake();
+        }
     }
 
     /// Number of live subscriptions (prunes dead ones).
@@ -319,6 +332,9 @@ impl TxQueue {
     }
 
     /// Enqueue a frame, blocking while the queue is full.
+    ///
+    /// This queue has no close signal: if its consumer stops while it is full,
+    /// this call can block forever. Success means queued, not transmitted.
     pub fn send(&self, frame: &CanFrame) {
         let mut queue = self.shared.queue.lock().expect("tx queue poisoned");
         while queue.len() >= self.shared.capacity {
@@ -346,6 +362,9 @@ impl TxQueue {
     /// this is safe on multitasking runtimes — no polling, no spinning.
     /// Multiple tasks may wait for space (the queue is `Clone`); each freed
     /// slot goes to exactly one of them (no fairness guarantee).
+    /// Like `send`, this can wait forever if the consumer stops; completion
+    /// means queued, not transmitted. Cancelling a completed send cannot retract
+    /// the frame, including after the pump has popped it.
     pub async fn send_async(&self, frame: &CanFrame) {
         core::future::poll_fn(|cx| {
             if self.try_send(frame) {
@@ -503,6 +522,32 @@ mod tests {
     use super::*;
     use crate::cobid::{CobId, NodeId};
 
+    #[test]
+    fn subscriber_waker_can_reenter_bus_after_complete_fanout() {
+        struct PublishAgain(SharedCanBus);
+        impl std::task::Wake for PublishAgain {
+            fn wake(self: Arc<Self>) {
+                // Fail rather than deadlock on the old implementation.
+                assert!(
+                    self.0.subs.try_lock().is_ok(),
+                    "wake held subscriber-list lock"
+                );
+                assert_eq!(self.0.subscriber_count(), 2);
+                self.0.publish(&frame(0x182));
+            }
+        }
+        let bus = SharedCanBus::new();
+        let a = bus.subscribe(4);
+        let b = bus.subscribe(4);
+        let waker = Waker::from(Arc::new(PublishAgain(bus.clone())));
+        a.shared.rx_wakers.register(&waker);
+        bus.publish(&frame(0x181));
+        for sub in [&a, &b] {
+            assert_eq!(sub.try_recv().unwrap().raw_id(), 0x181);
+            assert_eq!(sub.try_recv().unwrap().raw_id(), 0x182);
+            assert!(sub.is_empty());
+        }
+    }
     fn frame(id: u16) -> CanFrame {
         CanFrame::new(id, &[0xAA]).unwrap()
     }

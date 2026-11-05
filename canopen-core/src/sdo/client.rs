@@ -60,6 +60,10 @@ pub struct SdoClient<const BUF: usize = 256> {
     buf: [u8; BUF],
     offset: usize,
     total_len: usize,
+    upload_len: Option<usize>,
+    /// Whether the last completed upload stated its size. CiA 301 allows an
+    /// expedited reply without size (then all four bytes are delivered).
+    upload_size_indicated: bool,
 }
 
 impl<const BUF: usize> SdoClient<BUF> {
@@ -70,12 +74,23 @@ impl<const BUF: usize> SdoClient<BUF> {
             buf: [0; BUF],
             offset: 0,
             total_len: 0,
+            upload_len: None,
+            upload_size_indicated: false,
         }
     }
 
     /// Access the data buffer after an UploadComplete.
     pub fn data(&self) -> &[u8] {
         &self.buf[..self.offset]
+    }
+
+    /// After an UploadComplete: did the server state the transfer size?
+    ///
+    /// `false` means an expedited reply without size indication, whose
+    /// [`data`](Self::data) is all four payload bytes; the real object may
+    /// be shorter.
+    pub fn upload_size_indicated(&self) -> bool {
+        self.upload_size_indicated
     }
 
     /// The COB-ID for SDO requests to this node (client→server).
@@ -88,6 +103,8 @@ impl<const BUF: usize> SdoClient<BUF> {
         self.state = State::WaitingUploadInitResponse { index, subindex };
         self.offset = 0;
         self.total_len = 0;
+        self.upload_len = None;
+        self.upload_size_indicated = false;
 
         let mut data = [0u8; 8];
         data[0] = (Ccs::InitiateUpload as u8) << 5; // 0x40
@@ -98,15 +115,17 @@ impl<const BUF: usize> SdoClient<BUF> {
     }
 
     /// Start a download (write) transfer. Returns the initiate request frame
-    /// to send, or `Err(())` if `value` does not fit the client's `BUF`-byte
-    /// transfer buffer (nothing is sent; the client stays idle).
+    /// to send, or `Err(())` if a segmented value does not fit the client's
+    /// `BUF`-byte transfer buffer (the client becomes idle). Expedited values
+    /// of 1–4 bytes are encoded directly and do not need this buffer. This
+    /// method constructs a request only; it does not transmit anything.
     pub fn start_download(
         &mut self,
         index: u16,
         subindex: u8,
         value: &[u8],
     ) -> Result<CanFrame, ()> {
-        if value.len() <= 4 {
+        if !value.is_empty() && value.len() <= 4 {
             // Expedited download
             self.state = State::WaitingDownloadInitResponse { index, subindex };
             self.total_len = value.len();
@@ -182,8 +201,11 @@ impl<const BUF: usize> SdoClient<BUF> {
         match &self.state {
             State::Idle => SdoClientResult::Error,
 
-            State::WaitingUploadInitResponse { .. } => {
-                if cs != Scs::InitiateUploadResponse as u8 {
+            State::WaitingUploadInitResponse { index, subindex } => {
+                if cs != Scs::InitiateUploadResponse as u8
+                    || u16::from_le_bytes([response[1], response[2]]) != *index
+                    || response[3] != *subindex
+                {
                     self.state = State::Idle;
                     return SdoClientResult::Error;
                 }
@@ -198,8 +220,11 @@ impl<const BUF: usize> SdoClient<BUF> {
                 self.handle_upload_segment_response(response)
             }
 
-            State::WaitingDownloadInitResponse { .. } => {
-                if cs != Scs::InitiateDownloadResponse as u8 {
+            State::WaitingDownloadInitResponse { index, subindex } => {
+                if cs != Scs::InitiateDownloadResponse as u8
+                    || u16::from_le_bytes([response[1], response[2]]) != *index
+                    || response[3] != *subindex
+                {
                     self.state = State::Idle;
                     return SdoClientResult::Error;
                 }
@@ -227,16 +252,24 @@ impl<const BUF: usize> SdoClient<BUF> {
                 0
             };
             let data_len = 4 - n;
+            if data_len > BUF {
+                self.state = State::Idle;
+                return SdoClientResult::Error;
+            }
             self.buf[..data_len].copy_from_slice(&response[4..4 + data_len]);
             self.offset = data_len;
+            self.upload_size_indicated = size_indicated;
             self.state = State::Idle;
             SdoClientResult::UploadComplete { data_len }
         } else {
             // Segmented transfer
-            if size_indicated {
-                self.total_len =
-                    u32::from_le_bytes([response[4], response[5], response[6], response[7]])
-                        as usize;
+            self.upload_len = size_indicated.then(|| {
+                u32::from_le_bytes([response[4], response[5], response[6], response[7]]) as usize
+            });
+            self.upload_size_indicated = size_indicated;
+            if self.upload_len.is_some_and(|len| len > BUF) {
+                self.state = State::Idle;
+                return SdoClientResult::Error;
             }
 
             let (index, subindex) = match &self.state {
@@ -277,7 +310,12 @@ impl<const BUF: usize> SdoClient<BUF> {
         let last = (response[0] & 0x01) != 0;
         let seg_len = 7 - n;
 
-        if self.offset + seg_len > BUF {
+        let received = self.offset + seg_len;
+        if received > BUF
+            || self
+                .upload_len
+                .is_some_and(|len| received > len || (last && received != len))
+        {
             self.state = State::Idle;
             return SdoClientResult::Error;
         }
@@ -302,7 +340,7 @@ impl<const BUF: usize> SdoClient<BUF> {
     }
 
     fn handle_download_init_response(&mut self, _response: &[u8; 8]) -> SdoClientResult {
-        if self.total_len <= 4 {
+        if self.total_len > 0 && self.total_len <= 4 {
             // Was expedited, download is done
             self.state = State::Idle;
             SdoClientResult::DownloadComplete
@@ -651,6 +689,7 @@ mod tests {
         // The active transfer still completes with the real response.
         let mut resp = [0u8; 8];
         resp[0] = (Scs::InitiateUploadResponse as u8) << 5 | 0x03; // expedited, size, n=0
+        resp[1..3].copy_from_slice(&0x1000u16.to_le_bytes());
         resp[4..8].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         match client.process_response(&resp) {
             SdoClientResult::UploadComplete { data_len } => assert_eq!(data_len, 4),

@@ -71,7 +71,10 @@ pub fn encode_slcan_frame(frame: &CanFrame, out: &mut [u8]) -> Option<usize> {
 ///
 /// The trailing `\r` is optional. Extended and remote frames are ignored
 /// because CANopen uses standard data frames.
+/// An optional four-hex-digit timestamp is accepted and discarded; any other
+/// trailing content makes the line invalid.
 pub fn parse_slcan_frame(line: &[u8]) -> Option<CanFrame> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.is_empty() {
         return None;
     }
@@ -83,11 +86,17 @@ pub fn parse_slcan_frame(line: &[u8]) -> Option<CanFrame> {
             let id = (parse_hex_digit(line[1])? as u16) << 8
                 | (parse_hex_digit(line[2])? as u16) << 4
                 | parse_hex_digit(line[3])? as u16;
-            let dlc = (line[4] - b'0') as usize;
+            let dlc = line[4].checked_sub(b'0')? as usize;
             if dlc > 8 {
                 return None;
             }
             if line.len() < 5 + dlc * 2 {
+                return None;
+            }
+            let suffix = &line[5 + dlc * 2..];
+            if !suffix.is_empty()
+                && (suffix.len() != 4 || !suffix.iter().all(|b| parse_hex_digit(*b).is_some()))
+            {
                 return None;
             }
             let mut data = [0u8; 8];
@@ -121,6 +130,43 @@ fn parse_hex_digit(ch: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_trailing_garbage_but_accepts_optional_timestamp_and_delimiter() {
+        for line in [
+            &b"t20112Agarbage"[..],
+            &b"t20112At20112B"[..],
+            &b"t20112A000"[..],
+            &b"t20112A00000"[..],
+            &b"t20112AG000"[..],
+            &b"t20112A\rjunk"[..],
+        ] {
+            assert!(parse_slcan_frame(line).is_none(), "accepted {line:?}");
+        }
+        for line in [
+            &b"t20112A"[..],
+            &b"t20112A\r"[..],
+            &b"t20112A4D67"[..],
+            &b"t20112A4d67\r"[..],
+        ] {
+            assert_eq!(parse_slcan_frame(line).unwrap().data(), &[42]);
+        }
+    }
+
+    #[test]
+    fn every_dlc_byte_is_safe_and_only_decimal_zero_to_eight_is_valid() {
+        for dlc in 0..=255 {
+            let mut line = *b"t12380000000000000000";
+            line[4] = dlc;
+            let valid = (b'0'..=b'8').contains(&dlc);
+            let len = if valid {
+                5 + (dlc - b'0') as usize * 2
+            } else {
+                line.len()
+            };
+            assert_eq!(parse_slcan_frame(&line[..len]).is_some(), valid);
+        }
+    }
 
     #[test]
     fn parse_standard_frame() {

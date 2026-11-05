@@ -56,7 +56,7 @@ impl<T: AsyncCan> AsyncCan for SdoPort<'_, T> {
     async fn receive(&mut self) -> Result<CanFrame, Self::Error> {
         loop {
             let frame = self.transport.receive().await?;
-            if frame.raw_id() == self.response_cob && frame.raw_dlc() == 8 {
+            if frame.raw_id() == self.response_cob {
                 return Ok(frame);
             }
             // Buffer non-matching frames for other consumers
@@ -208,13 +208,17 @@ impl<T: AsyncCan> CanDemux<T> {
     ///
     /// Returns `None` if the deadline is reached before a matching heartbeat arrives.
     /// Non-matching frames are routed to internal buffers as usual.
+    /// With `embassy`, a timer wakes a silent receive at the deadline. Without
+    /// it, the caller must arrange polling or an external timer: `Clock` alone
+    /// cannot wake a suspended task. Buffered heartbeats are returned first.
     pub async fn recv_heartbeat_timed(
         &mut self,
         node: Option<NodeId>,
         timeout_us: u64,
         clock: &impl Clock,
     ) -> Result<Option<CanFrame>, T::Error> {
-        let deadline = clock.now_us() + timeout_us;
+        use core::{future::Future, task::Poll};
+        let started = clock.now_us();
 
         // Check buffer first
         let found = self.take_buffered_heartbeat(node);
@@ -222,12 +226,33 @@ impl<T: AsyncCan> CanDemux<T> {
             return Ok(found);
         }
 
+        #[cfg(feature = "embassy")]
+        let mut timer = core::pin::pin!(embassy_time::Timer::after(
+            embassy_time::Duration::from_micros(timeout_us)
+        ));
+
         // Poll transport until deadline
         loop {
-            if clock.now_us() >= deadline {
+            let frame = {
+                let mut receive = core::pin::pin!(self.transport.receive());
+                core::future::poll_fn(|cx| {
+                    if clock.now_us().wrapping_sub(started) >= timeout_us {
+                        return Poll::Ready(Ok(None));
+                    }
+                    if let Poll::Ready(result) = receive.as_mut().poll(cx) {
+                        return Poll::Ready(result.map(Some));
+                    }
+                    #[cfg(feature = "embassy")]
+                    if timer.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Ok(None));
+                    }
+                    Poll::Pending
+                })
+                .await?
+            };
+            let Some(frame) = frame else {
                 return Ok(None);
-            }
-            let frame = self.transport.receive().await?;
+            };
             let parsed = CobId::new(frame.raw_id()).map(|c| c.parse());
             match parsed {
                 Some(ParsedCobId::Heartbeat(n)) if node.is_none() || node == Some(n) => {
@@ -351,6 +376,41 @@ mod tests {
     use crate::od::*;
     use crate::sdo::driver::SdoDriver;
     use crate::sdo::server::SdoServer;
+
+    #[test]
+    fn timed_heartbeat_expires_during_pending_receive_and_clock_wrap() {
+        use core::{cell::Cell, future::Future, task::Context};
+        struct Silent;
+        impl AsyncCan for Silent {
+            type Error = ();
+            async fn transmit(&mut self, _: &CanFrame) -> Result<(), ()> {
+                Ok(())
+            }
+            async fn receive(&mut self) -> Result<CanFrame, ()> {
+                core::future::pending().await
+            }
+        }
+        struct Time(Cell<u64>);
+        impl Clock for Time {
+            fn now_us(&self) -> u64 {
+                self.0.get()
+            }
+        }
+        for start in [0, u64::MAX - 50] {
+            let clock = Time(Cell::new(start));
+            let mut demux = CanDemux::new(Silent);
+            let mut future = core::pin::pin!(demux.recv_heartbeat_timed(None, 100, &clock));
+            let mut cx = Context::from_waker(core::task::Waker::noop());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            clock.0.set(start.wrapping_add(99));
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            clock.0.set(start.wrapping_add(100));
+            assert!(matches!(
+                future.as_mut().poll(&mut cx),
+                core::task::Poll::Ready(Ok(None))
+            ));
+        }
+    }
 
     // A mock transport that interleaves heartbeat frames with SDO responses
     struct NoisyMockCan {
@@ -505,6 +565,27 @@ mod tests {
     }
 
     #[test]
+    fn sdo_port_preserves_malformed_target_response_for_driver_validation() {
+        // The source errors after one short response: filtering it must not
+        // turn the protocol error into a transport error.
+        struct Once(Option<CanFrame>);
+        impl AsyncCan for Once {
+            type Error = MockErr;
+            async fn transmit(&mut self, _: &CanFrame) -> Result<(), MockErr> {
+                Ok(())
+            }
+            async fn receive(&mut self) -> Result<CanFrame, MockErr> {
+                self.0.take().ok_or(MockErr)
+            }
+        }
+        let mut can = Once(Some(CanFrame::new(0x581, &[0x43]).unwrap()));
+        let target = NodeId::new(1).unwrap();
+        let mut port = SdoPort::new(&mut can, target);
+        let result = block_on(SdoDriver::new(target).read_u32(0x1000, 0, &mut port));
+        assert!(matches!(result, Err(crate::sdo::SdoError::ProtocolError)));
+    }
+
+    #[test]
     fn demux_sdo_routes_non_sdo_to_buffers() {
         let target = NodeId::new(1).unwrap();
         let driver = SdoDriver::new(target);
@@ -544,5 +625,37 @@ mod tests {
             assert_eq!(frame.raw_id(), 0x701);
             assert_eq!(frame.data()[0], 0x05);
         });
+    }
+
+    #[test]
+    fn timed_heartbeat_keeps_other_frames_and_returns_buffered_match_at_zero_timeout() {
+        struct Fixed;
+        impl Clock for Fixed {
+            fn now_us(&self) -> u64 {
+                0
+            }
+        }
+        let target = NodeId::new(1).unwrap();
+        let mut transport = NoisyMockCan::new();
+        for (id, data) in [(0x181, 42), (0x702, 127), (0x701, 5)] {
+            transport
+                .pending
+                .push(CanFrame::new(id, &[data]).unwrap())
+                .unwrap();
+        }
+        let mut demux = CanDemux::new(transport);
+        let found = block_on(demux.recv_heartbeat_timed(Some(target), 100, &Fixed))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.raw_id(), 0x701);
+        assert_eq!(demux.try_recv_pdo().unwrap().data(), &[42]);
+        let buffered =
+            block_on(demux.recv_heartbeat_timed(Some(NodeId::new(2).unwrap()), 0, &Fixed))
+                .unwrap()
+                .unwrap();
+        assert_eq!(buffered.raw_id(), 0x702);
+        assert!(block_on(demux.recv_heartbeat_timed(None, 0, &Fixed))
+            .unwrap()
+            .is_none());
     }
 }
