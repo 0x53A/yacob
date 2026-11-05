@@ -42,16 +42,16 @@ Big gaps not fully captured by the current known-issues list:
 | CAN frame model | Classic 11-bit CAN data frames | Yes | `CanFrame` rejects extended IDs and >8-byte payloads. |
 | CANopen FD | CANopen FD frame sizes / CiA 1301 | No | Classic CAN only. |
 | COB-ID parsing | NMT, EMCY, SDO, PDO, heartbeat, SYNC | Yes | `cobid`, `events`, tests. |
-| OD core | Variable/array/record lookup | Partial | `ObjectDictionary`, macro and EDS tests. DSL records have no sub0 (known-issues K12); duplicate/shadowing declarations are not rejected (K29). |
+| OD core | Variable/array/record lookup | Yes | `ObjectDictionary`, macro and EDS tests. Records get a generated sub0; duplicate/shadowing declarations are compile errors. |
 | OD access | `ro`, `wo`, `rw`, `const` | Partial | Implemented, but full CiA access-attribute semantics need audit. |
 | OD data types | bool, integer widths, float32, strings, octet/domain | Partial | Good common coverage; not full CiA type universe. |
 | OD validation | Application pre-write validation | Yes | `validate_write`, macro attribute, SDO tests. |
 | OD metadata | Names, data types, max variable length, PDO mappable | Yes | `OdEntryMeta`. |
 | OD extensions | Per-object read/write extension callbacks | Partial | `validate_write` only; no full CANopenNode-style OD extension IO layer. |
 | Mandatory object | 0x1000 Device type | User-provided | DSL/EDS can declare it; stack does not force presence. |
-| Mandatory object | 0x1001 Error register | Partial | EMCY producer tracks register, but OD synchronization is application/OD dependent. |
+| Mandatory object | 0x1001 Error register | Yes | A `u8` VAR at 0x1001 mirrors the EMCY error register (`store_error_register`), incl. change notification for TPDO mapping. |
 | Mandatory object | 0x1017 Producer heartbeat time | Yes | OD value wins over `NodeConfig` at init; SDO writes change the runtime period, 0 disables; re-synced on reset. Unit + interop tests. |
-| Mandatory object | 0x1018 Identity object | User-provided | DSL/EDS can declare it; LSS identity is configured separately and defaults to zeros (K23). sub0 missing for DSL records (K12). |
+| Mandatory object | 0x1018 Identity object | User-provided | DSL/EDS can declare it; `NodeConfig::from_od` takes the LSS identity from it. |
 | Error history | 0x1003 Pre-defined error field | No | EMCY does not maintain 0x1003. |
 | SYNC config | 0x1005 COB-ID SYNC | Yes | OD-integrated: COB-ID + generator bit 30, re-read on SDO write and reset; invalid static values fail construction, downloads validate reserved/unsupported values, and collision guards cover every node-owned service in either configuration order. Unit + interop tests. |
 | SYNC config | 0x1006 Communication cycle period | Yes | Drives `SyncProducer` when 0x1005 bit 30 is set. Unit + interop tests. |
@@ -96,7 +96,7 @@ Big gaps not fully captured by the current known-issues list:
 | SDO client expedited/segmented | Yes | `SdoClient`, `SdoDriver`, typed client tests. |
 | SDO client block transfer | No | Client supports expedited/segmented only. |
 | SDO client timeout | Partial | `SdoDriver` timed APIs; low-level `SdoClient` has no timeout. |
-| Abort-code mapping | Partial | OD error → abort mapping uses wrong/non-standard codes (K13); audit all state/protocol paths. |
+| Abort-code mapping | Partial | OD error → abort mapping follows CiA 301 (subindex vs object, length high/low, hardware error). Some protocol/state paths still answer on 0x0000:00. |
 | Busy-channel / collision behavior | Partial | Known issue; focused tests still missing. |
 | Multiple SDO channels | Yes | Additional SDO servers (0x1201+) via DSL `sdo_server[N]`; independent transfer state, dispatched by configured COB-ID. |
 | SDO via non-CAN mappings (CiA 309/J1939 mapping) | N/A | Outside core scope. |
@@ -106,7 +106,7 @@ Big gaps not fully captured by the current known-issues list:
 | Feature | Status | Evidence / notes |
 |---|---|---|
 | TPDO mapping from DSL/EDS | Yes | Macro/EDS tests. |
-| RPDO mapping from DSL/EDS | Partial | Full-width and bool mappings tested. Partial-width mappings are silently not applied (K27); DLC must match exactly (K24). |
+| RPDO mapping from DSL/EDS | Yes | Full-width, bool and partial-width (sign-extended) mappings tested. Longer frames use the leading bytes; shorter ones are counted (`RpdoEngine::length_errors`). |
 | Event-driven TPDO | Yes | `OdGuard` dirty tracking, tests. |
 | TPDO event timer | Yes | Unit tests and examples. |
 | TPDO inhibit time | Partial | Implemented for event sends; needs spec edge-case audit. |
@@ -118,7 +118,7 @@ Big gaps not fully captured by the current known-issues list:
 | Dynamic PDO remapping in PreOperational | Partial | Mapping lock protocol exists; needs broader conformance tests. |
 | PDO config write rejected in Operational | Yes | Unit + interop tests. |
 | Extended PDO count >4 | Yes | Interop tests cover PDO5. |
-| RTR PDO transmission types 252/253 | No | DSL recognizes values, but behavior appears absent. |
+| RTR PDO transmission types 252/253 | No | Rejected by the DSL, EDS import and generated SDO writes (no RTR frame support). |
 | MPDO | No | Not implemented. |
 | SYNC consumer dispatch | Yes | Matched by the 0x1005 COB-ID before the pre-defined-set parse, so a relocated SYNC works; DLC > 1 rejected as malformed. |
 | SYNC producer | Yes | `SyncProducer` wired to 0x1005 bit 30 + 0x1006; transmit is two-phase, so refused pulses remain pending and local application occurs only after acceptance. Applies accepted pulses locally (transports do not loop back). Not generated in Stopped. |
@@ -143,7 +143,7 @@ Big gaps not fully captured by the current known-issues list:
 | Feature | Status | Evidence / notes |
 |---|---|---|
 | LSS slave switch mode global | Yes | Unit tests. |
-| LSS slave selective switch | Partial | Unit + interop tests; partial matches are not sequence-bound (K25). |
+| LSS slave selective switch | Yes | Unit + interop tests; the four requests must arrive as one ordered sequence. |
 | LSS configure node ID | Partial | State updates and event; application persistence/reset semantics need integration. |
 | LSS store configuration | Partial | Emits event only. |
 | LSS identity inquiries | Yes | Unit + interop tests. |
@@ -155,8 +155,8 @@ Big gaps not fully captured by the current known-issues list:
 
 | Feature | Status | Evidence / notes |
 |---|---|---|
-| EDS import | Partial | `canopen-derive` parser handles useful subset, tests. Fails open on bad values (K15); input file not tracked by cargo (K28). |
-| EDS export | Partial | Macro export tests. Invalid DefaultValues for non-literal defaults (K21); DeviceInfo/object lists incomplete (K22). |
+| EDS import | Partial | `canopen-derive` parser handles useful subset, tests. Bad defaults/AccessTypes are compile errors; unsupported types are skipped silently (K15). |
+| EDS export | Yes | Macro export tests. Evaluated DefaultValues, DeviceInfo keys, CiA 306 object lists, 0x1021/0x1022. |
 | DCF parsing | Partial | `dcf.rs` exists; scope likely limited. |
 | DCF generation | Unknown | Needs audit. |
 | XDD/XDC | No | Not implemented. |

@@ -2,9 +2,10 @@
 
 This is the canonical index of open defects and debt in `canopen_rs`.
 It describes the current state only. It was last verified against the working
-tree on **2026-11-04** (HEAD `f3da028` plus uncommitted changes).
-Section 1.1 and its sub-sections come from four review passes on that day
-(K01–K31); everything else was spot-checked then.
+tree on **2026-11-05**, after the fix pass recorded in
+[review-2026-11-05-fixes](review-2026-11-05-fixes.md). Section 1.1 comes
+from four review passes on 2026-11-04 (K01–K31; fixed numbers are not
+reused); everything else was spot-checked then.
 The 2026-09-07/08 fix sessions (`review-2026-09-0*.md`) were reviewed and
 committed on 2026-11-05.
 
@@ -36,46 +37,40 @@ gap with a workaround. **low** means a footgun or cosmetic issue.
 
 ## 1. Open defects
 
-Suggested fix order (proposal, not a decision):
-1. Silent data loss with small, local fixes: K20, K27, K12, K16, K13.
-2. Generator correctness: K21, K28, K29, K14, K15, K22.
-3. Protocol behavior: K04, K24, K23, K01, K09, R05.
-4. Larger design work: K02 (streaming OD access), R14/application models,
-   A-items.
+The 2026-11-05 fix pass closed K03, K04, K07, K08, K13, K17, K18, K20, K21,
+K23, K24, K25, K27, K28 and K31, most of K12, K14, K15, K16, K22, K26 and
+K29, the K01 0x1001 mirror, and the R05 boot-up case. What is left below either
+needs a design decision or is a small remainder. Fix records:
+[review-2026-11-05-fixes](review-2026-11-05-fixes.md).
 
-### 1.1 Found in the 2026-11-04 architecture review
+Suggested order (proposal, not a decision):
+1. Needs a design first: K02 (streaming OD access), K06 (default/stored value
+   model), K05 (DCF semantics), K09 (PDO valid-bit write policy, ties into
+   A04), R14/application models, R10/R11 (pump and bus lifecycle).
+2. Decide, then small: K19 (bus self-publish), K10 duplicate RPDO COB-IDs.
+3. Verify: K11.
 
-**K01 — high — OD 0x1001 is not wired to the EMCY error register.**
-`EmcyProducer` keeps its own `error_register`. `set_error`/`clear_error` never
-update the OD's 0x1001 field, so SDO reads and PDO mappings of 0x1001 return the
-static default. Only `node.error_register()` is correct. 0x1003 (pre-defined
-error field) is not maintained by the stack, and 0x1014/0x1015 (EMCY COB-ID and
-inhibit time) are not supported. The 2026-09-07 review described this as an
-"ownership boundary". It is still a conformance defect: CiA 301 requires
-0x1001 to reflect the device's error state.
+### 1.1 Found in the 2026-11-04 review passes
+
+**K01 — medium — EMCY objects beyond 0x1001 are not maintained.**
+0x1001 now mirrors the EMCY error register: when the OD declares it as a
+`u8` VAR, `set_error`/`clear_error`/`clear_all_errors` write it and notify a
+change (so a TPDO mapping it fires). Still missing: 0x1003 (pre-defined error
+field) is not maintained by the stack, and 0x1014/0x1015 (EMCY COB-ID and
+inhibit time) are not supported.
 
 **K02 — high — 0x1021 Store EDS cannot be served for realistic devices.**
 - The SDO server transfers through a fixed `[u8; 889]` buffer, and the generated
-  0x1021 read returns `ValueTooLong` above that.
-  `interop-tests/vcan_node.eds` deflates to about 1.9 kB, so the flagship
+  0x1021 read returns `ValueTooLong` above that (abort 0x0504_0005).
+  `interop-tests/vcan_node.eds` deflates to about 2 kB, so the flagship
   example cannot serve its own EDS.
-- `SdoDriver` hardcodes `SdoClient::<256>` (`sdo/driver.rs`), so the host side
-  cannot read more than 256 B regardless of the server.
+- `SdoDriver` uses `SdoClient::<256>` (`SdoDriver::MAX_TRANSFER`), so the host
+  side cannot read more than 256 B regardless of the server.
 - The same ceilings apply to every large `domain<N>`/`octet_string<N>`. The
   CLAUDE.md example `domain<1024>` is not fully transferable.
 
 A streaming (chunked) OD read/write interface is needed rather than a bigger
 buffer.
-
-**K03 — low — 0x1022 Store Format value 1 is in the CiA-reserved range.**
-Values 1–127 are reserved by CiA 301. A manufacturer-specific "deflate" format
-must use 128–255.
-
-**K04 — high — `SdoDriver` never sends an abort.**
-On a protocol error, toggle mismatch, `TooLarge`, or timeout, the driver
-returns an error without sending an SDO abort. `SdoClient` has no abort-frame
-builder. The server channel stays busy until its 5 s timeout, so an immediate
-retry fails or interleaves with the stale transfer.
 
 **K05 — high — `Dcf::apply_remote` fails on any real EDS/DCF and skips the important parts.**
 - `Dcf::parse` collects every entry with a `ParameterValue` **or**
@@ -99,18 +94,6 @@ retry fails or interleaves with the stale transfer.
 - 0x1010/0x1011 (store/restore) and a default/stored/current value model do
   not exist. A proper fix needs that design first.
 
-**K07 — medium — RTR transmission types 252/253 are accepted but dead.**
-The DSL (`rtr_sync`, `rtr_event`), EDS import, and `TransmissionType` accept
-them. `CanFrame` cannot represent RTR (`new_remote` returns `None`), the
-transports drop RTR frames, and the TPDO engine has no RTR path. A TPDO with
-one of these types silently never transmits. Either reject them at all
-configuration boundaries or implement RTR.
-
-**K08 — medium — The EMCY pending queue drops silently.**
-`EmcyProducer::pending` holds 4 frames and pops the oldest when full. It can
-drop an error-reset EMCY (0x0000) or the first error of a burst. The drop is
-not counted (`events_dropped` does not include it).
-
 **K09 — medium — PDO config write policy does not follow the valid bit.**
 The SDO server rejects all 0x1400–0x1BFF writes while Operational
 (`server.rs`, `is_pdo_config_index`). CiA 301 instead allows changes to a
@@ -119,22 +102,16 @@ disabled PDO (bit 31 set) in any state, and rejects changing the COB-ID of an
 both too strict and too loose.
 
 **K10 — low — Smaller defects.**
-- **Block upload end confirmation** (`handle_block_upload`, sub-command 1)
-  clears `self.transfer` unconditionally. A stray frame ends any active
-  transfer on the channel, including a segmented download, without a state
-  check.
-- **Block upload CRC:** the initiate response always claims CRC support and
-  ignores the client's CRC flag.
-- **`CobId::tpdo`/`rpdo`:** PDO numbers above 3 silently fall back to the
-  PDO1 base.
-- **`ParsedCobId::pdo_num`** is 0-based, while `PdoNumber` is 1-based.
+- **`ParsedCobId::pdo_num`** is 0-based, while `PdoNumber` is 1-based. Only
+  the monitoring classifier and the egui monitor use it.
 - **`sync_pdo_from_od`:**
   - It is a `pub fn` that can be called mid-operation.
-  - It accepts reserved transmission types 241–251 and ignores comm-param
-    bit 30.
-  - It silently skips mapping entries it cannot read.
+  - It ignores comm-param bit 30 and silently skips mapping entries it cannot
+    read. (Reserved transmission types can no longer reach the OD: the DSL,
+    EDS import and generated SDO writes reject 241–253.)
 - **RPDO COB-IDs:** two enabled RPDOs on the same COB-ID are not rejected; the
-  first match wins.
+  first match wins. Whether to forbid it (CiA 301 does not explicitly) belongs
+  to the A04 COB-ID plan.
 
 **K11 — suspected — UDP multicast transport self-echo.**
 `UdpMulticastTransport` enables `multicast_loop` and does not filter its own
@@ -142,86 +119,31 @@ datagrams. A SYNC-producing node applies its pulse locally (by design) and then
 again from the echo. Unverified: depends on python-can's sender behavior and
 the interop test setup.
 
-### 1.1b Found in the 2026-11-04 second review pass
+**K12 — low — Sparse records iterate holes.**
+Records now have a generated sub0 (highest declared subindex). For sparse
+records `sub_count` returns that highest subindex, and loops such as the
+0x1016 duplicate check iterate `1..=count` over holes.
 
-**K12 — high — DSL records have no sub0.**
-For `record { ... }` entries the generated OD has no `(index, 0)` read arm and
-no meta entry: `read(0x1018, 0)` returns `NotFound`, `lookup` returns `None`,
-and SDO aborts with 0x0602_0000. Arrays do have sub0. The exported EDS still
-declares `[1018sub0]` (DefaultValue = highest sub), so the device contradicts
-its own EDS. Generic masters and python-canopen commonly read sub0 first. This
-affects every record, including the mandatory 0x1018 identity object.
-Minor related issue: for sparse records `sub_count` returns the highest
-subindex, and loops such as the 0x1016 duplicate check iterate `1..=count`
-over holes.
+**K14 — low — No typed EDS client methods for strings and domains.**
+`sdo_client_from_eds!` generates typed methods for every numeric type and
+bool; `visible_string`/`octet_string`/`domain` objects only have the raw
+upload/download escape hatch. Bounded by K02 on the driver side.
 
-**K13 — medium — OD error → SDO abort code mapping is wrong.**
-(`od_error_to_abort`, `sdo/protocol.rs`)
-- `OdError::ValueTooLong` maps to 0x0504_0005 (out of memory). For writes it
-  should be 0x0607_0012 (data type length too high).
-- `AbortCode::DataTypeMismatch` is 0x0609_0043, which is not a CiA 301 code.
-  It should be 0x0607_0010 (length mismatch), or 0x0607_0012/0x0607_0013.
-- `OdError::HardwareError` maps to 0x0800_0000 (general) instead of
-  0x0606_0000 (hardware error).
-- A segmented/block download whose length disagrees with the declared size
-  aborts with 0x0800_0020 (general transfer error). CiA 301 has 0x0607_0012
-  (too long) and 0x0607_0013 (too short) for this.
-- 0x0609_0011 (subindex does not exist) is never emitted: a missing subindex
-  of an existing object aborts as "object does not exist".
-- `AbortCode` lacks several standard codes, including 0x0607_0010/12/13,
-  0x0606_0000, 0x0604_0047, 0x0609_0036 and 0x0800_0023/24.
-
-**K14 — medium — The typed EDS SDO client has wrong signatures and gaps.**
-(`sdo_client_codegen`, extends A09)
-- `i8`/`i16` objects are read and written as `u8`/`u16`.
-- `i32` reads return `i32` but writes take a `u32` (`write_u32`).
-- `i64`/`u64`/`f64`/strings/domains get no typed methods at all; they are
-  skipped silently. `SdoDriver` has no `read_i8/i16/i64/u64/f64`/bool helpers.
-
-**K15 — medium — EDS import fails open.**
-(`canopen-derive/src/eds_parser.rs`)
-- An unparseable `DefaultValue` becomes `0`.
-- `$NODEID+…` defaults outside the PDO records (e.g. 0x1014, 0x1200) become
-  `0` silently.
-- An unknown `AccessType` becomes `ro`; `const` imports as `ro`, so the
-  re-export loses `const`.
-- Entries with an unsupported `DataType` or no `ParameterName` are dropped
-  without a diagnostic.
+**K15 — low — EDS import remainder.**
+- Entries with an unsupported `DataType` or no `ParameterName` are still
+  skipped without a diagnostic (deliberately for now: vendor EDS files use
+  types this stack cannot represent; a warning mechanism is missing).
+- `$NODEID` defaults outside the PDO records (e.g. 0x1014, 0x1200) become 0.
 - Record vs. array is decided by a heuristic (≥4 elements, all-zero
   defaults, string token compare), not by `ObjectType`/the sub data types.
 - `sanitize_name` collisions are possible, and `capacity` overrides are
   per index, not per subindex.
 
-A proc macro can `compile_error!` on every one of these; silently
-generating a different device is the worst option.
-
-**K16 — medium — `SdoPort` overflow neither drains nor counts.**
-(`can_router.rs`)
-- `drain_overflow()` returns `&self.overflow` and does not clear it. Code
-  written like the CLAUDE.md example (`for frame in port.drain_overflow()`)
-  re-processes old frames on every call.
-- The buffer is 16 frames. Once full, every newer frame is dropped with no
-  counter, and it stays full until `clear_overflow()` is called. On a bus
-  with cyclic PDOs one segmented transfer fills it.
-- `SdoPort` only knows the default SDO channel (`0x580 + id`), not
-  additional servers.
-
-**K17 — low — `WebSocketTransport` resource shape.**
-(`canopen-linux/src/websocket_transport.rs`)
-- The RX path is an unbounded `std::sync::mpsc` channel. A consumer that
-  stops polling grows memory without limit; the TX side is bounded.
-- Each transport creates a full multi-threaded tokio runtime (one worker
-  per core) plus a thread, for a single socket. A `current_thread` runtime
-  is enough.
-- Undecodable messages (EFF/RTR/ERR or malformed) are dropped without a
-  counter.
-
-**K18 — low — `pdo_client_from_eds!` decodes partial signed mappings
-without sign extension.** An `i8`/`i16`/`i32` object mapped with fewer
-bits than its width decodes as a positive number (4-bit `-1` → `15`). Only
-`i24` with a full 24-bit mapping is sign-extended. Whether the OD side
-(`copy_pdo_bits` into the RPDO target) behaves the same way is untested;
-the two sides should share one rule.
+**K16 — low — Router remainder.**
+`SdoPort::drain_overflow()` now takes the retained frames and
+`overflow_dropped()` counts losses. `SdoPort` still only knows the default SDO
+channel (`0x580 + id`), and the deprecated `HeartbeatPort` overflow is
+uncounted.
 
 **K19 — low — Shared bus does not see its own transmissions.**
 `run_pump` publishes received frames only. Frames sent through the
@@ -231,128 +153,30 @@ SocketCAN loops these back to other sockets, so the bus behaves differently
 from a second socket on the same interface. This should be a documented
 choice or an option.
 
-### 1.1c Found in the 2026-11-04 third review pass
-
-**K20 — high — A too-long write wipes a variable-length object.**
-Generated `write()` for `visible_string<N>`/`octet_string<N>`/`domain<N>`
-(heapless) calls `clear()` first and then `push_str`/`extend_from_slice`.
-When that fails, it returns `ValueTooLong` (SDO aborts), but the field is
-already empty. Verified: write `"abc"`, then write 10 bytes into a
-`visible_string<8>`. The result is `Err(ValueTooLong)` and the stored value
-is `""`. The SDO server never checks `max_size` up front, so any oversized
-SDO download destroys the current value. Writes must check the length first
-(or build into a temporary).
-
-**K21 — medium — The exported EDS has invalid `DefaultValue`s.**
-`eds_export` writes the default expression's token stream verbatim. Verified:
-`-5` → `DefaultValue=- 5`, `true` → `DefaultValue=true`,
-`1 << 4` → `DefaultValue=1 << 4`. None of these is a CiA 306 value. Our own
-importer turns them into `0` (K15), so export → import round trips silently
-change defaults. Evaluate the literal at macro time, or reject non-literal
-expressions.
-
-**K22 — medium — The exported EDS is incomplete.**
-- The auto-registered 0x1021/0x1022 exist in the OD but are not in the EDS.
-  (The implicit default SDO server has no 0x1200 OD record either, which is
-  allowed but means tools can't discover it from the OD.)
-- `[DeviceInfo]` has only `VendorName=` and `ProductName`. `VendorNumber`,
-  `ProductNumber`, `RevisionNumber`, `BaudRate_*`, `SimpleBootUpSlave`,
-  `Granularity`, `NrOfRXPDO`/`NrOfTXPDO` and `LSS_Supported` are missing.
-  Strict tools (CANeds, some master configurators) reject the file or guess.
-- Every user index below 0x2000 is listed under `[MandatoryObjects]`.
-  CiA 306 reserves that list for 0x1000, 0x1001 and 0x1018; the rest belong
-  in `[OptionalObjects]`.
-- Array sub-entries all get the array's name as `ParameterName` and
-  `DefaultValue=0`.
-
-**K23 — medium — LSS identity is not taken from 0x1018.**
-`LssSlave` uses `NodeConfig::identity`. `NodeConfig::from_od` sets it to
-`LssIdentity::default()` (all zeros) even when the OD declares 0x1018. By
-default, every node therefore answers an LSS selective switch for
-0/0/0/0, and the LSS identity can disagree with the identity readable via
-SDO. This is one more instance of the dual-source pattern (A07).
-
-**K24 — medium — RPDOs longer than their mapping are dropped silently.**
-`RpdoEngine::process_with_drop_count` requires `DLC == mapped length`
-exactly. A frame with extra bytes is consumed and ignored. CiA 301 (and
-CANopenNode) process a longer PDO using the leading bytes, and use EMCY
-0x8210 (PDO not processed, length error) / 0x8220 (length exceeded) as
-diagnostics. Masters that pad PDOs to 8 bytes do exist. In either direction
-the application gets no event or counter, so it cannot report 0x8210/0x8220
-itself. Check the exact CiA 301 wording when fixing.
-
-**K25 — low — LSS selective-switch state is not sequence-bound.**
-Vendor/product/revision matches are latched independently and cleared only
-by a serial request or a global switch. An interrupted selection sequence
-leaves stale partial matches that a later sequence can complete. CiA 305
-expects the four requests as one ordered sequence.
+**K22 — low — Exported EDS remainder.**
+The implicit default SDO server has no 0x1200 OD record, so tools cannot
+discover it from the EDS (allowed by CiA 301). `[DeviceInfo]` claims every
+standard bit rate, since the stack does not know the driver's.
 
 **K26 — low — `sdo_helpers` discard foreign traffic and busy-poll.**
 `sdo_upload`/`sdo_download` wrap the transport in a fresh `SdoPort` per call
 and drop its overflow, so every non-SDO frame received during the transfer
 is lost to the caller. `block_on_with_timeout` polls in a 100 µs sleep loop
-(a no-op waker). `sdo_upload` allocates 889 B although the driver is capped
-at 256 B (K02).
+(a no-op waker).
 
-### 1.1d Found in the 2026-11-04 fourth review pass (derive crate focus)
-
-**K27 — high — RPDO partial-width mappings never reach the OD.**
-`apply_mapped` writes `bytes_for_bits(bit_length)` bytes, but generated
-`write()` requires the object's exact size. Any RPDO mapping whose byte
-length is shorter than the object is rejected with `DataTypeMismatch`, and
-the error is swallowed: no OD write, no event, no counter. Verified: a
-`u32` mapped with 16 bits and a `u16` mapped with 8 bits stay 0 after a
-matching frame (`consumed = true`, 0 events). Such mappings come from EDS
-import and runtime remapping (`validate_mapping_target` does not check the
-width). Bools (1 bit → 1 byte) and full-width mappings work, so the test
-suite does not notice. The TPDO side works (it reads the whole object and
-copies the leading bits), so the two directions disagree. CLAUDE.md
-documents partial mappings as supported.
-
-**K28 — medium — EDS-driven macros do not track their input file.**
-`object_dictionary_from_eds!`, `sdo_client_from_eds!`, `pdo_client_from_eds!`
-and `device_from_eds!` read the EDS with `std::fs::read_to_string` and emit
-no `include_bytes!`/`include_str!`. Cargo therefore does not know the
-dependency: editing the EDS does not rebuild the crate, and the generated
-OD/client stays stale until something else triggers a rebuild. The usual fix
-is to emit `const _: &[u8] = include_bytes!("<abs path>");` in the expansion.
-
-**K29 — medium — The DSL accepts conflicting and impossible declarations.**
-All verified to compile without a diagnostic:
-- The same index declared twice (`[0x2000] a` and `[0x2000] b`). The first
-  match arm wins; `b` is unreachable over SDO.
-- A user entry at a generated index (e.g. `[0x1800] c: u8` next to
-  `tpdo[1]`, or `[0x1021]`). The user entry shadows sub0 of the generated
-  record or the Store-EDS object; reading 0x1800:00 then returns the user
-  value instead of the highest subindex.
-- An RPDO mapping a `ro` object and a TPDO mapping a `wo` object. The runtime
-  remapping validator (`validate_mapping_target`) rejects exactly these, so
-  the static and dynamic rules disagree. At runtime the RPDO write is
-  silently refused and the TPDO frame cannot be built ("retried forever",
-  §1.2).
-- A record may declare its own `[0]` entry, which works around K12 but can
-  disagree with the real highest subindex.
-
-Most macro errors are also `panic!`s without a span, rather than
+**K29 — low — Macro errors without spans.**
+Conflicting declarations are now rejected (duplicate indices, user entries on
+generated indices, record `[0]`/duplicate subindices, RPDO mapping of
+`ro`/`const` and TPDO mapping of `wo` objects, RTR transmission types). Many
+other macro errors are still `panic!`s without a span rather than
 `syn::Error`s pointing at the offending token.
-
-**K30 — withdrawn.** Reported as "fixed-size `read()` panics on a short
-buffer". The uncommitted 2026-09-08 change already guards this (a metadata
-lookup for `buf.len() < 8`, regression
-`generated_od_reads_reject_short_buffers_without_partial_writes`). The only
-remaining gap is objects without metadata, i.e. record sub0 (K12).
-
-**K31 — low — `#[export_eds(path)]` is a silent build-time side effect.**
-The proc macro writes into the source tree on every expansion (including
-rust-analyzer runs) and ignores write errors (`let _ = fs::write`). Using
-`MyOd::EDS` from a build script or a test is the conventional alternative.
 
 ### 1.2 Carried over from earlier reviews (spot-checked 2026-11-04, all still open)
 
 **R05 — high — Transmit acceptance and displacement.**
-- Boot-up (`process()` ignores the `transmit` result) and LSS replies still
-  consume state before the transport accepts the frame. SDO, heartbeat, EMCY,
-  async TPDO and SYNC paths are two-phase.
+- LSS replies still consume state before the transport accepts the frame.
+  Boot-up, SDO, heartbeat, EMCY, async TPDO and SYNC paths are two-phase
+  (boot-up retries on `WouldBlock` since 2026-11-05).
 - `Ok(Some(displaced))` is discarded by `Node`, `NbCanAsync` and `run_pump`.
 
 See [protocol-reliability-followups §1](protocol-reliability-followups.md#1-protocol-state-is-consumed-before-transmit-acceptance).
@@ -494,9 +318,9 @@ Using the explicit number everywhere removes the conversion code.
 the embassy signal. `events_dropped` mixes two of them. Address this together
 with R14 / the application-models redesign.
 
-**A09 — `SdoDriver` duplication and gaps.**
-- `upload`/`download` duplicate the `*_timed` variants; the plain ones could
-  delegate.
+**A09 — `SdoDriver` gaps.**
+(The plain/`*_timed` duplication was folded into one implementation with an
+optional deadline on 2026-11-05.)
 - There is no block transfer and no way to target additional server channels.
 - `NbCanAsync` busy-yields via `wake_by_ref`, which burns CPU on std.
 
